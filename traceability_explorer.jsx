@@ -494,7 +494,7 @@ function InvUploadModal({ onClose, onUploaded }) {
       const res = await fetch("/api/data/inventory", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(finalData),
+        body: JSON.stringify({ value: finalData }),
       });
       if (!res.ok) throw new Error("Server error: " + res.status);
       D.invSku = finalData.invSku;
