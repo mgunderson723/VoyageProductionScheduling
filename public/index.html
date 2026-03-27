@@ -4,6 +4,9 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>Production Planner — Voyage Foods</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;}
 body{font-family:var(--font-sans,'Georgia',serif);font-size:14px;color:var(--color-text-primary,#1a1916);background:var(--color-background-tertiary,#f7f6f3);}
@@ -163,6 +166,7 @@ table.orders tr:hover td{background:var(--color-background-secondary);}
     <button class="tab active" onclick="switchTab('calendar')">Calendar</button>
     <button class="tab" onclick="switchTab('orders')">Work orders</button>
     <button class="tab" onclick="switchTab('capacity')">Capacity &amp; ops</button>
+    <button class="tab" onclick="switchTab('traceability')">Traceability</button>
     <button class="tab" onclick="switchTab('admin')" id="tab-admin-btn" style="display:none;">Admin console</button>
   </div>
 
@@ -232,6 +236,11 @@ table.orders tr:hover td{background:var(--color-background-secondary);}
       <div><strong style="color:var(--color-text-primary);">EU/US:</strong> Cannot be mixed on same batch</div>
       <div><strong style="color:var(--color-text-primary);">Roasting yield:</strong> ~68–73%. First batch post-changeover may be scrap/QA hold.</div>
     </div>
+  </div>
+
+  <!-- TRACEABILITY EXPLORER -->
+  <div id="tab-traceability" style="display:none;">
+    <div id="traceability-root"></div>
   </div>
 
   <!-- ADMIN CONSOLE -->
@@ -647,15 +656,16 @@ function shortSku(s){
 
 function switchTab(t){
   if(t==='admin'&&(!currentUser||currentUser.role!=='admin'))return;
-  ['calendar','orders','capacity','admin'].forEach(k=>{document.getElementById('tab-'+k).style.display=k===t?'':'none';});
+  ['calendar','orders','capacity','traceability','admin'].forEach(k=>{document.getElementById('tab-'+k).style.display=k===t?'':'none';});
   document.querySelectorAll('.tab').forEach(el=>{
     const tabName=el.textContent.trim().toLowerCase();
-    const map={'calendar':'calendar','work orders':'orders','capacity & ops':'capacity','capacity &amp; ops':'capacity','admin console':'admin'};
+    const map={'calendar':'calendar','work orders':'orders','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','admin console':'admin'};
     el.classList.toggle('active',map[tabName]===t);
   });
   if(t==='calendar')renderCal();
   if(t==='orders')render();
   if(t==='admin')renderUsers();
+  if(t==='traceability'&&!window._traceabilityMounted){window._traceabilityMounted=true;if(window.App){ReactDOM.createRoot(document.getElementById('traceability-root')).render(React.createElement(window.App));}}
 }
 function shiftCal(d){calOffset+=d*4;renderCal();}
 function resetCal(){calOffset=0;renderCal();}
@@ -874,5 +884,6 @@ function renderMetrics(){
 function toggleGroup(grp){collapsed[grp]=!collapsed[grp];persist();render();}
 init();
 </script>
+<script type="text/babel" src="traceability_explorer.jsx"></script>
 </body>
 </html>
