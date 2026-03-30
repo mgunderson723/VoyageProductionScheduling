@@ -112,6 +112,26 @@ table.orders tr:hover td{background:var(--color-background-secondary);}
 .parallel-label{font-size:10px;color:#0F6E56;margin-bottom:2px;}
 .save-indicator{font-size:11px;color:var(--color-text-tertiary);margin-left:8px;transition:opacity 0.3s;}
 
+/* IMPORT MODAL */
+.drop-zone{border:2px dashed var(--color-border-secondary);border-radius:var(--border-radius-md,8px);padding:2.5rem 1.5rem;text-align:center;cursor:pointer;color:var(--color-text-secondary);transition:border-color 0.2s,background 0.2s;user-select:none;}
+.drop-zone:hover,.drop-zone.drag-over{border-color:var(--color-text-primary);background:var(--color-background-secondary);}
+.drop-zone .drop-icon{font-size:30px;margin-bottom:8px;}
+.drop-zone .drop-label{font-size:14px;margin-bottom:4px;color:var(--color-text-primary);}
+.drop-zone .drop-hint{font-size:11px;color:var(--color-text-tertiary);}
+.modal.import-modal{width:780px;}
+.import-preview{margin-top:8px;max-height:340px;overflow-y:auto;border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-md,8px);}
+table.import-tbl{width:100%;border-collapse:collapse;font-size:12px;}
+table.import-tbl th{text-align:left;padding:5px 8px;color:var(--color-text-secondary);font-weight:400;font-size:11px;border-bottom:0.5px solid var(--color-border-tertiary);background:var(--color-background-secondary);position:sticky;top:0;}
+table.import-tbl td{padding:5px 8px;border-bottom:0.5px solid var(--color-border-tertiary);vertical-align:middle;}
+table.import-tbl tr:last-child td{border-bottom:none;}
+table.import-tbl tr:hover td{background:var(--color-background-secondary);}
+.badge-new{background:#EAF3DE;color:#27500A;}
+.badge-update{background:#E6F1FB;color:#0C447C;}
+.badge-same{background:#F1EFE8;color:#888;}
+.import-summary{font-size:12px;color:var(--color-text-secondary);margin-bottom:8px;}
+.import-changes{font-size:10px;color:var(--color-text-tertiary);line-height:1.5;margin-top:2px;}
+.import-spinner{text-align:center;padding:2rem 1rem;color:var(--color-text-secondary);font-size:13px;}
+
 /* LOGIN & ADMIN STYLES */
 .login-overlay{position:fixed;inset:0;background:var(--color-background-tertiary,#f7f6f3);display:flex;align-items:center;justify-content:center;z-index:200;}
 .login-box{background:var(--color-background-primary,#fff);border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-lg,12px);padding:2rem;width:360px;max-width:92vw;text-align:center;}
@@ -195,7 +215,7 @@ table.orders tr:hover td{background:var(--color-background-secondary);}
 
   <!-- ORDERS -->
   <div id="tab-orders" style="display:none;">
-    <div class="header"><h2>Work orders</h2><button class="btn btn-primary" onclick="openModal()">+ New order</button></div>
+    <div class="header"><h2>Work orders</h2><div style="display:flex;gap:8px;"><button class="btn" onclick="openImportModal()" id="btn-import-excel">↑ Import Excel</button><button class="btn btn-primary" onclick="openModal()">+ New order</button></div></div>
     <div class="metrics" id="metrics"></div>
     <div id="board"></div>
   </div>
@@ -367,6 +387,53 @@ table.orders tr:hover td{background:var(--color-background-secondary);}
   <div class="modal-actions">
     <button class="btn" onclick="closeModal()">Cancel</button>
     <button class="btn btn-primary" onclick="saveOrder()">Save order</button>
+  </div>
+</div>
+</div>
+</div>
+
+<!-- IMPORT MODAL -->
+<div id="import-modal" style="display:none;">
+<div class="modal-overlay" onclick="closeImportOut(event)">
+<div class="modal import-modal">
+  <h2>Import from Excel</h2>
+
+  <!-- State 1: drop zone -->
+  <div id="import-drop-zone" class="drop-zone"
+    onclick="document.getElementById('import-file-input').click()"
+    ondragover="importDragOver(event)"
+    ondragleave="importDragLeave(event)"
+    ondrop="importDrop(event)">
+    <div class="drop-icon">📂</div>
+    <div class="drop-label">Drop your production schedule here</div>
+    <div class="drop-hint">or click to select &nbsp;·&nbsp; .xlsx files only</div>
+  </div>
+  <input type="file" id="import-file-input" accept=".xlsx" style="display:none;" onchange="importFileSelected(event)"/>
+
+  <!-- State 2: parsing -->
+  <div id="import-parsing" class="import-spinner" style="display:none;">Parsing schedule…</div>
+
+  <!-- State 3: preview -->
+  <div id="import-preview-section" style="display:none;">
+    <div class="import-summary" id="import-summary"></div>
+    <div class="import-preview">
+      <table class="import-tbl">
+        <thead><tr>
+          <th style="width:32px;"><input type="checkbox" id="import-check-all" onchange="importToggleAll(this.checked)" checked/></th>
+          <th>Action</th><th>MO #</th><th>SKU / Product</th><th>Machine</th><th>Start</th><th>End</th><th>Changes</th>
+        </tr></thead>
+        <tbody id="import-tbody"></tbody>
+      </table>
+    </div>
+    <div class="modal-actions" style="margin-top:1rem;">
+      <button class="btn" onclick="closeImportModal()">Cancel</button>
+      <button class="btn btn-primary" id="import-confirm-btn" onclick="confirmImport()">Import</button>
+    </div>
+  </div>
+
+  <!-- Initial cancel (hidden once preview shown) -->
+  <div class="modal-actions" id="import-initial-actions" style="margin-top:1rem;">
+    <button class="btn" onclick="closeImportModal()">Cancel</button>
   </div>
 </div>
 </div>
@@ -884,6 +951,147 @@ function renderMetrics(){
 }
 function toggleGroup(grp){collapsed[grp]=!collapsed[grp];persist();render();}
 init();
+
+/* ===== EXCEL IMPORT ===== */
+
+const IMPORT_MACHINE_LABELS={
+  seed_clean:'Seed cleaning',roaster:'Roaster',east_mac:'East Mac (CBS)',west_mac:'West Mac (CBE)',
+  mac_1250:'1250 Mac',mac_packout:'Mac Packout',fat_melter:'Fat melter',
+  refining:'Refining',conching:'Conching',depositing:'Pack out'
+};
+
+let importParsed=[];
+
+function openImportModal(){
+  if(!canEditOrders()){alert('You do not have permission to import orders.');return;}
+  // Reset to initial state
+  document.getElementById('import-modal').style.display='';
+  document.getElementById('import-drop-zone').style.display='';
+  document.getElementById('import-parsing').style.display='none';
+  document.getElementById('import-preview-section').style.display='none';
+  document.getElementById('import-initial-actions').style.display='flex';
+  document.getElementById('import-file-input').value='';
+  importParsed=[];
+}
+function closeImportModal(){document.getElementById('import-modal').style.display='none';}
+function closeImportOut(e){if(e.target.classList.contains('modal-overlay'))closeImportModal();}
+
+function importDragOver(e){e.preventDefault();e.currentTarget.classList.add('drag-over');}
+function importDragLeave(e){e.currentTarget.classList.remove('drag-over');}
+function importDrop(e){
+  e.preventDefault();e.currentTarget.classList.remove('drag-over');
+  const f=e.dataTransfer.files[0];
+  if(f)processImportFile(f);
+}
+function importFileSelected(e){const f=e.target.files[0];if(f)processImportFile(f);}
+
+async function processImportFile(file){
+  document.getElementById('import-drop-zone').style.display='none';
+  document.getElementById('import-initial-actions').style.display='none';
+  document.getElementById('import-parsing').style.display='';
+  document.getElementById('import-preview-section').style.display='none';
+
+  const fd=new FormData();
+  fd.append('file',file);
+  try{
+    const r=await fetch('/api/import-excel/parse',{method:'POST',body:fd});
+    const data=await r.json();
+    if(!data.ok)throw new Error(data.error||'Parse failed');
+    showImportPreview(data.orders);
+  }catch(err){
+    document.getElementById('import-parsing').style.display='none';
+    document.getElementById('import-drop-zone').style.display='';
+    document.getElementById('import-initial-actions').style.display='flex';
+    alert('Could not parse file: '+err.message);
+  }
+}
+
+function showImportPreview(parsed){
+  document.getElementById('import-parsing').style.display='none';
+  document.getElementById('import-preview-section').style.display='';
+
+  // Diff against current orders by orderId
+  const byId={};
+  orders.forEach(o=>{if(o.orderId)byId[o.orderId]=o;});
+
+  importParsed=parsed.map(imp=>{
+    const ex=byId[imp.orderId];
+    if(!ex)return{...imp,_action:'new'};
+    const FIELDS=['sku','machine','start','end','qty','total'];
+    const changes=FIELDS.filter(f=>String(ex[f]||'')!==String(imp[f]||''))
+      .map(f=>`${f}: ${ex[f]||'—'} → ${imp[f]||'—'}`);
+    return changes.length
+      ?{...imp,_action:'update',_changes:changes,_existingId:ex.id}
+      :{...imp,_action:'same',_existingId:ex.id};
+  });
+
+  const nNew=importParsed.filter(r=>r._action==='new').length;
+  const nUp=importParsed.filter(r=>r._action==='update').length;
+  const nSame=importParsed.filter(r=>r._action==='same').length;
+  document.getElementById('import-summary').textContent=
+    `Found ${importParsed.length} orders: ${nNew} new · ${nUp} to update · ${nSame} unchanged`;
+
+  document.getElementById('import-tbody').innerHTML=importParsed.map((r,i)=>{
+    const chk=r._action!=='same'?'checked':'';
+    const dis=r._action==='same'?'disabled':'';
+    const bClass=r._action==='new'?'badge-new':r._action==='update'?'badge-update':'badge-same';
+    const bLabel=r._action==='new'?'NEW':r._action==='update'?'UPDATE':'SAME';
+    const skuText=esc((r.sku||'').slice(0,38))+(r.sku&&r.sku.length>38?'…':'');
+    const machLabel=esc(IMPORT_MACHINE_LABELS[r.machine]||r.machine||'—');
+    const changes=r._changes?`<div class="import-changes">${r._changes.map(esc).join('<br>')}</div>`:'';
+    return `<tr>
+      <td><input type="checkbox" class="import-row-check" data-idx="${i}" ${chk} ${dis}/></td>
+      <td><span class="badge ${bClass}">${bLabel}</span></td>
+      <td style="font-family:monospace;font-size:11px;white-space:nowrap;">${esc(r.orderId||'—')}</td>
+      <td title="${esc(r.sku||'')}">${skuText}</td>
+      <td style="white-space:nowrap;">${machLabel}</td>
+      <td style="white-space:nowrap;">${r.start||'—'}</td>
+      <td style="white-space:nowrap;">${r.end||'—'}</td>
+      <td>${changes}</td>
+    </tr>`;
+  }).join('');
+
+  const importable=nNew+nUp;
+  const btn=document.getElementById('import-confirm-btn');
+  btn.textContent=`Import ${importable} order${importable!==1?'s':''}`;
+  btn.disabled=importable===0;
+}
+
+function importToggleAll(checked){
+  document.querySelectorAll('.import-row-check:not([disabled])').forEach(cb=>cb.checked=checked);
+}
+
+async function confirmImport(){
+  const checks=document.querySelectorAll('.import-row-check');
+  const selected=[];
+  checks.forEach((cb,i)=>{if(cb.checked)selected.push(importParsed[i]);});
+  if(!selected.length){closeImportModal();return;}
+
+  let added=0,updated=0;
+  selected.forEach(r=>{
+    const{_action,_changes,_existingId,...orderData}=r;
+    if(_action==='new'){
+      orders.push({...orderData,id:uid()});
+      added++;
+    }else if(_action==='update'){
+      const idx=orders.findIndex(o=>o.id===_existingId);
+      if(idx!==-1){
+        // Preserve status/priority, update schedule fields from Excel
+        orders[idx]={...orders[idx],sku:r.sku,machine:r.machine,start:r.start,
+          end:r.end,qty:r.qty,total:r.total,due:r.due,notes:r.notes};
+        updated++;
+      }
+    }
+  });
+
+  await persist();render();renderCal();
+  closeImportModal();
+
+  const n=document.getElementById('notice');
+  n.style.display='block';
+  n.textContent=`✓ Import complete — ${added} order${added!==1?'s':''} added, ${updated} updated.`;
+  setTimeout(()=>{n.style.display='none';},5000);
+}
 </script>
 <script type="text/babel" src="traceability_explorer.jsx"></script>
 </body>
