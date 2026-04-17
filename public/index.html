@@ -154,6 +154,23 @@ table.import-tbl tr:hover td{background:var(--color-background-secondary);}
 .role-operator{background:#E6F1FB;color:#0C447C;border-radius:99px;padding:2px 8px;font-size:11px;font-weight:500;}
 .role-viewer{background:#F1EFE8;color:#444441;border-radius:99px;padding:2px 8px;font-size:11px;font-weight:500;}
 
+/* MO STATUS PAGE */
+.status-table{width:100%;border-collapse:collapse;font-size:13px;}
+.status-table th{text-align:left;padding:7px 12px;color:var(--color-text-secondary);font-weight:400;font-size:11px;border-bottom:0.5px solid var(--color-border-tertiary);text-transform:uppercase;letter-spacing:0.03em;white-space:nowrap;}
+.status-table td{padding:8px 12px;border-bottom:0.5px solid var(--color-border-tertiary);vertical-align:middle;}
+.status-table tr:last-child td{border-bottom:none;}
+.status-table tr:hover td{background:var(--color-background-secondary);}
+.status-table .mo-id{font-weight:500;font-family:monospace;font-size:12px;}
+.status-table .tbd-id{color:var(--color-text-tertiary);font-style:italic;font-size:11px;}
+.progress-bar-wrap{width:90px;height:6px;background:var(--color-border-tertiary);border-radius:3px;overflow:hidden;display:inline-block;vertical-align:middle;margin-right:6px;}
+.progress-bar-fill{height:100%;border-radius:3px;background:#27C068;transition:width 0.3s;}
+.progress-bar-fill.over{background:#185FA5;}
+.status-filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:1rem;}
+.status-filters input{padding:6px 10px;font-size:13px;border:0.5px solid var(--color-border-secondary);border-radius:var(--border-radius-md,8px);background:var(--color-background-primary);color:var(--color-text-primary);font-family:inherit;width:200px;}
+.status-filters select{padding:6px 10px;font-size:13px;border:0.5px solid var(--color-border-secondary);border-radius:var(--border-radius-md,8px);background:var(--color-background-primary);color:var(--color-text-primary);font-family:inherit;}
+.status-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:1.25rem;}
+.no-inv-note{background:#FAEEDA;color:#633806;border-radius:var(--border-radius-md,8px);padding:8px 12px;font-size:12px;margin-bottom:1rem;}
+
 /* AI CHAT WIDGET */
 #ai-widget{position:fixed;bottom:24px;right:24px;z-index:8000;display:flex;flex-direction:column;align-items:flex-end;gap:12px;}
 #ai-fab{width:52px;height:52px;border-radius:50%;background:#1a1916;color:#fff;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(0,0,0,0.25);transition:transform 0.15s,background 0.15s;flex-shrink:0;}
@@ -218,6 +235,7 @@ table.import-tbl tr:hover td{background:var(--color-background-secondary);}
     <button class="tab" onclick="switchTab('orders')">Work orders</button>
     <button class="tab" onclick="switchTab('capacity')">Capacity &amp; ops</button>
     <button class="tab" onclick="switchTab('traceability')">Traceability</button>
+    <button class="tab" onclick="switchTab('mo-status')">MO Status</button>
     <button class="tab" onclick="switchTab('admin')" id="tab-admin-btn" style="display:none;">Admin console</button>
   </div>
 
@@ -292,6 +310,51 @@ table.import-tbl tr:hover td{background:var(--color-background-secondary);}
   <!-- TRACEABILITY EXPLORER -->
   <div id="tab-traceability" style="display:none;">
     <div id="traceability-root"></div>
+  </div>
+
+  <!-- MO STATUS -->
+  <div id="tab-mo-status" style="display:none;">
+    <div class="header">
+      <h2>MO Status</h2>
+      <button class="btn btn-sm" onclick="renderMOStatus()">↺ Refresh</button>
+    </div>
+    <div id="mo-status-summary" class="status-summary"></div>
+    <div id="mo-status-no-inv" class="no-inv-note" style="display:none;">
+      No inventory movement data loaded yet. Upload a CSV on the Traceability tab to see actual vs. planned quantities.
+    </div>
+    <div class="status-filters">
+      <input id="mo-status-search" placeholder="Search MO / SKU…" oninput="renderMOStatus()">
+      <select id="mo-status-machine" onchange="renderMOStatus()">
+        <option value="">All machines</option>
+      </select>
+      <select id="mo-status-filter" onchange="renderMOStatus()">
+        <option value="">All statuses</option>
+        <option value="not-started">Not started</option>
+        <option value="in-progress">In progress</option>
+        <option value="complete">Complete</option>
+        <option value="on-hold">On hold</option>
+        <option value="no-mo">No MO number</option>
+      </select>
+    </div>
+    <div class="card" style="overflow:hidden;">
+      <div style="overflow-x:auto;">
+        <table class="status-table">
+          <thead>
+            <tr>
+              <th>MO #</th>
+              <th>SKU / Product</th>
+              <th>Machine</th>
+              <th>Start → End</th>
+              <th style="text-align:right;">Planned qty</th>
+              <th style="text-align:right;">Actual in</th>
+              <th>Progress</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="mo-status-tbody"></tbody>
+        </table>
+      </div>
+    </div>
   </div>
 
   <!-- ADMIN CONSOLE -->
@@ -756,16 +819,17 @@ function shortSku(s){
 
 function switchTab(t){
   if(t==='admin'&&(!currentUser||currentUser.role!=='admin'))return;
-  ['calendar','orders','capacity','traceability','admin'].forEach(k=>{document.getElementById('tab-'+k).style.display=k===t?'':'none';});
+  ['calendar','orders','capacity','traceability','mo-status','admin'].forEach(k=>{document.getElementById('tab-'+k).style.display=k===t?'':'none';});
   document.querySelectorAll('.tab').forEach(el=>{
     const tabName=el.textContent.trim().toLowerCase();
-    const map={'calendar':'calendar','work orders':'orders','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','admin console':'admin'};
+    const map={'calendar':'calendar','work orders':'orders','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','mo status':'mo-status','admin console':'admin'};
     el.classList.toggle('active',map[tabName]===t);
   });
   if(t==='calendar')renderCal();
   if(t==='orders')render();
   if(t==='admin')renderUsers();
   if(t==='traceability'&&!window._traceabilityMounted){window._traceabilityMounted=true;if(window.App){ReactDOM.createRoot(document.getElementById('traceability-root')).render(React.createElement(window.App));}}
+  if(t==='mo-status'){populateMOStatusMachineFilter();renderMOStatus();}
 }
 function shiftCal(d){calOffset+=d*4;renderCal();}
 function resetCal(){calOffset=0;renderCal();}
@@ -1091,6 +1155,143 @@ function showImportPreview(parsed){
 
 function importToggleAll(checked){
   document.querySelectorAll('.import-row-check:not([disabled])').forEach(cb=>cb.checked=checked);
+}
+
+// ── MO Status Tab ────────────────────────────────────────────────────────────
+
+const MO_STATUS_MACHINE_LABELS = {
+  seed_clean:'Seed Cleaning', roaster:'Alk/Roaster',
+  east_mac:'East Mac (CBS)', west_mac:'West Mac (CBE)',
+  mac_1250:'1250 Mac', mac_packout:'Mac Packout', pouching:'Pouching',
+  fat_melter:'Fat Melter', refining:'Refining',
+  conching:'Conching', depositing:'Depositing',
+};
+
+function populateMOStatusMachineFilter() {
+  const sel = document.getElementById('mo-status-machine');
+  if (sel.options.length > 1) return; // already populated
+  const machines = [...new Set(orders.map(o => o.machine).filter(Boolean))].sort();
+  machines.forEach(m => {
+    const opt = document.createElement('option');
+    opt.value = m;
+    opt.textContent = MO_STATUS_MACHINE_LABELS[m] || m;
+    sel.appendChild(opt);
+  });
+}
+
+async function renderMOStatus() {
+  const search  = (document.getElementById('mo-status-search').value || '').toLowerCase();
+  const machine = document.getElementById('mo-status-machine').value;
+  const filter  = document.getElementById('mo-status-filter').value;
+
+  // Load inventory movements from server (or use D.moMovements if loaded by traceability tab)
+  let moMovements = {};
+  try {
+    const inv = await fetch('/api/data/inventory').then(r => r.json());
+    moMovements = (inv.exists && inv.value && inv.value.moMovements) ? inv.value.moMovements : {};
+  } catch(e) {}
+
+  const hasInvData = Object.keys(moMovements).length > 0;
+  document.getElementById('mo-status-no-inv').style.display = hasInvData ? 'none' : 'block';
+
+  // Build row data
+  const rows = orders.map(o => {
+    const moMatch = (o.orderId || '').match(/MO-\d+/);
+    const moId    = moMatch ? moMatch[0] : null;
+    const inv     = moId ? moMovements[moId] : null;
+    const planned = o.qty || 0;
+    const actual  = inv ? (inv.totalIn || 0) : 0;
+    const pct     = planned > 0 ? Math.min(Math.round(actual / planned * 100), 999) : null;
+
+    // Determine status
+    let status = o.status || 'queued';
+    if (hasInvData) {
+      if (status !== 'on-hold') {
+        if (actual === 0)           status = 'not-started';
+        else if (!planned || pct < 100) status = 'in-progress';
+        else                        status = 'complete';
+      }
+    }
+    if (!moId) status = 'no-mo';
+
+    return { o, moId, inv, planned, actual, pct, status };
+  });
+
+  // Summary counts
+  const counts = { 'not-started': 0, 'in-progress': 0, 'complete': 0, 'on-hold': 0, 'no-mo': 0 };
+  rows.forEach(r => { if (counts[r.status] !== undefined) counts[r.status]++; });
+
+  document.getElementById('mo-status-summary').innerHTML = [
+    { label:'Total orders', val: orders.length,          color:'' },
+    { label:'Not started',  val: counts['not-started'],  color:'#F1EFE8' },
+    { label:'In progress',  val: counts['in-progress'],  color:'#E6F1FB' },
+    { label:'Complete',     val: counts['complete'],      color:'#EAF3DE' },
+  ].map(s => `
+    <div class="metric" style="${s.color?'background:'+s.color:''}">
+      <div class="metric-label">${s.label}</div>
+      <div class="metric-value">${s.val}</div>
+    </div>`).join('');
+
+  // Filter rows
+  const filtered = rows.filter(r => {
+    if (machine && r.o.machine !== machine) return false;
+    if (filter  && r.status !== filter)     return false;
+    if (search) {
+      const hay = ((r.moId || '') + ' ' + (r.o.sku || '') + ' ' + (r.o.orderId || '')).toLowerCase();
+      if (!hay.includes(search)) return false;
+    }
+    return true;
+  });
+
+  // Sort: in-progress first, then not-started, then complete, then no-mo
+  const ORDER = {'in-progress':0,'not-started':1,'on-hold':2,'complete':3,'no-mo':4};
+  filtered.sort((a,b) => {
+    const so = (ORDER[a.status]??5) - (ORDER[b.status]??5);
+    if (so !== 0) return so;
+    return (a.o.start || '').localeCompare(b.o.start || '');
+  });
+
+  const statusBadge = s => {
+    const map = {
+      'not-started': 'badge-queued',
+      'in-progress':  'badge-in-progress',
+      'complete':     'badge-complete',
+      'on-hold':      'badge-on-hold',
+      'no-mo':        'badge-queued',
+    };
+    const labels = {
+      'not-started':'Not started','in-progress':'In progress',
+      'complete':'Complete','on-hold':'On hold','no-mo':'No MO',
+    };
+    return `<span class="badge ${map[s]||'badge-queued'}">${labels[s]||s}</span>`;
+  };
+
+  const fmtQty = q => q > 0 ? q.toLocaleString() + ' kg' : '—';
+
+  document.getElementById('mo-status-tbody').innerHTML = filtered.length === 0
+    ? `<tr><td colspan="8" class="empty">No orders match the current filters.</td></tr>`
+    : filtered.map(({ o, moId, actual, planned, pct, status }) => {
+        const moCell = moId
+          ? `<span class="mo-id">${moId}</span>`
+          : `<span class="tbd-id">${escapeHtml(o.orderId || '—')}</span>`;
+        const machLabel = MO_STATUS_MACHINE_LABELS[o.machine] || o.machine || '—';
+        const dateRange = (o.start && o.end)
+          ? `${o.start} → ${o.end}`
+          : (o.start || o.end || '—');
+        const progressCell = (moId && hasInvData && planned > 0)
+          ? `<div class="progress-bar-wrap"><div class="progress-bar-fill${pct>100?' over':''}" style="width:${Math.min(pct,100)}%"></div></div>${pct}%`
+          : `<span style="color:var(--color-text-tertiary);font-size:11px;">—</span>`;
+        return `<tr>
+          <td>${moCell}</td>
+          <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(o.sku||'')}">${escapeHtml(o.sku||'—')}</td>
+          <td>${machLabel}</td>
+          <td style="white-space:nowrap;font-size:12px;">${dateRange}</td>
+          <td style="text-align:right;">${fmtQty(planned)}</td>
+          <td style="text-align:right;">${moId && hasInvData ? fmtQty(actual) : '—'}</td>
+          <td style="white-space:nowrap;">${progressCell}</td>
+          <td>${statusBadge(status)}</td>
+        </tr>`;
+      }).join('');
 }
 
 async function confirmImport(){

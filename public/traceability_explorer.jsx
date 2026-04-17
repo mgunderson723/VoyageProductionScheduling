@@ -81,6 +81,7 @@ function parseInventoryCSV(text) {
   const batchSets = new Map();
   const catAgg = {};
   const rtAgg = {};
+  const moMap = new Map();   // MO-level movement tracking
   const monthSet = new Set();
   let rowCount = 0;
 
@@ -123,6 +124,17 @@ function parseInventoryCSV(text) {
     if (!rtAgg[rt]) rtAgg[rt] = {};
     if (!rtAgg[rt][month]) rtAgg[rt][month] = { i: 0, o: 0 };
     rtAgg[rt][month].i += inb; rtAgg[rt][month].o += outb;
+
+    // Track movements by MO reference
+    const ref = colMap.reference !== undefined ? (f[colMap.reference] || '') : '';
+    const moMatch = ref.match(/MO-\d+/);
+    if (moMatch) {
+      const moId = moMatch[0];
+      if (!moMap.has(moId)) moMap.set(moId, { mo: moId, sku, prod, totalIn: 0, totalOut: 0 });
+      const me = moMap.get(moId);
+      me.totalIn  += inb;
+      me.totalOut += outb;
+    }
   }
 
   // Set batch counts from unique batch numbers per SKU
@@ -131,7 +143,7 @@ function parseInventoryCSV(text) {
   const months = [...monthSet].sort();
   const invSku = [...skuMap.values()];
   if (!invSku.length) throw new Error("No valid data rows found (parsed " + lines.length + " lines, " + rowCount + " data rows)");
-  return { invSku, invCat: catAgg, invRt: rtAgg, months, rowCount };
+  return { invSku, invCat: catAgg, invRt: rtAgg, months, rowCount, moMovements: Object.fromEntries(moMap) };
 }
 
 /* ───────── Merge inventory data (for delta uploads) ───────── */
@@ -219,8 +231,18 @@ function mergeInventoryData(existing, delta) {
     }
   }
 
+  // Merge MO movements
+  const mergedMoMovements = {};
+  for (const src of [existing.moMovements || {}, delta.moMovements || {}]) {
+    for (const mo in src) {
+      if (!mergedMoMovements[mo]) mergedMoMovements[mo] = { ...src[mo], totalIn: 0, totalOut: 0 };
+      mergedMoMovements[mo].totalIn  += src[mo].totalIn  || 0;
+      mergedMoMovements[mo].totalOut += src[mo].totalOut || 0;
+    }
+  }
+
   const months = [...new Set([...(existing.months || []), ...(delta.months || [])])].sort();
-  return { invSku: [...skuMap.values()], invCat: mergedCatAgg, invRt: mergedRtAgg, months };
+  return { invSku: [...skuMap.values()], invCat: mergedCatAgg, invRt: mergedRtAgg, months, moMovements: mergedMoMovements };
 }
 
 /* ───────── shared ───────── */
@@ -489,7 +511,7 @@ function InvUploadModal({ onClose, onUploaded }) {
         const base = (existing.exists && existing.value) ? existing.value : { invSku: D.invSku, invCat: D.invCat, invRt: D.invRt, months: D.months };
         finalData = mergeInventoryData(base, parsed);
       } else {
-        finalData = { invSku: parsed.invSku, invCat: parsed.invCat, invRt: parsed.invRt, months: parsed.months };
+        finalData = { invSku: parsed.invSku, invCat: parsed.invCat, invRt: parsed.invRt, months: parsed.months, moMovements: parsed.moMovements || {} };
       }
       const res = await fetch("/api/data/inventory", {
         method: "PUT",
@@ -501,6 +523,7 @@ function InvUploadModal({ onClose, onUploaded }) {
       D.invCat = finalData.invCat;
       D.invRt = finalData.invRt;
       D.months = finalData.months;
+      D.moMovements = finalData.moMovements || {};
       onUploaded();
       onClose();
     } catch (err) {
@@ -874,7 +897,7 @@ function App() {
   useEffect(()=>{
     fetch("/api/data/inventory").then(r=>r.json()).then(d=>{
       if(d.exists&&d.value){
-        D.invSku=d.value.invSku;D.invCat=d.value.invCat;D.invRt=d.value.invRt;D.months=d.value.months;
+        D.invSku=d.value.invSku;D.invCat=d.value.invCat;D.invRt=d.value.invRt;D.months=d.value.months;if(d.value.moMovements)D.moMovements=d.value.moMovements;
         setInvUpdated(c=>c+1);
       }
     }).catch(()=>{});
