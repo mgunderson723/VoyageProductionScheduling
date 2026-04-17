@@ -17,6 +17,7 @@ const MACHINE_MAP = {
   "1250 mac":                         "mac_1250",
   "5k mac packout":                   "mac_packout",
   "mac packout":                      "mac_packout",
+  "pouching":                         "pouching",
   "mass line / conch / depositing":   "MULTI",
   "mass line (changeover)":           "conching",
   "fat melter":                       "fat_melter",
@@ -141,15 +142,16 @@ app.post("/api/import-excel/parse", upload.single("file"), (req, res) => {
 
     const results = [];
 
-    // Rows 0 = title, 1 = header — start at 2
+    // Row 0 = title, row 1 = header — data starts at row 2
+    // Column layout: A=Section, B=Line/Machine, C=MO#, D=SKU, E=Start, F=End, G=Qty/Notes
     for (let i = 2; i < rows.length; i++) {
       const row = rows[i];
-      const rawMachine = String(row[0] || "").trim();
-      const rawMO      = String(row[1] || "").trim();
-      const rawSKU     = String(row[2] || "").trim();
-      const rawStart   = row[3];
-      const rawEnd     = row[4];
-      const rawNotes   = String(row[5] || "").trim();
+      const rawMachine = String(row[1] || "").trim();
+      const rawMO      = String(row[2] || "").trim();
+      const rawSKU     = String(row[3] || "").trim();
+      const rawStart   = row[4];
+      const rawEnd     = row[5];
+      const rawNotes   = String(row[6] || "").trim();
 
       // Skip section headers and blank rows (no SKU = no real data)
       if (!rawSKU) continue;
@@ -204,7 +206,7 @@ const AI_SYSTEM = `You are a production scheduling assistant for Voyage Foods. Y
 
 Machines (use these exact keys):
 - Zone 1 Seed prep: seed_clean (Seed Cleaning), roaster (Alk/Roaster)
-- Zone 1 Mcintyres: east_mac (East Mac CBS), west_mac (West Mac CBE), mac_1250 (1250 Mac), mac_packout (Mac Packout)
+- Zone 1 Mcintyres: east_mac (East Mac CBS), west_mac (West Mac CBE), mac_1250 (1250 Mac), mac_packout (Mac Packout), pouching (Pouching)
 - Zone 2 Chocolate: fat_melter (Fat Melter), refining (Refining), conching (Conching), depositing (Depositing)
 
 Order statuses: queued, in-progress, complete, on-hold
