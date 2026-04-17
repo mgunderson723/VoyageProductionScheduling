@@ -1211,9 +1211,10 @@ async function renderMOStatus() {
     let status = o.status || 'queued';
     if (hasInvData) {
       if (status !== 'on-hold') {
-        if (actual === 0)            status = 'not-started';
-        else if (!planned || pct < 85) status = 'in-progress';
-        else                         status = 'complete';
+        if (actual === 0)                     status = 'not-started';
+        else if (planned === 0 && actual > 0) status = 'complete';
+        else if (!planned || pct < 85)        status = 'in-progress';
+        else                                  status = 'complete';
       }
     }
     if (!moId) status = 'no-mo';
