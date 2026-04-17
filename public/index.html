@@ -1304,7 +1304,8 @@ async function renderMOStatus() {
           <td style="text-align:right;">${moId && hasInvData ? fmtQty(actual) : '—'}</td>
           <td style="white-space:nowrap;">${progressCell}</td>
           <td>${statusBadge(status)}</td>
-          <td>${tracking === 'on-track'  ? '<span class="badge badge-on-track">On track</span>'
+          <td>${status === 'no-mo'        ? '<span class="badge badge-queued">MO needs to be added</span>'
+              : tracking === 'on-track'  ? '<span class="badge badge-on-track">On track</span>'
               : tracking === 'off-track' ? '<span class="badge badge-off-track">Off track</span>'
               : ''}</td>
         </tr>`;
