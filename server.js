@@ -213,7 +213,7 @@ Machines (use these exact keys):
 Order statuses: queued, in-progress, complete, on-hold
 Order priorities: high, med, low
 
-IMPORTANT: Before calling any write tools (shift_machine_orders, update_order_dates, update_order_status, delete_order), you MUST:
+IMPORTANT: Before calling any write tools (shift_machine_orders, update_order_dates, update_order_status, update_order_quantity, delete_order), you MUST:
 1. Use get_orders to see the current state
 2. Clearly describe to the user exactly what changes you plan to make
 3. Wait for them to explicitly confirm (e.g. "yes", "go ahead", "confirm") before executing writes
@@ -263,6 +263,19 @@ const AI_TOOLS = [
         status: { type: "string", enum: ["queued", "in-progress", "complete", "on-hold"] },
       },
       required: ["order_id", "status"],
+    },
+  },
+  {
+    name: "update_order_quantity",
+    description: "Update the batch quantity (kg) of a specific work order. Also recalculates the total.",
+    input_schema: {
+      type: "object",
+      properties: {
+        order_id: { type: "string", description: "The orderId field of the order" },
+        qty: { type: "number", description: "New batch quantity in kg" },
+        batches: { type: "number", description: "Number of batches (optional, defaults to existing value)" },
+      },
+      required: ["order_id", "qty"],
     },
   },
   {
@@ -342,6 +355,17 @@ async function executeAITool(name, input) {
       orders[idx].status = status;
       writeData("vf_orders", orders);
       return { ok: true, message: `Order '${order_id}' status set to '${status}'` };
+    }
+
+    case "update_order_quantity": {
+      const { order_id, qty, batches } = input;
+      const idx = orders.findIndex(o => o.orderId === order_id || o.id === order_id);
+      if (idx === -1) return { ok: false, error: `Order '${order_id}' not found` };
+      orders[idx].qty = qty;
+      if (batches !== undefined) orders[idx].batches = batches;
+      orders[idx].total = qty * (orders[idx].batches || 1);
+      writeData("vf_orders", orders);
+      return { ok: true, message: `Updated '${order_id}' quantity to ${qty} kg (total: ${orders[idx].total} kg)` };
     }
 
     case "delete_order": {
