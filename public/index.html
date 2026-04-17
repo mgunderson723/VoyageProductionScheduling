@@ -1533,7 +1533,7 @@ async function sendAIMessage() {
       aiMessages = data.messages;   // adopt server's full conversation (includes tool results)
       aiDisplayHistory.push({ role: 'assistant', text: data.reply });
       // If Claude made changes, refresh the UI
-      if (data.reply && /shifted|updated|changed|moved|set.*status|deleted|quantity/i.test(data.reply)) {
+      if (data.reply && /shifted|updated|changed|moved|set.*status|deleted|quantity|created order/i.test(data.reply)) {
         await loadData();
         render();
         renderCal();

@@ -231,7 +231,7 @@ When recommending a production slot:
 5. Present 2–3 concrete options (with start/end dates) and explain the trade-offs.
 6. Do NOT book anything — only recommend. The user must ask you to create or update an order to make it happen.
 
-IMPORTANT: Before calling any write tools (shift_machine_orders, update_order_dates, update_order_status, update_order_quantity, delete_order), you MUST:
+IMPORTANT: Before calling any write tools (add_order, shift_machine_orders, update_order_dates, update_order_status, update_order_quantity, delete_order), you MUST:
 1. Use get_orders to see the current state
 2. Clearly describe to the user exactly what changes you plan to make
 3. Wait for them to explicitly confirm (e.g. "yes", "go ahead", "confirm") before executing writes
@@ -281,6 +281,24 @@ const AI_TOOLS = [
         status: { type: "string", enum: ["queued", "in-progress", "complete", "on-hold"] },
       },
       required: ["order_id", "status"],
+    },
+  },
+  {
+    name: "add_order",
+    description: "Create a new work order on the production schedule. Only call this after the user has confirmed they want to proceed with a specific slot.",
+    input_schema: {
+      type: "object",
+      properties: {
+        sku:      { type: "string", description: "SKU / product description" },
+        machine:  { type: "string", description: "Machine key (e.g. east_mac, conching, roaster)" },
+        start:    { type: "string", description: "Start date YYYY-MM-DD" },
+        end:      { type: "string", description: "End date YYYY-MM-DD" },
+        qty:      { type: "number", description: "Batch quantity in kg" },
+        orderId:  { type: "string", description: "MO number if known (e.g. MO-00999), otherwise omit and one will be generated" },
+        priority: { type: "string", enum: ["high", "med", "low"], description: "Priority (default: med)" },
+        notes:    { type: "string", description: "Any notes or special instructions" },
+      },
+      required: ["sku", "machine", "start", "end"],
     },
   },
   {
@@ -400,6 +418,22 @@ async function executeAITool(name, input) {
       orders[idx].status = status;
       writeData("vf_orders", orders);
       return { ok: true, message: `Order '${order_id}' status set to '${status}'` };
+    }
+
+    case "add_order": {
+      const { sku, machine, start, end, qty = 0, orderId, priority = "med", notes = "" } = input;
+      const id = `ai-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const generatedOrderId = orderId || `TBD-${machine}-${(start || "").replace(/-/g, "")}`;
+      const newOrder = {
+        id, orderId: generatedOrderId, sku, machine,
+        start, end, due: end,
+        qty, batches: 1, total: qty,
+        status: "queued", priority, notes,
+        cat: "liquor", sub: "liquor",
+      };
+      orders.push(newOrder);
+      writeData("vf_orders", orders);
+      return { ok: true, message: `Created order '${generatedOrderId}' for ${sku} on ${machine} (${start} → ${end})`, order: newOrder };
     }
 
     case "find_available_slots": {
