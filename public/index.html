@@ -164,6 +164,7 @@ table.import-tbl tr:hover td{background:var(--color-background-secondary);}
 .status-table .tbd-id{color:var(--color-text-tertiary);font-style:italic;font-size:11px;}
 .progress-bar-wrap{width:90px;height:6px;background:var(--color-border-tertiary);border-radius:3px;overflow:hidden;display:inline-block;vertical-align:middle;margin-right:6px;}
 .progress-bar-fill{height:100%;border-radius:3px;background:#27C068;transition:width 0.3s;}
+.progress-bar-fill.near{background:#F5A623;}
 .progress-bar-fill.over{background:#185FA5;}
 .status-filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:1rem;}
 .status-filters input{padding:6px 10px;font-size:13px;border:0.5px solid var(--color-border-secondary);border-radius:var(--border-radius-md,8px);background:var(--color-background-primary);color:var(--color-text-primary);font-family:inherit;width:200px;}
@@ -1207,9 +1208,9 @@ async function renderMOStatus() {
     let status = o.status || 'queued';
     if (hasInvData) {
       if (status !== 'on-hold') {
-        if (actual === 0)           status = 'not-started';
-        else if (!planned || pct < 100) status = 'in-progress';
-        else                        status = 'complete';
+        if (actual === 0)            status = 'not-started';
+        else if (!planned || pct < 85) status = 'in-progress';
+        else                         status = 'complete';
       }
     }
     if (!moId) status = 'no-mo';
@@ -1279,7 +1280,7 @@ async function renderMOStatus() {
           ? `${o.start} → ${o.end}`
           : (o.start || o.end || '—');
         const progressCell = (moId && hasInvData && planned > 0)
-          ? `<div class="progress-bar-wrap"><div class="progress-bar-fill${pct>100?' over':''}" style="width:${Math.min(pct,100)}%"></div></div>${pct}%`
+          ? `<div class="progress-bar-wrap"><div class="progress-bar-fill${pct>100?' over':pct>=85?' near':''}" style="width:${Math.min(pct,100)}%"></div></div>${pct}%`
           : `<span style="color:var(--color-text-tertiary);font-size:11px;">—</span>`;
         return `<tr>
           <td>${moCell}</td>
