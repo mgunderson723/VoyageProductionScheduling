@@ -588,7 +588,7 @@ async function loadUsers(){
     }
   }catch(e){users=[];}
   if(!users.length){
-    users=[{id:'master',username:'admin',password:hashPassword('admin123'),role:'admin',created:'2026-01-01'}];
+    users=[{id:'master',username:'productionadmin',password:hashPassword('productionadmin1800'),role:'admin',created:'2026-01-01'}];
     await persistUsers();
   }
 }
