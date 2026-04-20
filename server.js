@@ -614,13 +614,20 @@ function cin7Headers() {
   };
 }
 
-async function fetchCin7Movements() {
+async function fetchCin7Movements(days) {
   if (!process.env.CIN7_ACCOUNT_ID || !process.env.CIN7_APPLICATION_KEY) {
     throw new Error("CIN7_ACCOUNT_ID or CIN7_APPLICATION_KEY environment variable not set");
   }
-  const end   = new Date();
-  const start = new Date();
-  start.setDate(start.getDate() - CIN7_SYNC_DAYS);
+  const windowDays = days ?? CIN7_SYNC_DAYS;
+  const end = new Date();
+  let start = new Date();
+  start.setDate(start.getDate() - windowDays);
+  // Snap start to the 1st of its month when the caller requested a short window,
+  // so the per-month merge in performCin7Sync doesn't replace a month bucket with
+  // a partial fetch and drop earlier days.
+  if (days != null) {
+    start = new Date(start.getFullYear(), start.getMonth(), 1);
+  }
   const startDate = start.toISOString().slice(0, 10);
   const endDate   = end.toISOString().slice(0, 10);
 
@@ -631,11 +638,17 @@ async function fetchCin7Movements() {
   while (true) {
     const url = `${C7.base}${C7.path}?Page=${page}&Limit=${limit}&StartDate=${startDate}&EndDate=${endDate}`;
     const resp = await fetch(url, { headers: cin7Headers() });
+    const ct   = resp.headers.get("content-type") || "";
+    const text = await resp.text().catch(() => "");
     if (!resp.ok) {
-      const body = await resp.text().catch(() => "");
-      throw new Error(`Cin7 API ${resp.status} ${resp.statusText}: ${body.slice(0, 300)}`);
+      throw new Error(`Cin7 API ${resp.status} ${resp.statusText} [${ct}]: ${text.slice(0, 300)}`);
     }
-    const data  = await resp.json();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (_) {
+      throw new Error(`Cin7 API ${resp.status} returned non-JSON [${ct}]: ${text.slice(0, 300)}`);
+    }
     const batch = data[C7.arrKey] || [];
     all.push(...batch);
     // Stop when we get fewer records than the page size
@@ -709,8 +722,8 @@ function buildInventoryFromCin7(movements) {
   };
 }
 
-async function performCin7Sync() {
-  const { movements, startDate, endDate } = await fetchCin7Movements();
+async function performCin7Sync(days) {
+  const { movements, startDate, endDate } = await fetchCin7Movements(days);
   const fresh    = buildInventoryFromCin7(movements);
   const existing = readData("inventory");
 
@@ -806,7 +819,7 @@ async function performCin7Sync() {
 // POST /api/sync-cin7 — manual on-demand sync
 app.post("/api/sync-cin7", async (req, res) => {
   try {
-    const status = await performCin7Sync();
+    const status = await performCin7Sync(15);
     res.json(status);
   } catch (e) {
     console.error("[Cin7] Sync error:", e.message);
@@ -828,8 +841,17 @@ app.get("/api/sync-cin7/test", async (req, res) => {
     }
     const url  = `${C7.base}${C7.path}?Page=1&Limit=3`;
     const resp = await fetch(url, { headers: cin7Headers() });
-    const body = await resp.json().catch(() => ({}));
-    res.json({ ok: resp.ok, status: resp.status, fieldMap: C7, sample: body });
+    const ct   = resp.headers.get("content-type") || "";
+    const text = await resp.text().catch(() => "");
+    let sample;
+    let parseError = null;
+    try {
+      sample = JSON.parse(text);
+    } catch (e) {
+      parseError = e.message;
+      sample = text.slice(0, 500);
+    }
+    res.json({ ok: resp.ok, status: resp.status, contentType: ct, fieldMap: C7, sample, parseError });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
