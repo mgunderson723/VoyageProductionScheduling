@@ -1,6 +1,7 @@
 const express = require("express");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const multer = require("multer");
 const XLSX = require("xlsx");
 const Anthropic = require("@anthropic-ai/sdk");
@@ -110,6 +111,133 @@ function writeData(key, data) {
   const file = path.join(DATA_DIR, `${key}.json`);
   fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8");
 }
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+//
+// All /api/* endpoints require a valid session cookie except /api/login and
+// /api/logout. The cookie is an HMAC-signed payload "<userId>.<expiresMs>.<sig>".
+// The hash function below MUST match public/index.html#hashPassword so existing
+// stored user records remain valid.
+
+const SESSION_SECRET   = process.env.SESSION_SECRET || crypto.randomBytes(32).toString("hex");
+const SESSION_TTL_MS   = 7 * 24 * 60 * 60 * 1000; // 7 days
+const SESSION_COOKIE   = "vfsession";
+const IS_PROD          = !!process.env.RAILWAY_ENVIRONMENT || process.env.NODE_ENV === "production";
+
+if (!process.env.SESSION_SECRET) {
+  console.warn("[auth] SESSION_SECRET not set — generated an ephemeral secret. Sessions will be invalidated on every restart. Set SESSION_SECRET in env to fix.");
+}
+
+function hashPassword(pw) {
+  let h = 0;
+  for (let i = 0; i < pw.length; i++) { h = ((h << 5) - h) + pw.charCodeAt(i); h |= 0; }
+  return "h_" + Math.abs(h).toString(36) + "_" + pw.length;
+}
+
+function signSession(userId) {
+  const expires = Date.now() + SESSION_TTL_MS;
+  const payload = `${userId}.${expires}`;
+  const sig = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
+  return `${payload}.${sig}`;
+}
+
+function verifySession(value) {
+  if (!value) return null;
+  const parts = value.split(".");
+  if (parts.length !== 3) return null;
+  const [userId, expiresStr, sig] = parts;
+  const payload = `${userId}.${expiresStr}`;
+  const expected = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
+  if (sig.length !== expected.length) return null;
+  let sigBuf, expBuf;
+  try { sigBuf = Buffer.from(sig); expBuf = Buffer.from(expected); } catch (e) { return null; }
+  if (!crypto.timingSafeEqual(sigBuf, expBuf)) return null;
+  if (Number(expiresStr) < Date.now()) return null;
+  return userId;
+}
+
+function parseCookies(header) {
+  const out = {};
+  if (!header) return out;
+  for (const part of header.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx === -1) continue;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    out[k] = decodeURIComponent(v);
+  }
+  return out;
+}
+
+function getSessionUserId(req) {
+  const cookies = parseCookies(req.headers.cookie);
+  return verifySession(cookies[SESSION_COOKIE]);
+}
+
+function buildCookie(value, maxAgeSec) {
+  const parts = [
+    `${SESSION_COOKIE}=${encodeURIComponent(value)}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    `Max-Age=${maxAgeSec}`,
+  ];
+  if (IS_PROD) parts.push("Secure");
+  return parts.join("; ");
+}
+
+// Seed a default admin if no users exist yet, so a fresh deploy is loginnable.
+function seedDefaultAdminIfMissing() {
+  const users = readData("vf_users");
+  if (Array.isArray(users) && users.length > 0) return;
+  const defaultUser = {
+    id: "master",
+    username: "productionadmin",
+    password: hashPassword("productionadmin1800"),
+    role: "admin",
+    created: new Date().toISOString().slice(0, 10),
+  };
+  writeData("vf_users", [defaultUser]);
+  console.log("[auth] Seeded default admin user 'productionadmin' (no prior users found).");
+}
+seedDefaultAdminIfMissing();
+
+// Public auth endpoints (registered BEFORE the requireAuth middleware below).
+app.post("/api/login", (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ ok: false, error: "Missing username or password" });
+  }
+  const users = readData("vf_users") || [];
+  const u = users.find(x => x && x.username && x.username.toLowerCase() === String(username).toLowerCase());
+  if (!u || u.password !== hashPassword(password)) {
+    return res.status(401).json({ ok: false, error: "Invalid credentials" });
+  }
+  res.setHeader("Set-Cookie", buildCookie(signSession(u.id), Math.floor(SESSION_TTL_MS / 1000)));
+  res.json({ ok: true, user: { id: u.id, username: u.username, role: u.role } });
+});
+
+app.post("/api/logout", (req, res) => {
+  res.setHeader("Set-Cookie", buildCookie("", 0));
+  res.json({ ok: true });
+});
+
+// Everything else under /api/* requires authentication.
+app.use("/api", (req, res, next) => {
+  if (req.path === "/login" || req.path === "/logout") return next();
+  const userId = getSessionUserId(req);
+  if (!userId) return res.status(401).json({ ok: false, error: "Not authenticated" });
+  req.userId = userId;
+  next();
+});
+
+// GET /api/me — used by the front-end to resume a session on page load.
+app.get("/api/me", (req, res) => {
+  const users = readData("vf_users") || [];
+  const u = users.find(x => x && x.id === req.userId);
+  if (!u) return res.status(401).json({ ok: false, error: "User no longer exists" });
+  res.json({ ok: true, user: { id: u.id, username: u.username, role: u.role } });
+});
 
 // GET data by key
 app.get("/api/data/:key", (req, res) => {

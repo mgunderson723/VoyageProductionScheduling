@@ -602,35 +602,47 @@ async function persistUsers(){
   }catch(e){}
 }
 
-function doLogin(){
+async function doLogin(){
   const uEl=document.getElementById('login-user'),pEl=document.getElementById('login-pass');
-  const username=uEl.value.trim().toLowerCase(),password=pEl.value;
-  if(!username||!password){document.getElementById('login-err').textContent='Please enter username and password.';return;}
-  const user=users.find(u=>u.username.toLowerCase()===username&&u.password===hashPassword(password));
-  if(!user){document.getElementById('login-err').textContent='Invalid username or password.';return;}
-  currentUser=user;
-  try{sessionStorage.setItem('vf_session',JSON.stringify({id:user.id,username:user.username,role:user.role}));}catch(e){}
-  showApp();
+  const errEl=document.getElementById('login-err');
+  const username=uEl.value.trim(),password=pEl.value;
+  if(!username||!password){errEl.textContent='Please enter username and password.';return;}
+  errEl.textContent='Signing in…';
+  try{
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password})});
+    if(!r.ok){
+      const j=await r.json().catch(()=>({}));
+      errEl.textContent=j.error||'Invalid username or password.';
+      return;
+    }
+    const j=await r.json();
+    await loadUsers();
+    currentUser=users.find(u=>u.id===j.user.id)||j.user;
+    errEl.textContent='';
+    showApp();
+  }catch(e){
+    errEl.textContent='Could not reach server. Try again.';
+  }
 }
-function doLogout(){
+async function doLogout(){
+  try{await fetch('/api/logout',{method:'POST'});}catch(e){}
   currentUser=null;
-  try{sessionStorage.removeItem('vf_session');}catch(e){}
   document.getElementById('main-app').style.display='none';
   document.getElementById('login-screen').style.display='flex';
   document.getElementById('login-user').value='';
   document.getElementById('login-pass').value='';
   document.getElementById('login-err').textContent='';
 }
-function tryResumeSession(){
+async function tryResumeSession(){
   try{
-    const s=sessionStorage.getItem('vf_session');
-    if(s){
-      const sess=JSON.parse(s);
-      const user=users.find(u=>u.id===sess.id);
-      if(user){currentUser=user;showApp();return true;}
-    }
-  }catch(e){}
-  return false;
+    const r=await fetch('/api/me');
+    if(!r.ok)return false;
+    const j=await r.json();
+    await loadUsers();
+    currentUser=users.find(u=>u.id===j.user.id)||j.user;
+    showApp();
+    return true;
+  }catch(e){return false;}
 }
 
 function showApp(){
@@ -792,8 +804,7 @@ async function init(){
       if(raw)collapsed=JSON.parse(raw);
     }
   }catch(e){}
-  await loadUsers();
-  if(!tryResumeSession()){
+  if(!(await tryResumeSession())){
     document.getElementById('login-screen').style.display='flex';
   }
 }
