@@ -1410,6 +1410,8 @@ async function init(){
   }
   // Compute which MOs are inventory-derived complete (best-effort, after orders are loaded)
   await loadInventoryCompletion();
+  // Re-derive completion + auto-promote whenever the Traceability tab uploads a fresh inventory CSV
+  window.addEventListener('vf-inventory-updated', () => { loadInventoryCompletion(); });
 }
 
 async function persist(){
@@ -1464,6 +1466,27 @@ async function loadInventoryCompletion(){
       }
     });
     inventoryCompletedMOs = next;
+
+    // Auto-promote: when inventory says an MO is done, flip the order's
+    // status to 'complete' so the Work Orders tab badge agrees with the
+    // calendar ✓ and MO Status tab. Skip orders the user has explicitly
+    // put on hold (deliberate state) or already marked complete.
+    let promoted = 0;
+    (orders||[]).forEach(o=>{
+      if(o.status === 'complete' || o.status === 'on-hold') return;
+      const moMatch = (o.orderId||'').match(/MO-\d+/);
+      if(!moMatch) return;
+      if(next.has(moMatch[0])){
+        o.status = 'complete';
+        promoted++;
+      }
+    });
+    if(promoted > 0){
+      await persist();
+      if(typeof render === 'function') render();
+      if(typeof renderCal === 'function') renderCal();
+      console.log(`[auto-promote] ${promoted} order(s) promoted to complete based on uploaded inventory data.`);
+    }
   }catch(e){/* silent — calendar still works without inventory data */}
 }
 

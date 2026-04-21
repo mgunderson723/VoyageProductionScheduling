@@ -82,6 +82,10 @@ function parseInventoryCSV(text) {
   const catAgg = {};
   const rtAgg = {};
   const monthSet = new Set();
+  // Per-MO movement aggregator — populated when a row's Reference column
+  // contains an MO number (MO-NNNN). Drives the "Complete" status on the
+  // MO Status tab, the calendar ✓ marks, and the auto-promote feature.
+  const moMovements = {};
   let rowCount = 0;
 
   for (let i = hdrIdx + 1; i < lines.length; i++) {
@@ -100,6 +104,7 @@ function parseInventoryCSV(text) {
     const inb = parseNum(f[colMap.qtyIn]);
     const outb = colMap.qtyOut !== undefined ? parseNum(f[colMap.qtyOut]) : 0;
     const batch = colMap.batch !== undefined ? f[colMap.batch] : '';
+    const ref = colMap.reference !== undefined ? (f[colMap.reference] || '') : '';
 
     monthSet.add(month);
     rowCount++;
@@ -123,6 +128,16 @@ function parseInventoryCSV(text) {
     if (!rtAgg[rt]) rtAgg[rt] = {};
     if (!rtAgg[rt][month]) rtAgg[rt][month] = { i: 0, o: 0 };
     rtAgg[rt][month].i += inb; rtAgg[rt][month].o += outb;
+
+    // Capture per-MO totals from the Reference column
+    const moMatch = ref ? ref.match(/MO-\d+/) : null;
+    if (moMatch) {
+      const moId = moMatch[0];
+      if (!moMovements[moId]) moMovements[moId] = { totalIn: 0, totalOut: 0, batches: 0 };
+      moMovements[moId].totalIn += inb;
+      moMovements[moId].totalOut += outb;
+      if (batch) moMovements[moId].batches += 1;
+    }
   }
 
   // Set batch counts from unique batch numbers per SKU
@@ -131,7 +146,7 @@ function parseInventoryCSV(text) {
   const months = [...monthSet].sort();
   const invSku = [...skuMap.values()];
   if (!invSku.length) throw new Error("No valid data rows found (parsed " + lines.length + " lines, " + rowCount + " data rows)");
-  return { invSku, invCat: catAgg, invRt: rtAgg, months, rowCount };
+  return { invSku, invCat: catAgg, invRt: rtAgg, months, moMovements, rowCount };
 }
 
 /* ───────── Merge inventory data (for delta uploads) ───────── */
@@ -220,7 +235,19 @@ function mergeInventoryData(existing, delta) {
   }
 
   const months = [...new Set([...(existing.months || []), ...(delta.months || [])])].sort();
-  return { invSku: [...skuMap.values()], invCat: mergedCatAgg, invRt: mergedRtAgg, months };
+
+  // Merge per-MO movement totals — sum totalIn/totalOut/batches per MO ID
+  const mergedMoMovements = {};
+  for (const src of [existing.moMovements || {}, delta.moMovements || {}]) {
+    for (const moId in src) {
+      if (!mergedMoMovements[moId]) mergedMoMovements[moId] = { totalIn: 0, totalOut: 0, batches: 0 };
+      mergedMoMovements[moId].totalIn += (src[moId].totalIn || 0);
+      mergedMoMovements[moId].totalOut += (src[moId].totalOut || 0);
+      mergedMoMovements[moId].batches += (src[moId].batches || 0);
+    }
+  }
+
+  return { invSku: [...skuMap.values()], invCat: mergedCatAgg, invRt: mergedRtAgg, months, moMovements: mergedMoMovements };
 }
 
 /* ───────── shared ───────── */
@@ -486,10 +513,10 @@ function InvUploadModal({ onClose, onUploaded }) {
       if (mode === "merge") {
         // Load existing persisted data to merge with
         const existing = await fetch("/api/data/inventory").then(r => r.json());
-        const base = (existing.exists && existing.value) ? existing.value : { invSku: D.invSku, invCat: D.invCat, invRt: D.invRt, months: D.months };
+        const base = (existing.exists && existing.value) ? existing.value : { invSku: D.invSku, invCat: D.invCat, invRt: D.invRt, months: D.months, moMovements: {} };
         finalData = mergeInventoryData(base, parsed);
       } else {
-        finalData = { invSku: parsed.invSku, invCat: parsed.invCat, invRt: parsed.invRt, months: parsed.months };
+        finalData = { invSku: parsed.invSku, invCat: parsed.invCat, invRt: parsed.invRt, months: parsed.months, moMovements: parsed.moMovements || {} };
       }
       const res = await fetch("/api/data/inventory", {
         method: "PUT",
@@ -502,6 +529,10 @@ function InvUploadModal({ onClose, onUploaded }) {
       D.invRt = finalData.invRt;
       D.months = finalData.months;
       onUploaded();
+      // Notify the main app so it re-runs the auto-promote pass against
+      // the freshly-uploaded inventory data — the calendar ✓ marks and
+      // Work Orders status badges update without a page reload.
+      try { window.dispatchEvent(new CustomEvent('vf-inventory-updated')); } catch (e) {}
       onClose();
     } catch (err) {
       setError("Save failed: " + err.message);
