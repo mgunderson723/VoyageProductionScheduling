@@ -1,0 +1,652 @@
+/* ============================================================================
+   VOYAGE FOODS — DESIGN TOKENS
+   Production Planner and related internal apps
+   ----------------------------------------------------------------------------
+   Drop this file at the root of your CSS imports. Everything downstream
+   should reference var(--vf-*) tokens rather than hex codes, so a single
+   edit here rolls out across every page.
+   ========================================================================= */
+
+:root {
+  /* --------------------------------------------------------------------------
+     BRAND
+     -------------------------------------------------------------------------- */
+  --vf-brand-navy:          #1A2B4A;  /* primary headings, active states */
+  --vf-brand-navy-hover:    #223763;
+  --vf-brand-cream:         #FAFAF7;  /* row labels, subtle surfaces */
+  --vf-brand-orange:        #E87722;  /* CTA, today marker, active tab */
+  --vf-brand-orange-hover:  #C6611A;
+  --vf-brand-orange-soft:   #FEF3E7;  /* tinted background for orange cells */
+
+  /* --------------------------------------------------------------------------
+     SURFACES — backgrounds, from top layer down
+     -------------------------------------------------------------------------- */
+  --vf-surface-page:        #FFFFFF;  /* main canvas */
+  --vf-surface-raised:      #FFFFFF;  /* cards, cells, modals on top of page */
+  --vf-surface-sunken:      #FAFAF7;  /* row labels, muted zones, weekends */
+  --vf-surface-hover:       #F5F5F0;  /* row hover, button hover */
+  --vf-surface-selected:    #FFF7ED;  /* active row, today column */
+  --vf-surface-disabled:    #F0EFE9;
+
+  /* --------------------------------------------------------------------------
+     BORDERS — three weights for hierarchy
+     -------------------------------------------------------------------------- */
+  --vf-border-subtle:       #F0EFE9;  /* internal grid lines */
+  --vf-border-default:      #E5E5E0;  /* section dividers, card edges */
+  --vf-border-strong:       #CFCEC6;  /* focused inputs, emphasized borders */
+  --vf-border-focus:        #1E6FB8;  /* keyboard focus ring */
+
+  /* --------------------------------------------------------------------------
+     TEXT — four levels of emphasis
+     -------------------------------------------------------------------------- */
+  --vf-text-primary:        #111827;  /* body, MO IDs, key numbers */
+  --vf-text-secondary:      #4B5563;  /* descriptions, supporting info */
+  --vf-text-tertiary:       #6B7280;  /* labels, metadata */
+  --vf-text-muted:          #9CA3AF;  /* placeholders, empty state hints */
+  --vf-text-inverse:        #FFFFFF;  /* text on dark/colored fills */
+  --vf-text-brand:          var(--vf-brand-navy);
+  --vf-text-link:           #1E6FB8;
+  --vf-text-link-hover:     #174F88;
+
+  /* --------------------------------------------------------------------------
+     CATEGORY COLORS — product types, machine groups, etc.
+     Each category has: soft (fill), base (border/accent), strong (text on soft)
+     Add new categories here; follow the same 3-stop pattern.
+     -------------------------------------------------------------------------- */
+
+  /* Blue — CBE liquor / data / information */
+  --vf-cat-blue-soft:       #E3EDF7;
+  --vf-cat-blue-base:       #1E6FB8;
+  --vf-cat-blue-strong:     #0F3E6E;
+
+  /* Green — CBS liquor / success / on-track */
+  --vf-cat-green-soft:      #E3F0E8;
+  --vf-cat-green-base:      #2E8B57;
+  --vf-cat-green-strong:    #1B5234;
+
+  /* Purple — finished chocolate / pouching / packaging */
+  --vf-cat-purple-soft:     #EDE7F6;
+  --vf-cat-purple-base:     #7A4FB5;
+  --vf-cat-purple-strong:   #462C6A;
+
+  /* Orange — roasting / brand accent / calls to action */
+  --vf-cat-orange-soft:     #FEF3E7;
+  --vf-cat-orange-base:     #E87722;
+  --vf-cat-orange-strong:   #8A4410;
+
+  /* Teal — reserved (e.g. QC, cleaning, utilities) */
+  --vf-cat-teal-soft:       #E0F2EF;
+  --vf-cat-teal-base:       #2A9D8F;
+  --vf-cat-teal-strong:     #1A5E56;
+
+  /* Pink — reserved (e.g. R&D, trial runs) */
+  --vf-cat-pink-soft:       #FBE8EE;
+  --vf-cat-pink-base:       #C2185B;
+  --vf-cat-pink-strong:     #751037;
+
+  /* Gray — neutral / unclassified / maintenance */
+  --vf-cat-gray-soft:       #EEEDE8;
+  --vf-cat-gray-base:       #6B7280;
+  --vf-cat-gray-strong:     #374151;
+
+  /* --------------------------------------------------------------------------
+     SEMANTIC STATES — success, warning, danger, info
+     Use for alerts, validation, status pills, progress bars.
+     -------------------------------------------------------------------------- */
+
+  /* Success — on track, completed, approved */
+  --vf-success-soft:        #E3F0E8;
+  --vf-success-base:        #2E8B57;
+  --vf-success-strong:      #1B5234;
+  --vf-success-text:        #1B5234;
+
+  /* Warning — needs attention, at risk, nearing threshold */
+  --vf-warning-soft:        #FEF3E7;
+  --vf-warning-base:        #E87722;
+  --vf-warning-strong:      #8A4410;
+  --vf-warning-text:        #8A4410;
+
+  /* Danger — blocked, failed, over capacity, past due */
+  --vf-danger-soft:         #FBEAEA;
+  --vf-danger-base:         #C13434;
+  --vf-danger-strong:       #7A1F1F;
+  --vf-danger-text:         #7A1F1F;
+
+  /* Info — neutral callouts, help text, system messages */
+  --vf-info-soft:           #E3EDF7;
+  --vf-info-base:           #1E6FB8;
+  --vf-info-strong:         #0F3E6E;
+  --vf-info-text:           #0F3E6E;
+
+  /* --------------------------------------------------------------------------
+     TYPOGRAPHY
+     -------------------------------------------------------------------------- */
+  --vf-font-sans:           "Inter", "Barlow", -apple-system, BlinkMacSystemFont,
+                            "Segoe UI", Roboto, sans-serif;
+  --vf-font-display:        "Barlow Condensed", "Inter", sans-serif;
+  --vf-font-mono:           "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+
+  --vf-text-xs:             11px;  /* table headers, metadata, legend labels */
+  --vf-text-sm:             12px;  /* cell body, dense data */
+  --vf-text-base:           13px;  /* default UI text */
+  --vf-text-md:             14px;  /* form inputs, buttons */
+  --vf-text-lg:             16px;  /* subheadings */
+  --vf-text-xl:             18px;  /* section titles */
+  --vf-text-2xl:            22px;  /* page titles */
+  --vf-text-3xl:            28px;  /* hero numbers in KPI cards */
+
+  --vf-weight-regular:      400;
+  --vf-weight-medium:       500;
+  --vf-weight-semibold:     600;
+
+  --vf-leading-tight:       1.2;
+  --vf-leading-normal:      1.5;
+  --vf-leading-relaxed:     1.7;
+
+  --vf-tracking-tight:      -0.01em;
+  --vf-tracking-normal:     0;
+  --vf-tracking-wide:       0.05em;   /* UPPERCASE labels */
+  --vf-tracking-wider:      0.08em;   /* tabs, section eyebrows */
+
+  /* --------------------------------------------------------------------------
+     SPACING — 4px base grid
+     -------------------------------------------------------------------------- */
+  --vf-space-0:             0;
+  --vf-space-1:             4px;
+  --vf-space-2:             8px;
+  --vf-space-3:             12px;
+  --vf-space-4:             16px;
+  --vf-space-5:             20px;
+  --vf-space-6:             24px;
+  --vf-space-8:             32px;
+  --vf-space-10:            40px;
+  --vf-space-12:            48px;
+
+  /* --------------------------------------------------------------------------
+     RADII
+     -------------------------------------------------------------------------- */
+  --vf-radius-xs:           2px;   /* inline tags, cell accents */
+  --vf-radius-sm:           4px;   /* buttons, inputs */
+  --vf-radius-md:           6px;   /* cards, modals */
+  --vf-radius-lg:           10px;  /* large containers */
+  --vf-radius-pill:         999px; /* status pills, toggle switches */
+
+  /* --------------------------------------------------------------------------
+     SHADOWS — flat aesthetic; shadows only for elevation cues
+     -------------------------------------------------------------------------- */
+  --vf-shadow-xs:           0 1px 0 rgba(17, 24, 39, 0.04);
+  --vf-shadow-sm:           0 1px 2px rgba(17, 24, 39, 0.06);
+  --vf-shadow-md:           0 4px 8px rgba(17, 24, 39, 0.08);
+  --vf-shadow-lg:           0 8px 24px rgba(17, 24, 39, 0.10);
+  --vf-shadow-focus:        0 0 0 3px rgba(30, 111, 184, 0.25);
+
+  /* --------------------------------------------------------------------------
+     Z-INDEX
+     -------------------------------------------------------------------------- */
+  --vf-z-base:              0;
+  --vf-z-dropdown:          100;
+  --vf-z-sticky:            200;
+  --vf-z-overlay:           300;
+  --vf-z-modal:             400;
+  --vf-z-toast:             500;
+
+  /* --------------------------------------------------------------------------
+     MOTION
+     -------------------------------------------------------------------------- */
+  --vf-duration-fast:       120ms;
+  --vf-duration-base:       200ms;
+  --vf-duration-slow:       320ms;
+  --vf-ease-out:            cubic-bezier(0.16, 1, 0.3, 1);
+  --vf-ease-in-out:         cubic-bezier(0.65, 0, 0.35, 1);
+
+  /* --------------------------------------------------------------------------
+     LAYOUT
+     -------------------------------------------------------------------------- */
+  --vf-sidebar-width:       220px;
+  --vf-topbar-height:       52px;
+  --vf-tabbar-height:       40px;
+  --vf-container-max:       1600px;
+}
+
+/* ============================================================================
+   BASE RESETS — safe starter styles for every page
+   ========================================================================= */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--vf-font-sans);
+  font-size: var(--vf-text-base);
+  line-height: var(--vf-leading-normal);
+  color: var(--vf-text-primary);
+  background: var(--vf-surface-page);
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--vf-text-link);
+  text-decoration: none;
+}
+a:hover { color: var(--vf-text-link-hover); text-decoration: underline; }
+
+:focus-visible {
+  outline: 2px solid var(--vf-border-focus);
+  outline-offset: 2px;
+}
+
+/* ============================================================================
+   UTILITY CLASSES — most layouts compose from these
+   ========================================================================= */
+
+/* Eyebrow / section label — all-caps small text */
+.vf-eyebrow {
+  font-size: var(--vf-text-xs);
+  font-weight: var(--vf-weight-medium);
+  letter-spacing: var(--vf-tracking-wider);
+  text-transform: uppercase;
+  color: var(--vf-text-tertiary);
+}
+
+/* Monospace for IDs and codes */
+.vf-mono { font-family: var(--vf-font-mono); font-size: 0.92em; }
+
+/* ============================================================================
+   BUTTONS
+   ========================================================================= */
+
+.vf-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--vf-space-2);
+  height: 32px;
+  padding: 0 var(--vf-space-3);
+  border: 1px solid transparent;
+  border-radius: var(--vf-radius-sm);
+  font-family: inherit;
+  font-size: var(--vf-text-md);
+  font-weight: var(--vf-weight-medium);
+  cursor: pointer;
+  transition: background var(--vf-duration-fast) var(--vf-ease-out),
+              border-color var(--vf-duration-fast) var(--vf-ease-out);
+  white-space: nowrap;
+}
+.vf-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.vf-btn--primary {
+  background: var(--vf-brand-orange);
+  color: var(--vf-text-inverse);
+}
+.vf-btn--primary:hover:not(:disabled) { background: var(--vf-brand-orange-hover); }
+
+.vf-btn--secondary {
+  background: var(--vf-surface-raised);
+  color: var(--vf-text-primary);
+  border-color: var(--vf-border-default);
+}
+.vf-btn--secondary:hover:not(:disabled) {
+  background: var(--vf-surface-hover);
+  border-color: var(--vf-border-strong);
+}
+
+.vf-btn--ghost {
+  background: transparent;
+  color: var(--vf-text-secondary);
+}
+.vf-btn--ghost:hover:not(:disabled) {
+  background: var(--vf-surface-hover);
+  color: var(--vf-text-primary);
+}
+
+.vf-btn--danger {
+  background: var(--vf-danger-base);
+  color: var(--vf-text-inverse);
+}
+.vf-btn--danger:hover:not(:disabled) { background: var(--vf-danger-strong); }
+
+.vf-btn--sm { height: 26px; padding: 0 var(--vf-space-2); font-size: var(--vf-text-sm); }
+.vf-btn--lg { height: 40px; padding: 0 var(--vf-space-4); font-size: var(--vf-text-lg); }
+
+/* ============================================================================
+   FORM CONTROLS
+   ========================================================================= */
+
+.vf-input, .vf-select, .vf-textarea {
+  width: 100%;
+  height: 32px;
+  padding: 0 var(--vf-space-3);
+  background: var(--vf-surface-raised);
+  border: 1px solid var(--vf-border-default);
+  border-radius: var(--vf-radius-sm);
+  font-family: inherit;
+  font-size: var(--vf-text-md);
+  color: var(--vf-text-primary);
+  transition: border-color var(--vf-duration-fast) var(--vf-ease-out),
+              box-shadow var(--vf-duration-fast) var(--vf-ease-out);
+}
+.vf-input:hover, .vf-select:hover, .vf-textarea:hover { border-color: var(--vf-border-strong); }
+.vf-input:focus, .vf-select:focus, .vf-textarea:focus {
+  outline: none;
+  border-color: var(--vf-border-focus);
+  box-shadow: var(--vf-shadow-focus);
+}
+.vf-textarea { height: auto; padding: var(--vf-space-2) var(--vf-space-3); resize: vertical; }
+
+.vf-label {
+  display: block;
+  margin-bottom: var(--vf-space-1);
+  font-size: var(--vf-text-sm);
+  font-weight: var(--vf-weight-medium);
+  color: var(--vf-text-secondary);
+}
+
+/* ============================================================================
+   CARDS
+   ========================================================================= */
+
+.vf-card {
+  background: var(--vf-surface-raised);
+  border: 1px solid var(--vf-border-default);
+  border-radius: var(--vf-radius-md);
+  padding: var(--vf-space-4);
+}
+.vf-card--sunken { background: var(--vf-surface-sunken); border: none; }
+.vf-card--raised { box-shadow: var(--vf-shadow-sm); }
+
+.vf-card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--vf-space-3);
+  padding-bottom: var(--vf-space-3);
+  border-bottom: 1px solid var(--vf-border-subtle);
+}
+.vf-card__title { font-size: var(--vf-text-lg); font-weight: var(--vf-weight-medium); margin: 0; }
+
+/* KPI / metric card — hero numbers for dashboards */
+.vf-kpi {
+  background: var(--vf-surface-sunken);
+  border-radius: var(--vf-radius-md);
+  padding: var(--vf-space-4);
+}
+.vf-kpi__label {
+  font-size: var(--vf-text-xs);
+  font-weight: var(--vf-weight-medium);
+  letter-spacing: var(--vf-tracking-wide);
+  text-transform: uppercase;
+  color: var(--vf-text-tertiary);
+  margin-bottom: var(--vf-space-2);
+}
+.vf-kpi__value {
+  font-size: var(--vf-text-3xl);
+  font-weight: var(--vf-weight-medium);
+  color: var(--vf-text-primary);
+  line-height: 1;
+}
+.vf-kpi__delta {
+  margin-top: var(--vf-space-2);
+  font-size: var(--vf-text-sm);
+}
+.vf-kpi__delta--up   { color: var(--vf-success-text); }
+.vf-kpi__delta--down { color: var(--vf-danger-text); }
+.vf-kpi__delta--flat { color: var(--vf-text-tertiary); }
+
+/* ============================================================================
+   BADGES & PILLS — for status chips, category tags
+   ========================================================================= */
+
+.vf-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--vf-space-1);
+  height: 20px;
+  padding: 0 var(--vf-space-2);
+  border-radius: var(--vf-radius-xs);
+  font-size: var(--vf-text-xs);
+  font-weight: var(--vf-weight-medium);
+  letter-spacing: var(--vf-tracking-wide);
+  line-height: 1;
+}
+.vf-badge--pill { border-radius: var(--vf-radius-pill); padding: 0 var(--vf-space-3); }
+
+.vf-badge--blue    { background: var(--vf-cat-blue-soft);    color: var(--vf-cat-blue-strong); }
+.vf-badge--green   { background: var(--vf-cat-green-soft);   color: var(--vf-cat-green-strong); }
+.vf-badge--purple  { background: var(--vf-cat-purple-soft);  color: var(--vf-cat-purple-strong); }
+.vf-badge--orange  { background: var(--vf-cat-orange-soft);  color: var(--vf-cat-orange-strong); }
+.vf-badge--teal    { background: var(--vf-cat-teal-soft);    color: var(--vf-cat-teal-strong); }
+.vf-badge--pink    { background: var(--vf-cat-pink-soft);    color: var(--vf-cat-pink-strong); }
+.vf-badge--gray    { background: var(--vf-cat-gray-soft);    color: var(--vf-cat-gray-strong); }
+
+.vf-badge--success { background: var(--vf-success-soft); color: var(--vf-success-text); }
+.vf-badge--warning { background: var(--vf-warning-soft); color: var(--vf-warning-text); }
+.vf-badge--danger  { background: var(--vf-danger-soft);  color: var(--vf-danger-text); }
+.vf-badge--info    { background: var(--vf-info-soft);    color: var(--vf-info-text); }
+
+/* Status dot — use inline inside a badge or next to text */
+.vf-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.vf-dot--success { background: var(--vf-success-base); }
+.vf-dot--warning { background: var(--vf-warning-base); }
+.vf-dot--danger  { background: var(--vf-danger-base); }
+.vf-dot--info    { background: var(--vf-info-base); }
+.vf-dot--neutral { background: var(--vf-text-muted); }
+
+/* ============================================================================
+   PROGRESS BARS — for capacity utilization, MO completion, yield targets
+   ========================================================================= */
+
+.vf-progress {
+  position: relative;
+  width: 100%;
+  height: 8px;
+  background: var(--vf-surface-disabled);
+  border-radius: var(--vf-radius-pill);
+  overflow: hidden;
+}
+.vf-progress__fill {
+  height: 100%;
+  background: var(--vf-brand-orange);
+  border-radius: var(--vf-radius-pill);
+  transition: width var(--vf-duration-slow) var(--vf-ease-out);
+}
+.vf-progress--thin  { height: 4px; }
+.vf-progress--thick { height: 12px; }
+
+/* Semantic fills — use based on threshold logic in your app */
+.vf-progress__fill--success { background: var(--vf-success-base); }
+.vf-progress__fill--warning { background: var(--vf-warning-base); }
+.vf-progress__fill--danger  { background: var(--vf-danger-base); }
+.vf-progress__fill--info    { background: var(--vf-info-base); }
+
+/* Segmented progress — for multi-stage MOs (e.g. roasted / refined / conched) */
+.vf-progress-segmented {
+  display: flex;
+  gap: 2px;
+  width: 100%;
+  height: 8px;
+}
+.vf-progress-segmented__seg {
+  flex: 1;
+  background: var(--vf-surface-disabled);
+  border-radius: var(--vf-radius-xs);
+}
+.vf-progress-segmented__seg--done    { background: var(--vf-success-base); }
+.vf-progress-segmented__seg--active  { background: var(--vf-brand-orange); }
+.vf-progress-segmented__seg--blocked { background: var(--vf-danger-base); }
+
+/* Labeled progress — label + bar + value, common dashboard pattern */
+.vf-progress-row {
+  display: grid;
+  grid-template-columns: 140px 1fr 60px;
+  align-items: center;
+  gap: var(--vf-space-3);
+  padding: var(--vf-space-2) 0;
+}
+.vf-progress-row__label { font-size: var(--vf-text-sm); color: var(--vf-text-secondary); }
+.vf-progress-row__value {
+  font-size: var(--vf-text-sm);
+  font-weight: var(--vf-weight-medium);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ============================================================================
+   ALERTS / CALLOUTS
+   ========================================================================= */
+
+.vf-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--vf-space-3);
+  padding: var(--vf-space-3) var(--vf-space-4);
+  border-radius: var(--vf-radius-md);
+  border-left: 3px solid;
+  font-size: var(--vf-text-md);
+}
+.vf-alert__title { font-weight: var(--vf-weight-medium); margin-bottom: var(--vf-space-1); }
+.vf-alert__body  { color: var(--vf-text-secondary); }
+
+.vf-alert--success { background: var(--vf-success-soft); border-color: var(--vf-success-base); color: var(--vf-success-text); }
+.vf-alert--warning { background: var(--vf-warning-soft); border-color: var(--vf-warning-base); color: var(--vf-warning-text); }
+.vf-alert--danger  { background: var(--vf-danger-soft);  border-color: var(--vf-danger-base);  color: var(--vf-danger-text); }
+.vf-alert--info    { background: var(--vf-info-soft);    border-color: var(--vf-info-base);    color: var(--vf-info-text); }
+
+/* ============================================================================
+   TABLES — dense data grids (WO list, inventory, audit logs)
+   ========================================================================= */
+
+.vf-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--vf-text-base);
+}
+.vf-table th {
+  text-align: left;
+  padding: var(--vf-space-2) var(--vf-space-3);
+  background: var(--vf-surface-sunken);
+  border-bottom: 1px solid var(--vf-border-default);
+  font-size: var(--vf-text-xs);
+  font-weight: var(--vf-weight-medium);
+  letter-spacing: var(--vf-tracking-wide);
+  text-transform: uppercase;
+  color: var(--vf-text-tertiary);
+  white-space: nowrap;
+}
+.vf-table td {
+  padding: var(--vf-space-3);
+  border-bottom: 1px solid var(--vf-border-subtle);
+  vertical-align: top;
+}
+.vf-table tr:hover td { background: var(--vf-surface-hover); }
+.vf-table td.vf-num   { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Density modifier — for Bloomberg-style dense screens like the calendar */
+.vf-table--dense th { padding: var(--vf-space-1) var(--vf-space-2); }
+.vf-table--dense td { padding: var(--vf-space-1) var(--vf-space-2); font-size: var(--vf-text-sm); }
+
+/* ============================================================================
+   CALENDAR / SCHEDULE GRID — the pattern from the production planner
+   ========================================================================= */
+
+.vf-schedule {
+  background: var(--vf-surface-raised);
+  border: 1px solid var(--vf-border-default);
+  border-radius: var(--vf-radius-md);
+  overflow: hidden;
+}
+.vf-schedule__header {
+  background: var(--vf-surface-sunken);
+  border-bottom: 1px solid var(--vf-border-default);
+}
+.vf-schedule__day {
+  padding: var(--vf-space-2);
+  border-left: 1px solid var(--vf-border-subtle);
+  text-align: center;
+}
+.vf-schedule__day--today    { background: var(--vf-surface-selected); }
+.vf-schedule__day--weekend  { background: var(--vf-surface-sunken); color: var(--vf-text-muted); }
+
+.vf-schedule__machine {
+  padding: var(--vf-space-3);
+  background: var(--vf-surface-sunken);
+  border-bottom: 1px solid var(--vf-border-subtle);
+  font-size: var(--vf-text-sm);
+  color: var(--vf-text-secondary);
+}
+
+/* Scheduled item card inside a cell */
+.vf-mo {
+  padding: var(--vf-space-1) var(--vf-space-2);
+  border-left: 3px solid;
+  border-radius: var(--vf-radius-xs);
+  font-size: var(--vf-text-xs);
+  line-height: 1.4;
+  box-shadow: var(--vf-shadow-xs);
+}
+.vf-mo__id    { font-weight: var(--vf-weight-medium); color: var(--vf-brand-navy); }
+.vf-mo__desc  { color: var(--vf-text-secondary); }
+.vf-mo__qty   { font-weight: var(--vf-weight-medium); color: var(--vf-text-primary); }
+
+.vf-mo--blue    { background: var(--vf-cat-blue-soft);    border-color: var(--vf-cat-blue-base); }
+.vf-mo--green   { background: var(--vf-cat-green-soft);   border-color: var(--vf-cat-green-base); }
+.vf-mo--purple  { background: var(--vf-cat-purple-soft);  border-color: var(--vf-cat-purple-base); }
+.vf-mo--orange  { background: var(--vf-cat-orange-soft);  border-color: var(--vf-cat-orange-base); }
+.vf-mo--teal    { background: var(--vf-cat-teal-soft);    border-color: var(--vf-cat-teal-base); }
+.vf-mo--gray    { background: var(--vf-cat-gray-soft);    border-color: var(--vf-cat-gray-base); }
+
+/* ============================================================================
+   NAVIGATION — top bar + tabs
+   ========================================================================= */
+
+.vf-topbar {
+  height: var(--vf-topbar-height);
+  padding: 0 var(--vf-space-5);
+  background: var(--vf-surface-raised);
+  border-bottom: 1px solid var(--vf-border-default);
+  display: flex;
+  align-items: center;
+  gap: var(--vf-space-3);
+}
+.vf-topbar__brand {
+  font-size: var(--vf-text-base);
+  font-weight: var(--vf-weight-medium);
+  letter-spacing: var(--vf-tracking-wider);
+  color: var(--vf-brand-navy);
+  text-transform: uppercase;
+}
+
+.vf-tabs {
+  display: flex;
+  gap: var(--vf-space-6);
+  padding: 0 var(--vf-space-5);
+  background: var(--vf-surface-sunken);
+  border-bottom: 1px solid var(--vf-border-default);
+}
+.vf-tab {
+  padding: var(--vf-space-3) 0;
+  font-size: var(--vf-text-xs);
+  font-weight: var(--vf-weight-medium);
+  letter-spacing: var(--vf-tracking-wider);
+  text-transform: uppercase;
+  color: var(--vf-text-tertiary);
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  transition: color var(--vf-duration-fast) var(--vf-ease-out);
+}
+.vf-tab:hover { color: var(--vf-text-primary); }
+.vf-tab--active {
+  color: var(--vf-brand-navy);
+  border-bottom-color: var(--vf-brand-orange);
+}
+
+/* ============================================================================
+   END
+   ========================================================================= */
