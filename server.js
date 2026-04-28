@@ -987,9 +987,144 @@ app.get("/api/sync-cin7/test", async (req, res) => {
   }
 });
 
-// Daily Cin7 API cron is DISABLED — see the /api/sync-cin7 comment above.
-// Inventory updates now come from manual report uploads on the Traceability tab.
-console.log("[Cin7] API sync disabled — using manual report uploads instead.");
+// Daily Cin7 movement-sync cron is DISABLED — see the /api/sync-cin7 comment.
+// Inventory MOVEMENTS still come from manual report uploads on the Traceability
+// tab. The on-hand snapshot below is a separate, working API path.
+console.log("[Cin7] Movement sync disabled — using manual report uploads instead.");
+
+// ── Cin7 on-hand inventory (Phase 1 of the MRP feature) ──────────────────────
+//
+// Cin7 Core's V1 endpoint /ExternalApi/ProductAvailability returns a snapshot
+// of stock per SKU × Location × Batch — the only Cin7 endpoint we've found
+// that gives us live on-hand quantities. It does NOT include movement
+// history or MO linkage; for that we still rely on the manual upload path.
+
+const C7_ONHAND_URL = "https://inventory.dearsystems.com/ExternalApi/ProductAvailability";
+
+async function fetchCin7OnHand() {
+  if (!process.env.CIN7_ACCOUNT_ID || !process.env.CIN7_APPLICATION_KEY) {
+    throw new Error("CIN7_ACCOUNT_ID or CIN7_APPLICATION_KEY environment variable not set");
+  }
+  const all = [];
+  let page = 1;
+  const limit = 1000;
+  while (true) {
+    const url = `${C7_ONHAND_URL}?Page=${page}&Limit=${limit}`;
+    const resp = await fetch(url, { headers: cin7Headers(), redirect: "follow" });
+    const ct = resp.headers.get("content-type") || "";
+    const text = await resp.text().catch(() => "");
+    if (!resp.ok) {
+      throw new Error(`Cin7 ProductAvailability ${resp.status} ${resp.statusText} [${ct}]: ${text.slice(0, 300)}`);
+    }
+    let data;
+    try { data = JSON.parse(text); }
+    catch (_) { throw new Error(`Cin7 ProductAvailability ${resp.status} returned non-JSON [${ct}]: ${text.slice(0, 300)}`); }
+    const batch = data.ProductAvailability || [];
+    all.push(...batch);
+    if (batch.length < limit) break;
+    page++;
+    if (page > 50) throw new Error("Cin7 ProductAvailability pagination exceeded 50 pages — aborting");
+  }
+  return all;
+}
+
+async function performCin7OnHandSync() {
+  const rows = await fetchCin7OnHand();
+  const now = new Date().toISOString();
+  // Per-SKU rollup: sum across batches/locations for the MRP engine
+  const bySku = {};
+  for (const r of rows) {
+    const sku = r.SKU;
+    if (!sku) continue;
+    if (!bySku[sku]) {
+      bySku[sku] = {
+        sku,
+        name: r.Name || "",
+        onHand: 0,
+        allocated: 0,
+        available: 0,
+        onOrder: 0,
+        inTransit: 0,
+        stockOnHand: 0,
+        locations: new Set(),
+        batches: 0,
+        nextDelivery: null,
+      };
+    }
+    const a = bySku[sku];
+    a.onHand += Number(r.OnHand) || 0;
+    a.allocated += Number(r.Allocated) || 0;
+    a.available += Number(r.Available) || 0;
+    a.onOrder += Number(r.OnOrder) || 0;
+    a.inTransit += Number(r.InTransit) || 0;
+    a.stockOnHand += Number(r.StockOnHand) || 0;
+    a.batches += 1;
+    if (r.Location) a.locations.add(r.Location);
+    if (r.NextDeliveryDate && (!a.nextDelivery || r.NextDeliveryDate < a.nextDelivery)) {
+      a.nextDelivery = r.NextDeliveryDate;
+    }
+  }
+  // Convert location Sets to sorted arrays for serialization
+  const skuRollup = Object.values(bySku).map(a => ({ ...a, locations: [...a.locations].sort() }));
+  const blob = {
+    lastSync: now,
+    rowCount: rows.length,
+    skuCount: skuRollup.length,
+    rows,           // raw per SKU/location/batch records
+    bySku: skuRollup, // rolled up per-SKU totals (what MRP uses)
+  };
+  writeData("inventory_onhand", blob);
+  return { ok: true, lastSync: now, rowCount: rows.length, skuCount: skuRollup.length };
+}
+
+// Admin-only middleware
+function requireAdmin(req, res, next) {
+  const users = readData("vf_users") || [];
+  const u = users.find(x => x && x.id === req.userId);
+  if (!u || u.role !== "admin") {
+    return res.status(403).json({ ok: false, error: "Admin role required" });
+  }
+  next();
+}
+
+// POST /api/cin7/onhand/sync — admin-triggered live pull
+app.post("/api/cin7/onhand/sync", requireAdmin, async (req, res) => {
+  try {
+    const status = await performCin7OnHandSync();
+    res.json(status);
+  } catch (e) {
+    console.error("[Cin7 OnHand] Sync error:", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/cin7/onhand — return the cached on-hand snapshot (any authed user)
+app.get("/api/cin7/onhand", (req, res) => {
+  const blob = readData("inventory_onhand");
+  if (!blob) return res.json({ ok: true, lastSync: null, bySku: [], rows: [] });
+  res.json({ ok: true, ...blob });
+});
+
+// GET /api/cin7/onhand/status — last sync metadata only (cheap)
+app.get("/api/cin7/onhand/status", (req, res) => {
+  const blob = readData("inventory_onhand");
+  if (!blob) return res.json({ ok: true, lastSync: null });
+  res.json({ ok: true, lastSync: blob.lastSync, rowCount: blob.rowCount, skuCount: blob.skuCount });
+});
+
+// Nightly on-hand sync at 06:30 UTC (just after the manual movement-upload window)
+if (process.env.CIN7_ACCOUNT_ID && process.env.CIN7_APPLICATION_KEY) {
+  cron.schedule("30 6 * * *", async () => {
+    console.log("[Cin7 OnHand] Nightly sync starting…");
+    try {
+      const s = await performCin7OnHandSync();
+      console.log(`[Cin7 OnHand] Sync done — ${s.rowCount} rows, ${s.skuCount} SKUs`);
+    } catch (e) {
+      console.error("[Cin7 OnHand] Nightly sync failed:", e.message);
+    }
+  });
+  console.log("[Cin7 OnHand] Nightly sync scheduled at 06:30 UTC");
+}
 
 app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));

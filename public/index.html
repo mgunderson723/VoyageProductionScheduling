@@ -807,6 +807,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
     <button class="tab" onclick="switchTab('capacity')">Capacity &amp; ops</button>
     <button class="tab" onclick="switchTab('traceability')">Traceability</button>
     <button class="tab" onclick="switchTab('mo-status')">MO Status</button>
+    <button class="tab" onclick="switchTab('live-inv')">Live Inventory</button>
     <button class="tab" onclick="switchTab('admin')" id="tab-admin-btn" style="display:none;">Admin console</button>
   </div>
 
@@ -932,6 +933,44 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
           <tbody id="mo-status-tbody"></tbody>
         </table>
       </div>
+    </div>
+  </div>
+
+  <!-- LIVE INVENTORY (on-hand from Cin7 ProductAvailability API) -->
+  <div id="tab-live-inv" style="display:none;">
+    <div class="header">
+      <div style="display:flex;align-items:center;gap:var(--vf-space-3);flex-wrap:wrap;">
+        <h2>Live Inventory</h2>
+        <span id="live-inv-ts" style="font-size:var(--vf-text-sm);color:var(--vf-text-tertiary);"></span>
+      </div>
+      <div style="display:flex;gap:var(--vf-space-2);align-items:center;">
+        <button class="btn btn-sm" id="live-inv-sync-btn" onclick="syncLiveInventory()" style="display:none;">⟳ Sync from Cin7</button>
+      </div>
+    </div>
+
+    <div class="status-summary" id="live-inv-kpis"></div>
+
+    <div class="status-filters">
+      <input id="live-inv-search" placeholder="Search SKU or product…" oninput="renderLiveInventory()">
+      <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
+        <input type="checkbox" id="live-inv-aggregate" checked onchange="renderLiveInventory()" style="margin:0;"/>
+        Aggregate by SKU
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
+        <input type="checkbox" id="live-inv-hide-zero" checked onchange="renderLiveInventory()" style="margin:0;"/>
+        Hide zero on-hand
+      </label>
+    </div>
+
+    <div id="live-inv-empty" class="no-inv-note" style="display:none;">
+      No on-hand snapshot loaded yet. An admin can click "⟳ Sync from Cin7" to pull the current state, or wait for the nightly sync at 06:30 UTC.
+    </div>
+
+    <div style="overflow-x:auto;">
+      <table class="status-table" id="live-inv-table">
+        <thead id="live-inv-thead"></thead>
+        <tbody id="live-inv-tbody"></tbody>
+      </table>
     </div>
   </div>
 
@@ -1528,10 +1567,10 @@ function shortSku(s){
 
 function switchTab(t){
   if(t==='admin'&&(!currentUser||currentUser.role!=='admin'))return;
-  ['calendar','orders','capacity','traceability','mo-status','admin'].forEach(k=>{document.getElementById('tab-'+k).style.display=k===t?'':'none';});
+  ['calendar','orders','capacity','traceability','mo-status','live-inv','admin'].forEach(k=>{document.getElementById('tab-'+k).style.display=k===t?'':'none';});
   document.querySelectorAll('.tab').forEach(el=>{
     const tabName=el.textContent.trim().toLowerCase();
-    const map={'calendar':'calendar','work orders':'orders','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','mo status':'mo-status','admin console':'admin'};
+    const map={'calendar':'calendar','work orders':'orders','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','mo status':'mo-status','live inventory':'live-inv','admin console':'admin'};
     el.classList.toggle('active',map[tabName]===t);
   });
   if(t==='calendar')renderCal();
@@ -1539,6 +1578,7 @@ function switchTab(t){
   if(t==='admin')renderUsers();
   if(t==='traceability'&&!window._traceabilityMounted){window._traceabilityMounted=true;if(window.App){ReactDOM.createRoot(document.getElementById('traceability-root')).render(React.createElement(window.App));}}
   if(t==='mo-status'){populateMOStatusMachineFilter();renderMOStatus();loadSyncStatus();}
+  if(t==='live-inv')loadLiveInventory();
 }
 function shiftCal(d){calOffset+=d*4;renderCal();}
 function resetCal(){calOffset=0;renderCal();}
@@ -1934,6 +1974,139 @@ async function triggerCin7Sync() {
   }
   btn.disabled = false;
   btn.textContent = '⟳ Sync from Cin7';
+}
+
+// ── Live Inventory Tab ───────────────────────────────────────────────────────
+//
+// Pulls the on-hand snapshot from /api/cin7/onhand (which the server populates
+// from Cin7's ProductAvailability endpoint, daily at 06:30 UTC plus on-demand).
+// Phase 1 of the MRP feature — surfaces current stock so users have a live
+// view without uploading a CSV. Future phases will compare this against the
+// production plan's BOM-exploded requirements.
+
+let liveInventoryData = null;
+
+async function loadLiveInventory() {
+  // Show admin-only sync button
+  const btn = document.getElementById('live-inv-sync-btn');
+  if (btn) btn.style.display = (currentUser && currentUser.role === 'admin') ? 'inline-flex' : 'none';
+  try {
+    const r = await fetch('/api/cin7/onhand');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    liveInventoryData = await r.json();
+  } catch (e) {
+    liveInventoryData = { ok: false, lastSync: null, bySku: [], rows: [] };
+  }
+  renderLiveInventory();
+}
+
+async function syncLiveInventory() {
+  const btn = document.getElementById('live-inv-sync-btn');
+  const ts  = document.getElementById('live-inv-ts');
+  if (btn) { btn.disabled = true; btn.textContent = '⟳ Syncing…'; }
+  if (ts) ts.textContent = 'Syncing from Cin7…';
+  try {
+    const r = await fetch('/api/cin7/onhand/sync', { method: 'POST' });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    await loadLiveInventory();
+  } catch (e) {
+    alert('Sync failed: ' + e.message);
+    if (ts) ts.textContent = 'Sync failed — ' + e.message;
+  }
+  if (btn) { btn.disabled = false; btn.textContent = '⟳ Sync from Cin7'; }
+}
+
+function renderLiveInventory() {
+  if (!liveInventoryData) return;
+  const { lastSync, bySku, rows, rowCount, skuCount } = liveInventoryData;
+  const tsEl = document.getElementById('live-inv-ts');
+  const empty = document.getElementById('live-inv-empty');
+  const thead = document.getElementById('live-inv-thead');
+  const tbody = document.getElementById('live-inv-tbody');
+  const kpis = document.getElementById('live-inv-kpis');
+
+  if (!lastSync) {
+    if (tsEl) tsEl.textContent = '';
+    if (empty) empty.style.display = 'block';
+    if (thead) thead.innerHTML = '';
+    if (tbody) tbody.innerHTML = '';
+    if (kpis) kpis.innerHTML = '';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  const d = new Date(lastSync);
+  const ageMin = Math.round((Date.now() - d.getTime()) / 60000);
+  const ageStr = ageMin < 60 ? `${ageMin} min ago` : ageMin < 1440 ? `${Math.round(ageMin/60)} hr ago` : `${Math.round(ageMin/1440)} days ago`;
+  if (tsEl) tsEl.textContent = `Last synced ${d.toLocaleString()} (${ageStr}) · ${(rowCount||0).toLocaleString()} rows · ${(skuCount||0).toLocaleString()} SKUs`;
+
+  const search = (document.getElementById('live-inv-search').value || '').toLowerCase();
+  const aggregate = document.getElementById('live-inv-aggregate').checked;
+  const hideZero = document.getElementById('live-inv-hide-zero').checked;
+
+  // KPIs
+  const skus = bySku || [];
+  const totalSkus = skus.length;
+  const skusWithStock = skus.filter(s => s.onHand > 0).length;
+  const skusOnOrder = skus.filter(s => s.onOrder > 0).length;
+  const totalUnits = skus.reduce((sum, s) => sum + (s.onHand || 0), 0);
+  if (kpis) kpis.innerHTML = [
+    { label: 'SKUs tracked',    val: totalSkus.toLocaleString(),                                accent: '' },
+    { label: 'SKUs in stock',   val: skusWithStock.toLocaleString(),                            accent: 'var(--vf-success-base)' },
+    { label: 'SKUs on order',   val: skusOnOrder.toLocaleString(),                              accent: 'var(--vf-info-base)' },
+    { label: 'Total units on hand', val: Math.round(totalUnits).toLocaleString(),               accent: 'var(--vf-cat-gray-base)' },
+  ].map(s => `<div class="metric" style="${s.accent?'border-left:3px solid '+s.accent+';':''}"><div class="metric-label">${s.label}</div><div class="metric-value">${s.val}</div></div>`).join('');
+
+  // Table
+  if (aggregate) {
+    if (thead) thead.innerHTML = '<tr><th>SKU</th><th>Name</th><th>Locations</th><th>Batches</th><th style="text-align:right;">On hand</th><th style="text-align:right;">Allocated</th><th style="text-align:right;">Available</th><th style="text-align:right;">On order</th><th style="text-align:right;">In transit</th></tr>';
+    let filtered = (skus || []).filter(s => {
+      if (hideZero && s.onHand === 0 && s.onOrder === 0 && s.inTransit === 0) return false;
+      if (search) {
+        const hay = ((s.sku||'') + ' ' + (s.name||'')).toLowerCase();
+        if (!hay.includes(search)) return false;
+      }
+      return true;
+    });
+    filtered.sort((a,b) => (b.onHand||0) - (a.onHand||0));
+    if (tbody) tbody.innerHTML = filtered.length === 0
+      ? `<tr><td colspan="9" class="empty">No SKUs match.</td></tr>`
+      : filtered.map(s => `<tr>
+          <td><span class="mo-id">${escapeHtml(s.sku)}</span></td>
+          <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(s.name||'')}">${escapeHtml(s.name||'—')}</td>
+          <td style="font-size:11px;color:var(--vf-text-secondary);">${escapeHtml((s.locations||[]).join(', ')||'—')}</td>
+          <td style="text-align:right;font-size:12px;">${s.batches||0}</td>
+          <td style="text-align:right;font-variant-numeric:tabular-nums;">${(s.onHand||0).toLocaleString(undefined,{maximumFractionDigits:2})}</td>
+          <td style="text-align:right;font-variant-numeric:tabular-nums;color:${s.allocated>0?'var(--vf-warning-text)':'var(--vf-text-tertiary)'};">${(s.allocated||0).toLocaleString(undefined,{maximumFractionDigits:2})}</td>
+          <td style="text-align:right;font-variant-numeric:tabular-nums;font-weight:500;">${(s.available||0).toLocaleString(undefined,{maximumFractionDigits:2})}</td>
+          <td style="text-align:right;font-variant-numeric:tabular-nums;color:${s.onOrder>0?'var(--vf-info-text)':'var(--vf-text-tertiary)'};">${(s.onOrder||0).toLocaleString(undefined,{maximumFractionDigits:2})}</td>
+          <td style="text-align:right;font-variant-numeric:tabular-nums;color:${s.inTransit>0?'var(--vf-info-text)':'var(--vf-text-tertiary)'};">${(s.inTransit||0).toLocaleString(undefined,{maximumFractionDigits:2})}</td>
+        </tr>`).join('');
+  } else {
+    if (thead) thead.innerHTML = '<tr><th>SKU</th><th>Name</th><th>Location</th><th>Batch</th><th>Expiry</th><th style="text-align:right;">On hand</th><th style="text-align:right;">Allocated</th><th style="text-align:right;">Available</th><th style="text-align:right;">On order</th></tr>';
+    let filtered = (rows || []).filter(r => {
+      if (hideZero && (r.OnHand||0) === 0 && (r.OnOrder||0) === 0) return false;
+      if (search) {
+        const hay = ((r.SKU||'') + ' ' + (r.Name||'') + ' ' + (r.Batch||'')).toLowerCase();
+        if (!hay.includes(search)) return false;
+      }
+      return true;
+    });
+    filtered.sort((a,b) => (b.OnHand||0) - (a.OnHand||0));
+    if (tbody) tbody.innerHTML = filtered.length === 0
+      ? `<tr><td colspan="9" class="empty">No rows match.</td></tr>`
+      : filtered.slice(0, 1000).map(r => `<tr>
+          <td><span class="mo-id">${escapeHtml(r.SKU||'—')}</span></td>
+          <td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(r.Name||'')}">${escapeHtml(r.Name||'—')}</td>
+          <td style="font-size:11px;color:var(--vf-text-secondary);">${escapeHtml(r.Location||'—')}</td>
+          <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(r.Batch||'—')}</td>
+          <td style="font-size:11px;color:var(--vf-text-tertiary);">${r.ExpiryDate ? r.ExpiryDate.slice(0,10) : '—'}</td>
+          <td style="text-align:right;font-variant-numeric:tabular-nums;">${(r.OnHand||0).toLocaleString(undefined,{maximumFractionDigits:2})}</td>
+          <td style="text-align:right;font-variant-numeric:tabular-nums;">${(r.Allocated||0).toLocaleString(undefined,{maximumFractionDigits:2})}</td>
+          <td style="text-align:right;font-variant-numeric:tabular-nums;font-weight:500;">${(r.Available||0).toLocaleString(undefined,{maximumFractionDigits:2})}</td>
+          <td style="text-align:right;font-variant-numeric:tabular-nums;">${(r.OnOrder||0).toLocaleString(undefined,{maximumFractionDigits:2})}</td>
+        </tr>`).join('') + (filtered.length > 1000 ? `<tr><td colspan="9" style="text-align:center;color:var(--vf-text-tertiary);font-size:11px;">…and ${filtered.length - 1000} more rows. Refine search to narrow.</td></tr>` : '');
+  }
 }
 
 // ── MO Status Tab ────────────────────────────────────────────────────────────
