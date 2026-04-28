@@ -1450,16 +1450,23 @@ async function loadInventoryCompletion(){
     if(!r.ok) return;
     const j = await r.json();
     const moMovements = (j && j.exists && j.value && j.value.moMovements) ? j.value.moMovements : {};
-    const next = new Set();
-    // Walk every order to compute pct against its planned qty
+
+    // Sum planned qty across ALL scheduled rows that share an MO number,
+    // so a multi-day MO with rows of 1,118 + 559 + 1,397 kg is compared
+    // to its true total (3,074 kg) rather than to any single day's slice.
+    const plannedByMo = {};
     (orders||[]).forEach(o=>{
       const moMatch = (o.orderId||'').match(/MO-\d+/);
-      const moId = moMatch ? moMatch[0] : null;
-      if(!moId) return;
+      if(!moMatch) return;
+      const moId = moMatch[0];
+      plannedByMo[moId] = (plannedByMo[moId] || 0) + (o.qty || 0);
+    });
+
+    const next = new Set();
+    Object.entries(plannedByMo).forEach(([moId, planned])=>{
       const inv = moMovements[moId];
       if(!inv) return;
-      const planned = o.qty || 0;
-      const actual  = inv.totalIn || 0;
+      const actual = inv.totalIn || 0;
       // Treat as complete if planned was 0 but we made some, or pct ≥ 85
       if((planned === 0 && actual > 0) || (planned > 0 && actual / planned >= 0.85)){
         next.add(moId);
@@ -1966,60 +1973,112 @@ async function renderMOStatus() {
   const hasInvData = Object.keys(moMovements).length > 0;
   document.getElementById('mo-status-no-inv').style.display = hasInvData ? 'none' : 'block';
 
-  // Build row data
-  const rows = orders.map(o => {
+  // Build row data — collapse rows that share an MO number into a single
+  // row, summing planned qty across all scheduled days/operations and
+  // listing every distinct machine the MO touches. Orders without a real
+  // MO number (TBD-* placeholders, blank IDs) stay as one row each.
+  const today = new Date().toISOString().slice(0, 10);
+
+  // Phase 1: bucket by MO ID (or by per-order id for non-MO rows)
+  const buckets = new Map();
+  orders.forEach(o => {
     const moMatch = (o.orderId || '').match(/MO-\d+/);
-    const moId    = moMatch ? moMatch[0] : null;
+    const key = moMatch ? moMatch[0] : ('order:' + o.id);
+    if (!buckets.has(key)) buckets.set(key, { moId: moMatch ? moMatch[0] : null, items: [] });
+    buckets.get(key).items.push(o);
+  });
+
+  // Phase 2: turn each bucket into a single row
+  const rows = [];
+  for (const { moId, items } of buckets.values()) {
+    const planned = items.reduce((s, o) => s + (o.qty || 0), 0);
     const inv     = moId ? moMovements[moId] : null;
-    const planned = o.qty || 0;
     const actual  = inv ? (inv.totalIn || 0) : 0;
     const pct     = planned > 0 ? Math.min(Math.round(actual / planned * 100), 999) : null;
 
-    // Determine status
-    let status = o.status || 'queued';
-    if (hasInvData) {
-      if (status !== 'on-hold') {
-        if (actual === 0)                     status = 'not-started';
-        else if (planned === 0 && actual > 0) status = 'complete';
-        else if (!planned || pct < 85)        status = 'in-progress';
-        else                                  status = 'complete';
-      }
-    }
-    if (!moId) status = 'no-mo';
+    // Earliest start, latest end across all rows
+    const starts = items.map(o => o.start).filter(Boolean).sort();
+    const ends   = items.map(o => o.end || o.due).filter(Boolean).sort();
+    const start = starts[0] || null;
+    const end   = ends[ends.length - 1] || null;
 
-    // Tracking: only applies once start date has passed
-    const today = new Date().toISOString().slice(0, 10);
+    // Distinct machines (preserve insertion order, deduped)
+    const machineKeys = [...new Set(items.map(o => o.machine).filter(Boolean))];
+    const machineLabel = machineKeys.length === 0
+      ? '—'
+      : machineKeys.map(m => MO_STATUS_MACHINE_LABELS[m] || m).join(' · ');
+
+    // Pick a representative SKU + orderId for display
+    const sku = items.find(o => o.sku)?.sku || '';
+    const displayOrderId = moId || (items[0].orderId || '—');
+
+    // Status precedence across the bucket:
+    //   on-hold > complete (manual) > derived-from-inventory > stored status
+    const allOnHold = items.every(o => o.status === 'on-hold');
+    const anyComplete = items.some(o => o.status === 'complete');
+    let status;
+    if (allOnHold) {
+      status = 'on-hold';
+    } else if (hasInvData && moId) {
+      if (actual === 0)                                       status = 'not-started';
+      else if (planned === 0 && actual > 0)                   status = 'complete';
+      else if (!planned || pct < 85)                          status = 'in-progress';
+      else                                                    status = 'complete';
+    } else if (anyComplete) {
+      status = 'complete';
+    } else {
+      // Mixed/no inventory — promote highest-progress status from items
+      const stored = items.map(o => o.status || 'queued');
+      if      (stored.includes('in-progress'))                status = 'in-progress';
+      else if (stored.every(s => s === 'queued'))             status = 'not-started';
+      else                                                    status = stored[0];
+    }
+    if (!moId && !displayOrderId.startsWith('MO-'))           status = 'no-mo';
+
+    // Tracking: only applies once the earliest start date has passed
     let tracking = null;
-    if (o.start && o.start <= today) {
+    if (start && start <= today) {
       const isComplete = (status === 'complete');
-      if (isComplete)                         tracking = 'on-track';
-      else if (o.end && o.end < today)        tracking = 'off-track';
-      else                                    tracking = 'on-track'; // started, end date not yet passed
+      if (isComplete)                                         tracking = 'on-track';
+      else if (end && end < today)                            tracking = 'off-track';
+      else                                                    tracking = 'on-track';
     }
 
-    return { o, moId, inv, planned, actual, pct, status, tracking };
-  });
+    rows.push({
+      o: { ...items[0], orderId: displayOrderId, sku, machine: machineKeys[0] || '', start, end },
+      moId, inv, planned, actual, pct, status, tracking,
+      itemCount: items.length,
+      machineLabel,
+    });
+  }
 
   // Summary counts
   const counts = { 'not-started': 0, 'in-progress': 0, 'complete': 0, 'on-hold': 0, 'no-mo': 0 };
   rows.forEach(r => { if (counts[r.status] !== undefined) counts[r.status]++; });
 
-  // Semantic accent colors per design guide: in-progress = info, complete = success
+  // Semantic accent colors per design guide: in-progress = info, complete = success.
+  // "Tracked units" = collapsed buckets (one per MO + one per non-MO row),
+  // matching what the table below shows.
   document.getElementById('mo-status-summary').innerHTML = [
-    { label:'Total orders', val: orders.length,         accent: '' },
-    { label:'Not started',  val: counts['not-started'], accent: 'var(--vf-cat-gray-base)' },
-    { label:'In progress',  val: counts['in-progress'], accent: 'var(--vf-info-base)' },
-    { label:'Complete',     val: counts['complete'],    accent: 'var(--vf-success-base)' },
+    { label:'Tracked units', val: rows.length,           accent: '' },
+    { label:'Not started',   val: counts['not-started'], accent: 'var(--vf-cat-gray-base)' },
+    { label:'In progress',   val: counts['in-progress'], accent: 'var(--vf-info-base)' },
+    { label:'Complete',      val: counts['complete'],    accent: 'var(--vf-success-base)' },
   ].map(s => `
     <div class="metric" style="${s.accent?'border-left:3px solid '+s.accent+';':''}">
       <div class="metric-label">${s.label}</div>
       <div class="metric-value">${s.val}</div>
     </div>`).join('');
 
-  // Filter rows
+  // Filter rows — machine filter matches if ANY of the bucket's machines matches
   const filtered = rows.filter(r => {
-    if (machine && r.o.machine !== machine) return false;
-    if (filter  && r.status !== filter)     return false;
+    if (machine) {
+      const machineKeys = r.machineLabel ? r.machineLabel : '';
+      // Check the original items via re-bucket (machineKeys aren't preserved on r directly)
+      // — simpler: just check the single representative machine OR look at the joined label
+      if (!(r.o.machine === machine || (r.machineLabel && r.machineLabel.includes(MO_STATUS_MACHINE_LABELS[machine] || machine)))) return false;
+    }
+    if (filter && r.status !== filter) return false;
     if (search) {
       const hay = ((r.moId || '') + ' ' + (r.o.sku || '') + ' ' + (r.o.orderId || '')).toLowerCase();
       if (!hay.includes(search)) return false;
@@ -2053,13 +2112,12 @@ async function renderMOStatus() {
   const fmtQty = q => q > 0 ? q.toLocaleString() + ' kg' : '—';
 
   document.getElementById('mo-status-tbody').innerHTML = filtered.length === 0
-    ? `<tr><td colspan="8" class="empty">No orders match the current filters.</td></tr>`
-    : filtered.map(({ o, moId, actual, planned, pct, status, tracking }) => {
+    ? `<tr><td colspan="9" class="empty">No orders match the current filters.</td></tr>`
+    : filtered.map(({ o, moId, actual, planned, pct, status, tracking, itemCount, machineLabel }) => {
         const moCell = moId
-          ? `<span class="mo-id">${moId}</span>`
+          ? `<span class="mo-id">${moId}</span>${itemCount > 1 ? `<div style="font-size:10px;color:var(--vf-text-tertiary);margin-top:2px;">${itemCount} scheduled rows</div>` : ''}`
           : `<span class="tbd-id">${escapeHtml(o.orderId || '—')}</span>`;
-        const machLabel = MO_STATUS_MACHINE_LABELS[o.machine] || o.machine || '—';
-        const dateRange = (o.start && o.end)
+        const dateRange = (o.start && o.end && o.start !== o.end)
           ? `${o.start} → ${o.end}`
           : (o.start || o.end || '—');
         const progressCell = (moId && hasInvData && planned > 0)
@@ -2068,7 +2126,7 @@ async function renderMOStatus() {
         return `<tr>
           <td>${moCell}</td>
           <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(o.sku||'')}">${escapeHtml(o.sku||'—')}</td>
-          <td>${machLabel}</td>
+          <td style="font-size:12px;">${escapeHtml(machineLabel)}</td>
           <td style="white-space:nowrap;font-size:12px;">${dateRange}</td>
           <td style="text-align:right;">${fmtQty(planned)}</td>
           <td style="text-align:right;">${moId && hasInvData ? fmtQty(actual) : '—'}</td>
