@@ -231,14 +231,14 @@ function mergeInventoryData(existing, delta) {
     }
   }
 
-  // Merge MO movements
-  const mergedMoMovements = {};
-  for (const src of [existing.moMovements || {}, delta.moMovements || {}]) {
-    for (const mo in src) {
-      if (!mergedMoMovements[mo]) mergedMoMovements[mo] = { ...src[mo], totalIn: 0, totalOut: 0 };
-      mergedMoMovements[mo].totalIn  += src[mo].totalIn  || 0;
-      mergedMoMovements[mo].totalOut += src[mo].totalOut || 0;
-    }
+  // Merge MO movements — fresh value WINS per MO (not additive). The Cin7
+  // Inventory Movement Details report ships the running per-MO totals, so
+  // the same MO appearing in overlapping daily/weekly reports must NOT be
+  // summed — that produces 2x / 3x / Nx inflation. For MOs only present
+  // in the existing snapshot (outside the delta's window), keep them as-is.
+  const mergedMoMovements = { ...(existing.moMovements || {}) };
+  for (const mo in (delta.moMovements || {})) {
+    mergedMoMovements[mo] = delta.moMovements[mo];
   }
 
   const months = [...new Set([...(existing.months || []), ...(delta.months || [])])].sort();
