@@ -216,6 +216,16 @@ body {
 .mo-block--complete .mo-id { color: var(--vf-success-text); }
 .mo-block--complete .mo-sku { text-decoration: line-through; }
 .mo-block--complete:hover { opacity: 0.85; }
+
+/* Calendar search hits — orange ring on matching MO blocks, others dim */
+.mo-block--match {
+  outline: 2px solid var(--vf-brand-orange);
+  outline-offset: -1px;
+  box-shadow: 0 0 0 4px var(--vf-brand-orange-soft);
+  z-index: 1;
+  position: relative;
+}
+.cal-table.cal-searching .mo-block:not(.mo-block--match) { opacity: 0.35; }
 .mo-done-mark {
   display: inline-block;
   width: 12px; height: 12px;
@@ -814,9 +824,17 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
   <!-- CALENDAR -->
   <div id="tab-calendar">
     <div class="header">
-      <div style="display:flex;align-items:center;gap:8px;">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
         <h2>4-week schedule</h2>
         <button class="btn btn-primary btn-sm" onclick="openModal()">+ New order</button>
+        <div style="position:relative;display:flex;align-items:center;gap:6px;margin-left:8px;">
+          <input id="cal-search" placeholder="Find MO or SKU…"
+            oninput="onCalSearchInput()"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();calSearchJump();} if(event.key==='Escape'){clearCalSearch();}"
+            style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;width:180px;height:28px;">
+          <span id="cal-search-count" style="font-size:11px;color:var(--vf-text-tertiary);min-width:80px;"></span>
+          <button class="btn btn-sm" id="cal-search-clear" onclick="clearCalSearch()" style="display:none;padding:0 8px;height:28px;">✕</button>
+        </div>
       </div>
       <div class="cal-nav">
         <button class="btn btn-sm" onclick="shiftCal(-1)">← Back</button>
@@ -990,6 +1008,34 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       <thead><tr><th>Username</th><th>Role</th><th>Created</th><th>Actions</th></tr></thead>
       <tbody id="admin-user-body"></tbody>
     </table>
+
+    <h2 style="margin-top:32px;">Audit Log — Order Changes</h2>
+    <div style="display:flex;gap:var(--vf-space-2);align-items:center;margin:var(--vf-space-3) 0;flex-wrap:wrap;">
+      <input id="audit-search" placeholder="Filter by MO, user, or field…" oninput="renderAuditLog()" style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;width:280px;height:32px;">
+      <select id="audit-source-filter" onchange="renderAuditLog()" style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;height:32px;">
+        <option value="">All sources</option>
+        <option value="manual">Manual</option>
+        <option value="auto-promote">Auto-promote</option>
+        <option value="excel-import">Excel import</option>
+        <option value="seed">Seed</option>
+      </select>
+      <select id="audit-action-filter" onchange="renderAuditLog()" style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;height:32px;">
+        <option value="">All actions</option>
+        <option value="create">Create</option>
+        <option value="update">Update</option>
+        <option value="delete">Delete</option>
+      </select>
+      <span id="audit-count" style="font-size:11px;color:var(--vf-text-tertiary);margin-left:auto;"></span>
+      <button class="btn btn-sm" onclick="loadAuditLog()">↺ Refresh</button>
+    </div>
+    <div style="overflow-x:auto;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);max-height:600px;overflow-y:auto;">
+      <table class="admin-table" id="audit-log-table" style="margin-top:0;">
+        <thead style="position:sticky;top:0;background:var(--vf-surface-sunken);z-index:1;">
+          <tr><th>When</th><th>User</th><th>Source</th><th>Action</th><th>MO / Order</th><th>What changed</th></tr>
+        </thead>
+        <tbody id="audit-log-body"></tbody>
+      </table>
+    </div>
   </div>
 </div>
 
@@ -1202,9 +1248,10 @@ async function serverGet(key){
     return j.exists?j.value:null;
   }catch(e){return null;}
 }
-async function serverPut(key,value){
+async function serverPut(key,value,extra){
   try{
-    const r=await fetch('/api/data/'+key,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({value})});
+    const body = Object.assign({value}, extra || {});
+    const r=await fetch('/api/data/'+key,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     return r.ok;
   }catch(e){return false;}
 }
@@ -1389,6 +1436,74 @@ function deleteUser(id){
   persistUsers();renderUsers();
 }
 
+// ── Audit Log (admin console) ────────────────────────────────────────────────
+//
+// Pulls the most recent vf_orders changes from /api/audit-log and renders them
+// in a sortable table. Server caps the log at 5000 entries, evicting oldest.
+
+let auditEntries = [];
+async function loadAuditLog(){
+  try {
+    const r = await fetch('/api/audit-log');
+    if (!r.ok) { auditEntries = []; renderAuditLog(); return; }
+    const j = await r.json();
+    auditEntries = j.entries || [];
+  } catch (e) { auditEntries = []; }
+  renderAuditLog();
+}
+function renderAuditLog(){
+  const search = (document.getElementById('audit-search').value || '').toLowerCase();
+  const sourceFilter = document.getElementById('audit-source-filter').value;
+  const actionFilter = document.getElementById('audit-action-filter').value;
+  const filtered = auditEntries.filter(e => {
+    if (sourceFilter && e.source !== sourceFilter) return false;
+    if (actionFilter && e.action !== actionFilter) return false;
+    if (search) {
+      const hay = ((e.orderId||'') + ' ' + (e.userName||'') + ' ' + Object.keys(e.changes||{}).join(' ')).toLowerCase();
+      if (!hay.includes(search)) return false;
+    }
+    return true;
+  });
+  document.getElementById('audit-count').textContent = `${filtered.length.toLocaleString()} of ${auditEntries.length.toLocaleString()} entries`;
+  const sourceBadge = src => {
+    const s = src || 'manual';
+    const colorMap = { 'manual':'var(--vf-cat-gray-base)', 'auto-promote':'var(--vf-info-base)', 'excel-import':'var(--vf-cat-purple-base)', 'seed':'var(--vf-cat-orange-base)' };
+    return `<span class="badge" style="background:transparent;border:1px solid ${colorMap[s]||'var(--vf-cat-gray-base)'};color:${colorMap[s]||'var(--vf-text-secondary)'};">${esc(s)}</span>`;
+  };
+  const actionBadge = a => {
+    const map = { 'create':'badge-complete', 'update':'badge-in-progress', 'delete':'badge-high' };
+    return `<span class="badge ${map[a]||'badge-queued'}">${esc(a)}</span>`;
+  };
+  const fmtChanges = e => {
+    if (e.action === 'create' || e.action === 'delete') {
+      const snap = e.snapshot || {};
+      const summary = `${snap.machine||'—'} · ${snap.qty||0} kg · ${snap.start||'?'}→${snap.end||'?'} · ${snap.status||'?'}`;
+      return `<span style="font-size:11px;color:var(--vf-text-secondary);">${esc(summary)}</span>`;
+    }
+    if (!e.changes) return '<span style="color:var(--vf-text-tertiary);">—</span>';
+    const parts = Object.entries(e.changes).map(([f,c]) => {
+      const from = c.from === null || c.from === undefined ? '∅' : String(c.from);
+      const to   = c.to   === null || c.to   === undefined ? '∅' : String(c.to);
+      return `<div style="font-size:11px;line-height:1.5;"><strong>${esc(f)}</strong>: <span style="color:var(--vf-text-tertiary);text-decoration:line-through;">${esc(from.slice(0,40))}</span> → <span style="color:var(--vf-text-primary);">${esc(to.slice(0,40))}</span></div>`;
+    });
+    return parts.join('');
+  };
+  document.getElementById('audit-log-body').innerHTML = filtered.length === 0
+    ? `<tr><td colspan="6" class="empty">No matching audit entries.</td></tr>`
+    : filtered.map(e => {
+        const d = new Date(e.ts);
+        const when = `${d.toLocaleDateString()}<br/><span style="font-size:10px;color:var(--vf-text-tertiary);">${d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}</span>`;
+        return `<tr>
+          <td style="font-size:11px;white-space:nowrap;">${when}</td>
+          <td style="font-size:12px;">${esc(e.userName||'—')}</td>
+          <td>${sourceBadge(e.source)}</td>
+          <td>${actionBadge(e.action)}</td>
+          <td><span class="mo-id">${esc(e.orderId||e.entityId||'—')}</span></td>
+          <td style="max-width:520px;">${fmtChanges(e)}</td>
+        </tr>`;
+      }).join('');
+}
+
 const SUBTYPES={coffee:[{v:'coffee_beans',l:'Roast beans'},{v:'coffee_ground',l:'Roast & ground'}],liquor:[{v:'liquor',l:'Chocolate liquor'}],chocolate:[{v:'chocolate',l:'Finished chocolate'}]};
 const BATCH_C={coffee_beans:{fixed:325},coffee_ground:{fixed:1000},liquor:{min:2250,max:4300},chocolate:{min:3000,max:6000}};
 const PROD_LABELS={coffee_beans:'Coffee — Roast beans',coffee_ground:'Coffee — Roast & ground',liquor:'Chocolate liquor',chocolate:'Finished chocolate'};
@@ -1432,7 +1547,7 @@ async function init(){
       orders=raw?JSON.parse(raw):JSON.parse(JSON.stringify(SEED));
     }
     if(!orders.length) {orders=JSON.parse(JSON.stringify(SEED));}
-    await persist();
+    await persist('seed');
   }catch(e){orders=JSON.parse(JSON.stringify(SEED));}
   try{
     let data=await serverGet('vf_collapsed');
@@ -1453,11 +1568,11 @@ async function init(){
   window.addEventListener('vf-inventory-updated', () => { loadInventoryCompletion(); });
 }
 
-async function persist(){
+async function persist(source){
   const ind=document.getElementById('save-ind');
   ind.textContent='Saving…';ind.style.opacity='1';
   try{
-    const ok1=await serverPut('vf_orders',orders);
+    const ok1=await serverPut('vf_orders',orders,source?{source}:null);
     const ok2=await serverPut('vf_collapsed',collapsed);
     if(!ok1||!ok2){
       if(window.storage){
@@ -1528,7 +1643,7 @@ async function loadInventoryCompletion(){
       }
     });
     if(promoted > 0){
-      await persist();
+      await persist('auto-promote');
       if(typeof render === 'function') render();
       if(typeof renderCal === 'function') renderCal();
       console.log(`[auto-promote] ${promoted} order(s) promoted to complete based on uploaded inventory data.`);
@@ -1575,13 +1690,60 @@ function switchTab(t){
   });
   if(t==='calendar')renderCal();
   if(t==='orders')render();
-  if(t==='admin')renderUsers();
+  if(t==='admin'){renderUsers();loadAuditLog();}
   if(t==='traceability'&&!window._traceabilityMounted){window._traceabilityMounted=true;if(window.App){ReactDOM.createRoot(document.getElementById('traceability-root')).render(React.createElement(window.App));}}
   if(t==='mo-status'){populateMOStatusMachineFilter();renderMOStatus();loadSyncStatus();}
   if(t==='live-inv')loadLiveInventory();
 }
 function shiftCal(d){calOffset+=d*4;renderCal();}
 function resetCal(){calOffset=0;renderCal();}
+
+// Calendar search state — when set, renderCal applies .mo-block--match
+// to matching orders and dims the rest. Pressing Enter (or clicking the
+// "Find" affordance) jumps the calendar window to the first match.
+let calSearchTerm = '';
+
+function onCalSearchInput(){
+  calSearchTerm = (document.getElementById('cal-search').value || '').trim().toLowerCase();
+  document.getElementById('cal-search-clear').style.display = calSearchTerm ? '' : 'none';
+  updateCalSearchCount();
+  renderCal();
+}
+function updateCalSearchCount(){
+  const el = document.getElementById('cal-search-count');
+  if (!calSearchTerm) { el.textContent = ''; return; }
+  const matches = orders.filter(orderMatchesCalSearch);
+  el.textContent = matches.length + (matches.length === 1 ? ' match' : ' matches');
+  el.style.color = matches.length === 0 ? 'var(--vf-danger-text)' : 'var(--vf-text-tertiary)';
+}
+function orderMatchesCalSearch(o){
+  if (!calSearchTerm) return false;
+  const hay = ((o.orderId||'') + ' ' + (o.sku||'') + ' ' + (o.notes||'')).toLowerCase();
+  return hay.includes(calSearchTerm);
+}
+function clearCalSearch(){
+  calSearchTerm = '';
+  const inp = document.getElementById('cal-search');
+  if (inp) inp.value = '';
+  document.getElementById('cal-search-clear').style.display = 'none';
+  document.getElementById('cal-search-count').textContent = '';
+  renderCal();
+}
+function calSearchJump(){
+  if (!calSearchTerm) return;
+  const matches = orders.filter(orderMatchesCalSearch);
+  if (matches.length === 0) return;
+  // Pick earliest start date among matches; fall back to due date
+  const dates = matches.map(o => o.start || o.due).filter(Boolean).sort();
+  if (!dates.length) return;
+  const target = new Date(dates[0] + 'T00:00:00');
+  const today = new Date(); today.setHours(0,0,0,0);
+  const monToday = getMon(today);
+  const diffDays = Math.round((target - monToday) / 86400000);
+  // calOffset is in weeks; place target in the first week of the visible window
+  calOffset = Math.floor(diffDays / 7);
+  renderCal();
+}
 
 function renderCal(){
   const today=new Date();today.setHours(0,0,0,0);
@@ -1616,7 +1778,9 @@ function renderCal(){
             const done=isOrderComplete(o);
             const doneAttr=done?' data-complete="1"':'';
             const doneMark=done?'<span class="mo-done-mark" aria-label="Completed">✓</span> ':'';
-            html+=`<div class="mo-block ${chipClass(o)}${done?' mo-block--complete':''}"${doneAttr} title="${esc((o.sku||'')+'\n'+(o.notes||''))+(done?'\nCompleted':'')}" onclick="event.stopPropagation();editById('${esc(o.id)}')">
+            const isMatch=calSearchTerm && orderMatchesCalSearch(o);
+            const matchCls=isMatch?' mo-block--match':'';
+            html+=`<div class="mo-block ${chipClass(o)}${done?' mo-block--complete':''}${matchCls}"${doneAttr} title="${esc((o.sku||'')+'\n'+(o.notes||''))+(done?'\nCompleted':'')}" onclick="event.stopPropagation();editById('${esc(o.id)}')">
               <div class="mo-id">${doneMark}${esc(o.orderId)||'—'}</div>
               ${o.sku?`<div class="mo-sku">${esc(shortSku(o.sku))}</div>`:''}
               ${o.total?`<div class="mo-qty">${o.total.toLocaleString()} kg</div>`:''}
@@ -1629,6 +1793,7 @@ function renderCal(){
     });
   });
   document.getElementById('cal-table').innerHTML=html+'</tbody>';
+  document.getElementById('cal-table').classList.toggle('cal-searching', !!calSearchTerm);
 }
 
 function editById(id){const o=orders.find(x=>x.id===id);if(!o)return;openModal(o);}
@@ -2336,7 +2501,7 @@ async function confirmImport(){
     }
   });
 
-  await persist();
+  await persist('excel-import');
   await loadInventoryCompletion(); // re-derive completed-MO set against newly-imported orders
   render();renderCal();
   closeImportModal();

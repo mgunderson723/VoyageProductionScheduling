@@ -253,11 +253,122 @@ app.get("/api/data/:key", (req, res) => {
 app.put("/api/data/:key", (req, res) => {
   const key = req.params.key.replace(/[^a-z0-9_-]/gi, "");
   try {
+    // Audit: when vf_orders is updated, diff old vs new and append per-change
+    // entries to vf_audit_log. Other keys are written through unchanged.
+    if (key === "vf_orders") {
+      try { auditOrdersChange(readData("vf_orders") || [], req.body.value || [], req); }
+      catch (e) { console.error("[audit] failed to record changes:", e.message); }
+    }
     writeData(key, req.body.value);
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
+});
+
+// ── Order audit log ──────────────────────────────────────────────────────────
+//
+// Every PUT to vf_orders runs through auditOrdersChange() which diffs the old
+// and new arrays and appends one or more entries to vf_audit_log. The log is
+// append-only and capped at AUDIT_MAX entries (oldest evicted) so the file
+// can't grow unbounded.
+
+const AUDIT_MAX = 5000;
+const AUDITED_FIELDS = [
+  "orderId", "sku", "due", "start", "end", "cat", "sub", "region", "temper",
+  "machine", "qty", "batches", "total", "status", "priority", "notes",
+];
+
+function actorFromRequest(req) {
+  const users = readData("vf_users") || [];
+  const u = users.find(x => x && x.id === req.userId);
+  return {
+    userId: req.userId || null,
+    userName: u ? u.username : "(unknown)",
+  };
+}
+
+function diffOrder(oldO, newO) {
+  const changes = {};
+  for (const f of AUDITED_FIELDS) {
+    const a = oldO ? oldO[f] : undefined;
+    const b = newO ? newO[f] : undefined;
+    if (a !== b) changes[f] = { from: a == null ? null : a, to: b == null ? null : b };
+  }
+  return changes;
+}
+
+function appendAuditEntries(entries) {
+  if (!entries.length) return;
+  const log = readData("vf_audit_log") || [];
+  log.push(...entries);
+  // Keep only the latest AUDIT_MAX
+  const trimmed = log.length > AUDIT_MAX ? log.slice(log.length - AUDIT_MAX) : log;
+  writeData("vf_audit_log", trimmed);
+}
+
+function auditOrdersChange(oldOrders, newOrders, req) {
+  const actor = actorFromRequest(req);
+  const source = (req.body && typeof req.body.source === "string") ? req.body.source : "manual";
+  const ts = new Date().toISOString();
+  const oldById = new Map(oldOrders.map(o => [o.id, o]));
+  const newById = new Map(newOrders.map(o => [o.id, o]));
+  const entries = [];
+
+  // Created orders
+  for (const [id, o] of newById) {
+    if (!oldById.has(id)) {
+      entries.push({
+        ts, ...actor, source,
+        action: "create",
+        orderId: o.orderId || null,
+        entityId: id,
+        snapshot: pickAuditedFields(o),
+      });
+    }
+  }
+  // Deleted orders
+  for (const [id, o] of oldById) {
+    if (!newById.has(id)) {
+      entries.push({
+        ts, ...actor, source,
+        action: "delete",
+        orderId: o.orderId || null,
+        entityId: id,
+        snapshot: pickAuditedFields(o),
+      });
+    }
+  }
+  // Updated orders
+  for (const [id, newO] of newById) {
+    const oldO = oldById.get(id);
+    if (!oldO) continue;
+    const changes = diffOrder(oldO, newO);
+    if (Object.keys(changes).length === 0) continue;
+    entries.push({
+      ts, ...actor, source,
+      action: "update",
+      orderId: newO.orderId || oldO.orderId || null,
+      entityId: id,
+      changes,
+    });
+  }
+  appendAuditEntries(entries);
+}
+
+function pickAuditedFields(o) {
+  const out = {};
+  for (const f of AUDITED_FIELDS) if (o[f] !== undefined) out[f] = o[f];
+  return out;
+}
+
+// GET /api/audit-log — recent entries (admin only)
+// requireAdmin is hoisted (function declaration) — defined further below.
+app.get("/api/audit-log", (req, res, next) => requireAdmin(req, res, next), (req, res) => {
+  const log = readData("vf_audit_log") || [];
+  // Newest first, limit 500 by default
+  const limit = Math.min(parseInt(req.query.limit, 10) || 500, AUDIT_MAX);
+  res.json({ ok: true, total: log.length, entries: log.slice(-limit).reverse() });
 });
 
 // POST /api/import-excel/parse — parse an uploaded .xlsx production schedule
