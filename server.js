@@ -1383,6 +1383,189 @@ app.get("/api/cin7/onhand/status", (req, res) => {
   res.json({ ok: true, lastSync: blob.lastSync, rowCount: blob.rowCount, skuCount: blob.skuCount });
 });
 
+// ── Cin7 Inventory Movement Details ingest (Apps Script → app webhook) ───────
+//
+// The user's Cin7 daily report drops an XLSX file into a Google Drive folder.
+// A small Apps Script bound to that folder reads the file each morning and
+// POSTs it to this endpoint with a shared secret. We parse it server-side
+// (same shape as the Traceability tab's manual CSV upload) and replace the
+// inventory data — driving auto-promote and the calendar ✓ marks without any
+// human action.
+//
+// Auth: header X-VF-Sync-Secret must match env INVENTORY_SYNC_SECRET.
+// Body: { filename, contentType, contentBase64, fileLastModified? }
+
+function parseInventoryXlsx(buffer) {
+  const wb = XLSX.read(buffer, { type: "buffer", cellDates: true });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+  return parseInventoryRows(rows);
+}
+
+// Same aggregation logic as public/traceability_explorer.jsx#parseInventoryCSV
+// but takes a 2-D array of rows (from sheet_to_json) instead of CSV text.
+// Output shape MUST match so downstream consumers (Live Inventory KPIs, MO
+// Status auto-promote, calendar ✓ marks) work identically.
+function parseInventoryRows(rows) {
+  if (rows.length < 2) throw new Error("File has no data rows");
+
+  // Find the header row — first row containing both 'sku' and a 'quantity in' column
+  let hdrIdx = -1;
+  for (let i = 0; i < Math.min(rows.length, 20); i++) {
+    const fields = rows[i].map(f => String(f || "").toLowerCase().trim());
+    if (fields.includes("sku") && (fields.includes("quantity in") || fields.includes("inbound"))) {
+      hdrIdx = i; break;
+    }
+  }
+  if (hdrIdx === -1) throw new Error("Could not find header row with SKU + Quantity columns");
+
+  const hdr = rows[hdrIdx].map(h => String(h || "").toLowerCase().trim());
+  const colMap = {};
+  hdr.forEach((h, i) => {
+    if (h === "sku") colMap.sku = i;
+    else if (h === "product") colMap.product = i;
+    else if (h === "category") colMap.category = i;
+    else if (h === "unit") colMap.unit = i;
+    else if (h === "date") colMap.date = i;
+    else if (h === "month") colMap.month = i;
+    else if (h === "reference type" || h === "ref_type") colMap.refType = i;
+    else if (h === "quantity in" || h === "inbound") colMap.qtyIn = i;
+    else if (h === "quantity out" || h === "outbound") colMap.qtyOut = i;
+    else if (h === "batch #" || h === "batch_count") colMap.batch = i;
+    else if (h === "reference") colMap.reference = i;
+  });
+  if (colMap.sku === undefined) throw new Error("Missing required column: SKU");
+  if (colMap.qtyIn === undefined) throw new Error("Missing required column: Quantity in");
+  if (colMap.date === undefined && colMap.month === undefined) throw new Error("Missing required column: Date or Month");
+
+  const skuMap = new Map();
+  const batchSets = new Map();
+  const catAgg = {};
+  const rtAgg = {};
+  const moMap = new Map();
+  const monthSet = new Set();
+  const parseNum = s => { if (s == null || s === "") return 0; return parseFloat(String(s).replace(/,/g, "")) || 0; };
+  const dateToMonth = d => {
+    if (!d) return null;
+    const s = (d instanceof Date) ? d.toISOString().slice(0, 10) : String(d);
+    const mMap = { jan:"01",feb:"02",mar:"03",apr:"04",may:"05",jun:"06",jul:"07",aug:"08",sep:"09",oct:"10",nov:"11",dec:"12" };
+    let m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/);
+    if (m) { const mo = mMap[m[2].toLowerCase()]; return mo ? m[3]+"-"+mo : null; }
+    m = s.match(/^(\d{4})-(\d{2})/);
+    if (m) return m[1]+"-"+m[2];
+    return null;
+  };
+
+  let rowCount = 0;
+  for (let i = hdrIdx + 1; i < rows.length; i++) {
+    const f = rows[i];
+    if (!f || f.length < 3) continue;
+    const sku = String(f[colMap.sku] || "").trim();
+    if (!sku) continue;
+    const month = colMap.month !== undefined ? String(f[colMap.month] || "") : dateToMonth(f[colMap.date]);
+    if (!month) continue;
+    const prod = colMap.product !== undefined ? String(f[colMap.product] || "") : "";
+    const cat = colMap.category !== undefined ? String(f[colMap.category] || "") : "";
+    const unit = colMap.unit !== undefined ? String(f[colMap.unit] || "") : "";
+    const rt = colMap.refType !== undefined ? String(f[colMap.refType] || "") : "";
+    const inb = parseNum(f[colMap.qtyIn]);
+    const outb = colMap.qtyOut !== undefined ? parseNum(f[colMap.qtyOut]) : 0;
+    const batch = colMap.batch !== undefined ? String(f[colMap.batch] || "") : "";
+    monthSet.add(month);
+    rowCount++;
+
+    if (!skuMap.has(sku)) skuMap.set(sku, { s: sku, p: prod, c: cat, u: unit, m: {}, rt: {}, ti: 0, to: 0, net: 0, bc: 0 });
+    if (!batchSets.has(sku)) batchSets.set(sku, new Set());
+    const entry = skuMap.get(sku);
+    if (!entry.m[month]) entry.m[month] = { i: 0, o: 0 };
+    entry.m[month].i += inb; entry.m[month].o += outb;
+    entry.ti += inb; entry.to += outb; entry.net += (inb - outb);
+    if (batch) batchSets.get(sku).add(batch);
+    if (rt) {
+      if (!entry.rt[rt]) entry.rt[rt] = { i: 0, o: 0 };
+      entry.rt[rt].i += inb; entry.rt[rt].o += outb;
+    }
+    if (!catAgg[cat]) catAgg[cat] = {};
+    if (!catAgg[cat][month]) catAgg[cat][month] = { i: 0, o: 0 };
+    catAgg[cat][month].i += inb; catAgg[cat][month].o += outb;
+    if (!rtAgg[rt]) rtAgg[rt] = {};
+    if (!rtAgg[rt][month]) rtAgg[rt][month] = { i: 0, o: 0 };
+    rtAgg[rt][month].i += inb; rtAgg[rt][month].o += outb;
+
+    const ref = colMap.reference !== undefined ? String(f[colMap.reference] || "") : "";
+    const moMatch = ref.match(/MO-\d+/);
+    if (moMatch) {
+      const moId = moMatch[0];
+      if (!moMap.has(moId)) moMap.set(moId, { mo: moId, sku, prod, totalIn: 0, totalOut: 0 });
+      const me = moMap.get(moId);
+      me.totalIn += inb;
+      me.totalOut += outb;
+    }
+  }
+  for (const [sku, entry] of skuMap) entry.bc = batchSets.get(sku).size;
+  const months = [...monthSet].sort();
+  const invSku = [...skuMap.values()];
+  if (!invSku.length) throw new Error("No valid data rows found");
+  return {
+    invSku,
+    invCat: catAgg,
+    invRt: rtAgg,
+    months,
+    rowCount,
+    moMovements: Object.fromEntries(moMap),
+  };
+}
+
+app.post("/api/cin7/inventory-movements", async (req, res) => {
+  // Auth: shared secret. Returns 401 instead of standard requireAuth so this
+  // endpoint can be hit by Apps Script without a session cookie.
+  const expected = process.env.INVENTORY_SYNC_SECRET;
+  if (!expected) return res.status(503).json({ ok: false, error: "INVENTORY_SYNC_SECRET not configured on server" });
+  const provided = req.headers["x-vf-sync-secret"] || req.headers["X-VF-Sync-Secret"];
+  if (!provided || provided !== expected) return res.status(401).json({ ok: false, error: "Invalid sync secret" });
+
+  try {
+    const body = req.body || {};
+    const { filename, contentBase64, fileLastModified } = body;
+    if (!contentBase64) return res.status(400).json({ ok: false, error: "Missing contentBase64 in body" });
+    const buffer = Buffer.from(contentBase64, "base64");
+    let parsed;
+    try {
+      parsed = parseInventoryXlsx(buffer);
+    } catch (e) {
+      return res.status(400).json({ ok: false, error: "Parse failed: " + e.message });
+    }
+
+    // Replace mode (matches the recommended UI default for daily rolling reports).
+    const finalData = {
+      invSku: parsed.invSku,
+      invCat: parsed.invCat,
+      invRt: parsed.invRt,
+      months: parsed.months,
+      moMovements: parsed.moMovements || {},
+      lastSync: new Date().toISOString(),
+      lastSyncSource: "gdrive-auto-sync",
+      lastSyncFile: filename || null,
+      lastSyncFileModified: fileLastModified || null,
+    };
+    writeData("inventory", finalData);
+
+    console.log(`[gdrive-sync] Ingested ${filename || "(unnamed)"} — ${parsed.rowCount} rows · ${parsed.invSku.length} SKUs · ${Object.keys(parsed.moMovements).length} MOs`);
+    res.json({
+      ok: true,
+      filename: filename || null,
+      rowCount: parsed.rowCount,
+      skuCount: parsed.invSku.length,
+      moCount: Object.keys(parsed.moMovements).length,
+      months: parsed.months,
+      lastSync: finalData.lastSync,
+    });
+  } catch (e) {
+    console.error("[gdrive-sync] Ingest error:", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── MRP Phase 2: BOM + supply settings (lead times, safety stock) ────────────
 //
 // Storage shape:
