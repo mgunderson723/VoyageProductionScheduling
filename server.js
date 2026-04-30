@@ -243,9 +243,15 @@ app.post("/api/logout", (req, res) => {
   res.json({ ok: true });
 });
 
-// Everything else under /api/* requires authentication.
+// Everything else under /api/* requires authentication, except a small set
+// of webhook endpoints that have their own auth (shared secret in header).
+const SESSION_BYPASS_PATHS = new Set([
+  "/login",
+  "/logout",
+  "/cin7/inventory-movements", // Apps Script auto-sync, gated by X-VF-Sync-Secret
+]);
 app.use("/api", (req, res, next) => {
-  if (req.path === "/login" || req.path === "/logout") return next();
+  if (SESSION_BYPASS_PATHS.has(req.path)) return next();
   const userId = getSessionUserId(req);
   if (!userId) return res.status(401).json({ ok: false, error: "Not authenticated" });
   req.userId = userId;
