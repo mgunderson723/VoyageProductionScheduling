@@ -226,6 +226,28 @@ body {
   position: relative;
 }
 .cal-table.cal-searching .mo-block:not(.mo-block--match) { opacity: 0.35; }
+
+/* Tentative (unconfirmed) orders — dashed left border + reduced opacity.
+   Keeps the category color visible so the operator can still tell what it is,
+   but signals "this is not yet committed" at a glance. Phase 3 MRP will be
+   able to ignore these unless "include unconfirmed" is enabled. */
+.mo-block--tentative {
+  border-left-style: dashed;
+  border-left-width: 3px;
+  opacity: 0.78;
+  background-image: repeating-linear-gradient(
+    -45deg,
+    transparent 0,
+    transparent 6px,
+    rgba(17, 24, 39, 0.04) 6px,
+    rgba(17, 24, 39, 0.04) 8px
+  );
+}
+.mo-block--tentative .mo-id::before {
+  content: '◌ ';
+  color: var(--vf-text-tertiary);
+  font-weight: var(--vf-weight-medium);
+}
 .mo-done-mark {
   display: inline-block;
   width: 12px; height: 12px;
@@ -850,6 +872,10 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       <div class="legend-item"><div class="legend-dot" style="background:var(--vf-cat-purple-base);"></div>Finished chocolate</div>
       <div class="legend-item"><div class="legend-dot" style="background:var(--vf-cat-orange-base);"></div>Roasting / seed prep</div>
       <div class="legend-item"><div class="legend-dot" style="background:var(--vf-cat-teal-base);"></div>Other</div>
+      <div class="legend-item" style="margin-left:12px;border-left:1px solid var(--vf-border-default);padding-left:12px;">
+        <div style="width:10px;height:10px;border-left:3px dashed var(--vf-text-tertiary);"></div>
+        Tentative (◌ unconfirmed)
+      </div>
     </div>
     <div class="cal-wrap"><table class="cal-table" id="cal-table"></table></div>
   </div>
@@ -1283,6 +1309,13 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
     <div class="field"><label>Priority</label>
       <select id="f-priority"><option value="low">Low</option><option value="med">Medium</option><option value="high">High</option></select>
     </div>
+  </div>
+  <div class="field" style="display:flex;align-items:center;gap:var(--vf-space-2);padding:var(--vf-space-2) var(--vf-space-3);background:var(--vf-surface-sunken);border-radius:var(--vf-radius-sm);border-left:3px solid var(--vf-brand-orange);margin-bottom:var(--vf-space-3);">
+    <input type="checkbox" id="f-confirmed" style="margin:0;width:16px;height:16px;cursor:pointer;">
+    <label for="f-confirmed" style="margin:0;text-transform:none;letter-spacing:0;font-size:var(--vf-text-md);color:var(--vf-text-primary);cursor:pointer;">
+      <strong>Confirmed</strong> for production
+      <span style="display:block;font-size:11px;color:var(--vf-text-tertiary);font-weight:400;">When unchecked, MRP will only consume materials for this order if "include unconfirmed" is enabled.</span>
+    </label>
   </div>
   <div class="field"><label>Notes</label><textarea id="f-notes" placeholder="Special instructions, MO notes..."></textarea></div>
   <div class="modal-actions">
@@ -1913,7 +1946,11 @@ function renderCal(){
             const doneMark=done?'<span class="mo-done-mark" aria-label="Completed">✓</span> ':'';
             const isMatch=calSearchTerm && orderMatchesCalSearch(o);
             const matchCls=isMatch?' mo-block--match':'';
-            html+=`<div class="mo-block ${chipClass(o)}${done?' mo-block--complete':''}${matchCls}"${doneAttr} title="${esc((o.sku||'')+'\n'+(o.notes||''))+(done?'\nCompleted':'')}" onclick="event.stopPropagation();editById('${esc(o.id)}')">
+            // Only EXPLICIT confirmed:false → Tentative; legacy undefined → Confirmed
+            const isTentative = o.confirmed === false;
+            const tentativeCls = isTentative ? ' mo-block--tentative' : '';
+            const titleSuffix = (done ? '\nCompleted' : '') + (isTentative ? '\nTentative — not confirmed for production' : '');
+            html+=`<div class="mo-block ${chipClass(o)}${done?' mo-block--complete':''}${matchCls}${tentativeCls}"${doneAttr} title="${esc((o.sku||'')+'\n'+(o.notes||''))+titleSuffix}" onclick="event.stopPropagation();editById('${esc(o.id)}')">
               <div class="mo-id">${doneMark}${esc(o.orderId)||'—'}</div>
               ${o.sku?`<div class="mo-sku">${esc(shortSku(o.sku))}</div>`:''}
               ${o.total?`<div class="mo-qty">${o.total.toLocaleString()} kg</div>`:''}
@@ -1980,6 +2017,7 @@ function openModal(prefill,mk,ds){
   document.getElementById('f-machine').value=mk||'';
   document.getElementById('f-batches').value='1';document.getElementById('f-total').value='';
   document.getElementById('f-status').value='queued';document.getElementById('f-priority').value='low';
+  document.getElementById('f-confirmed').checked=false; // default new orders to unconfirmed
   document.getElementById('wrap-variants').style.display='none';
   document.getElementById('batch-info').style.display='none';
   document.getElementById('bom-box').style.display='none';
@@ -2001,6 +2039,7 @@ function openModal(prefill,mk,ds){
     document.getElementById('f-batches').value=prefill.batches||'1';
     document.getElementById('f-status').value=prefill.status||'queued';
     document.getElementById('f-priority').value=prefill.priority||'low';
+    document.getElementById('f-confirmed').checked=!!prefill.confirmed;
     document.getElementById('f-notes').value=prefill.notes||'';
     calcBOM();
   }
@@ -2059,7 +2098,8 @@ function saveOrder(){
     qty,batches,total:qty*batches,
     status:document.getElementById('f-status').value,
     priority:document.getElementById('f-priority').value,
-    notes:document.getElementById('f-notes').value.trim()
+    notes:document.getElementById('f-notes').value.trim(),
+    confirmed:document.getElementById('f-confirmed').checked
   };
   if(editingId){const i=orders.findIndex(x=>x.id===editingId);if(i!==-1)orders[i]=o;}
   else orders.push(o);
@@ -2089,9 +2129,14 @@ function render(){
         <span class="card-meta">${items.length} order${items.length!==1?'s':''}</span>
       </div>
       ${isOpen?`<table class="orders">
-        <thead><tr><th>ID</th><th>SKU</th><th>Machine</th><th>Start</th><th>End</th><th>Total</th><th>Priority</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>ID</th><th>SKU</th><th>Machine</th><th>Start</th><th>End</th><th>Total</th><th>Priority</th><th>Status</th><th>Confirm</th><th></th></tr></thead>
         <tbody>${items.map(o=>{
           const od=o.due&&o.status!=='complete'&&o.due<todayStr;
+          // Treat undefined (legacy data) as confirmed; only explicit false → Tentative
+          const isTentative = o.confirmed === false;
+          const confirmedBadge = isTentative
+            ? '<span class="badge badge-on-hold">◌ Tentative</span>'
+            : '<span class="badge badge-complete">✓ Confirmed</span>';
           return`<tr>
             <td style="font-size:12px;white-space:nowrap;">${esc(o.orderId)||'—'}</td>
             <td style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(o.sku||'')}">${esc(shortSku(o.sku))||'—'}</td>
@@ -2101,6 +2146,7 @@ function render(){
             <td style="white-space:nowrap;">${o.total?o.total.toLocaleString()+' kg':'—'}</td>
             <td><span class="badge badge-${o.priority||'low'}">${{high:'High',med:'Med',low:'Low'}[o.priority]||'—'}</span></td>
             <td><span class="badge badge-${o.status}">${{queued:'Queued','in-progress':'In progress','on-hold':'On hold',complete:'Complete'}[o.status]||o.status}</span></td>
+            <td>${confirmedBadge}</td>
             <td style="white-space:nowrap;">
               ${canEditOrders()?`<button class="btn btn-sm" onclick="editById('${o.id}')">Edit</button>
               <button class="btn btn-sm btn-danger" style="margin-left:4px;" onclick="deleteOrder('${o.id}')">Del</button>`:''}

@@ -298,6 +298,7 @@ const AUDIT_MAX = 5000;
 const AUDITED_FIELDS = [
   "orderId", "sku", "due", "start", "end", "cat", "sub", "region", "temper",
   "machine", "qty", "batches", "total", "status", "priority", "notes",
+  "confirmed",
 ];
 
 function actorFromRequest(req) {
@@ -433,7 +434,7 @@ app.post("/api/import-excel/parse", upload.single("file"), (req, res) => {
             orderId: mo, sku: rawSKU,
             machine: MASS_MACHINES[idx] || "conching",
             start, end, qty, batches: 1, total: qty,
-            ...attribs, status: "queued", priority: "med", due: end, notes: rawNotes,
+            ...attribs, status: "queued", priority: "med", due: end, notes: rawNotes, confirmed: false,
           });
         });
       } else {
@@ -448,7 +449,7 @@ app.post("/api/import-excel/parse", upload.single("file"), (req, res) => {
           orderId, sku: rawSKU,
           machine: machKey === "MULTI" ? "conching" : machKey,
           start, end, qty, batches: 1, total: qty,
-          ...attribs, status: "queued", priority: "med", due: end, notes,
+          ...attribs, status: "queued", priority: "med", due: end, notes, confirmed: false,
         });
       }
     }
@@ -690,6 +691,7 @@ async function executeAITool(name, input) {
         qty, batches: 1, total: qty,
         status: "queued", priority, notes,
         cat: "liquor", sub: "liquor",
+        confirmed: false,
       };
       orders.push(newOrder);
       writeData("vf_orders", orders);
