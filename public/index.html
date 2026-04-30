@@ -3091,11 +3091,28 @@ function renderAIMessages(displayHistory) {
     container.innerHTML = '<div class="ai-empty">Ask me to update the schedule.<br>e.g. "West Mac went down — shift all orders 3 days forward"</div>';
     return;
   }
-  container.innerHTML = displayHistory.map(m => {
+  container.innerHTML = displayHistory.map((m, i) => {
     const cls = m.role === 'user' ? 'user' : (m.error ? 'error' : 'assistant');
-    return `<div class="ai-msg ${cls}">${escapeHtml(m.text)}</div>`;
+    let body = escapeHtml(m.text);
+    if (m.jumpToDate) {
+      body += `<div style="margin-top:6px;"><button class="btn btn-sm btn-primary" onclick="aiJumpToDate('${m.jumpToDate}')" style="font-size:11px;padding:4px 10px;">Jump to ${m.jumpToDate}</button></div>`;
+    }
+    return `<div class="ai-msg ${cls}">${body}</div>`;
   }).join('');
   container.scrollTop = container.scrollHeight;
+}
+
+// Helper for the AI hint that surfaces when a created order falls outside
+// the current calendar window. Switches to the Calendar tab and shifts the
+// 4-week view so the target date is in frame.
+function aiJumpToDate(dateStr) {
+  const target = new Date(dateStr + 'T00:00:00');
+  const today = new Date(); today.setHours(0,0,0,0);
+  const monToday = getMon(today);
+  const diffDays = Math.round((target - monToday) / 86400000);
+  calOffset = Math.floor(diffDays / 7);
+  switchTab('calendar');
+  renderCal();
 }
 
 const AI_THINKING_MSGS = [
@@ -3187,11 +3204,42 @@ async function sendAIMessage() {
     if (data.ok) {
       aiMessages = data.messages;   // adopt server's full conversation (includes tool results)
       aiDisplayHistory.push({ role: 'assistant', text: data.reply });
-      // If Claude made changes, refresh the UI
-      if (data.reply && /shifted|updated|changed|moved|set.*status|deleted|quantity|created order/i.test(data.reply)) {
-        await loadData();
+      // Server tells us explicitly whether any mutating tool ran; refresh
+      // local state if so. Replaces the old fragile reply-text regex match
+      // (which missed cases like "all three orders are confirmed in the
+      // backend" because none of the trigger keywords were present).
+      if (data.dataChanged) {
+        const beforeIds = new Set(orders.map(o => o.id));
+        // Reload orders from the server (the AI tools mutate them server-side
+        // via vf_orders writes, but our local 'orders' array is stale).
+        const fresh = await serverGet('vf_orders');
+        if (Array.isArray(fresh)) orders = fresh;
+        await loadInventoryCompletion();
         render();
         renderCal();
+        // Find any newly-added orders and, if the earliest is outside the
+        // current calendar window, surface a hint so the user doesn't think
+        // the chatbot did nothing visually. Only triggers when an add_order
+        // tool ran — irrelevant for status/qty updates of visible orders.
+        if ((data.mutatedTools || []).includes('add_order')) {
+          const newOrders = orders.filter(o => !beforeIds.has(o.id) && o.start);
+          if (newOrders.length) {
+            const earliest = newOrders.map(o => o.start).sort()[0];
+            const target = new Date(earliest + 'T00:00:00');
+            const today = new Date(); today.setHours(0,0,0,0);
+            const monToday = getMon(today);
+            const visStart = addDays(monToday, calOffset * 7);
+            const visEnd   = addDays(visStart, 27);
+            if (target < visStart || target > visEnd) {
+              const fmt = d => d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+              aiDisplayHistory.push({
+                role: 'assistant',
+                text: `(${newOrders.length} new order${newOrders.length === 1 ? '' : 's'} created starting ${fmt(target)} — outside the current 4-week view. Click below to jump there.)`,
+                jumpToDate: earliest,
+              });
+            }
+          }
+        }
       }
     } else {
       aiDisplayHistory.push({ role: 'assistant', error: true, text: 'Error: ' + (data.error || 'Unknown error') });

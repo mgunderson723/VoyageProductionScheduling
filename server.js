@@ -501,6 +501,18 @@ For delete_order specifically: always name the order ID and SKU in your confirma
 
 Dates are always in YYYY-MM-DD format.`;
 
+// Tools that mutate vf_orders. Used by /api/chat to set a dataChanged flag
+// in the response so the front-end refreshes its local state regardless of
+// what wording the model used in its reply text.
+const MUTATING_AI_TOOLS = new Set([
+  "shift_machine_orders",
+  "update_order_dates",
+  "update_order_status",
+  "add_order",
+  "update_order_quantity",
+  "delete_order",
+]);
+
 const AI_TOOLS = [
   {
     name: "get_orders",
@@ -804,6 +816,7 @@ app.post("/api/chat", async (req, res) => {
       content: m.content,
     }));
     let response;
+    const mutatedTools = []; // names of mutating tools invoked this turn
 
     // Agentic loop — max 8 tool-use rounds
     for (let i = 0; i < 8; i++) {
@@ -822,11 +835,18 @@ app.post("/api/chat", async (req, res) => {
       currentMessages.push({ role: "assistant", content: response.content });
 
       const toolResults = await Promise.all(
-        toolUseBlocks.map(async block => ({
-          type: "tool_result",
-          tool_use_id: block.id,
-          content: JSON.stringify(await executeAITool(block.name, block.input)),
-        }))
+        toolUseBlocks.map(async block => {
+          // Track mutating tool invocations so the front-end knows to refresh
+          // its local data — replaces the fragile reply-text regex matching.
+          if (MUTATING_AI_TOOLS.has(block.name)) {
+            mutatedTools.push(block.name);
+          }
+          return {
+            type: "tool_result",
+            tool_use_id: block.id,
+            content: JSON.stringify(await executeAITool(block.name, block.input)),
+          };
+        })
       );
       currentMessages.push({ role: "user", content: toolResults });
     }
@@ -841,7 +861,13 @@ app.post("/api/chat", async (req, res) => {
     // Append final assistant message to the conversation
     currentMessages.push({ role: "assistant", content: response.content });
 
-    res.json({ ok: true, reply, messages: currentMessages });
+    res.json({
+      ok: true,
+      reply,
+      messages: currentMessages,
+      dataChanged: mutatedTools.length > 0,
+      mutatedTools,
+    });
   } catch (e) {
     console.error("AI chat error:", e);
     res.status(500).json({ ok: false, error: e.message });
