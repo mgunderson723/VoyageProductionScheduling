@@ -1522,87 +1522,107 @@ function parseInventoryRows(rows) {
   };
 }
 
-// Per-month-replace merge for the daily auto-sync. Each daily file covers a
-// rolling 15-day window from Cin7. The naive additive merge would double-count
-// SKU monthly totals on the second day's overlap. This function instead:
-//   - For invSku monthly buckets: REPLACES months covered by the new file,
-//     KEEPS months outside that window from the existing snapshot
-//   - For invCat / invRt: same per-month replacement strategy
-//   - For moMovements: overwrites per MO (delta wins, no math drift)
-//   - For SKUs only in existing (no new data this cycle): preserved as-is
-// Mirrors the original server-side Cin7 sync's merge semantics in
-// performCin7Sync (kept around as reference even though that path is dead).
+// Max-merge for the daily auto-sync against a rolling 15-day Cin7 window.
+//
+// Why MAX and not REPLACE: each daily file is a partial slice (only
+// transactions whose stock-movement-date falls in the last 15 days). For an
+// MO that ran 12 days starting outside that window, the file would report a
+// partial total. Per-month-REPLACE would clobber the full bulk-backfilled
+// month with the partial 15-day slice — eroding history one day at a time.
+//
+// Strategy: for each (SKU, month) bucket, take MAX of i and o independently
+// across existing vs delta. Same for invCat[cat][month], invRt[rt][month],
+// and moMovements per MO. The "fullest" snapshot ever seen wins.
+//
+// Assumes monotonic-growth semantics: production-receipt qtys only go up over
+// time. Voiding a posted transaction would reduce the true total — MAX would
+// incorrectly preserve the pre-void value. Rare enough that re-running a bulk
+// backfill is an acceptable fix when needed.
 function mergeInventoryByMonth(existing, delta) {
-  const deltaMonths = new Set(delta.months || []);
-  const skuMap = new Map();
-
-  // Seed with existing SKUs, but strip out months the delta will replace
-  for (const e of existing.invSku || []) {
-    const entry = { ...e, m: {}, rt: { ...(e.rt || {}) }, ti: 0, to: 0, net: 0, bc: e.bc || 0 };
-    for (const m in (e.m || {})) {
-      if (!deltaMonths.has(m)) {
-        entry.m[m] = { ...e.m[m] };
-        entry.ti += e.m[m].i;
-        entry.to += e.m[m].o;
-        entry.net += e.m[m].i - e.m[m].o;
-      }
-    }
-    skuMap.set(e.s, entry);
-  }
-  // Layer fresh months on top
-  for (const e of delta.invSku || []) {
-    if (!skuMap.has(e.s)) {
-      const fresh = { ...e, m: {}, rt: { ...(e.rt || {}) }, ti: 0, to: 0, net: 0, bc: e.bc || 0 };
-      for (const m in (e.m || {})) {
-        fresh.m[m] = { ...e.m[m] };
-        fresh.ti += e.m[m].i;
-        fresh.to += e.m[m].o;
-        fresh.net += e.m[m].i - e.m[m].o;
-      }
-      skuMap.set(e.s, fresh);
-    } else {
-      const entry = skuMap.get(e.s);
-      for (const m in (e.m || {})) {
-        entry.m[m] = { ...e.m[m] };
-        entry.ti += e.m[m].i;
-        entry.to += e.m[m].o;
-        entry.net += e.m[m].i - e.m[m].o;
-      }
-      // Refresh rt totals from the delta side (they're SKU-level totals so a
-      // straight copy is fine — overlapping refs would have been part of the
-      // existing rt totals before, but since we cleared months already, we
-      // rebuild rt strictly from the delta for the in-window data).
-      for (const r in (e.rt || {})) entry.rt[r] = { ...e.rt[r] };
-      if (e.p && !entry.p) entry.p = e.p;
-      if (e.c && !entry.c) entry.c = e.c;
-      if (e.u && !entry.u) entry.u = e.u;
-    }
-  }
-
-  // catAgg / rtAgg — per-month replacement
-  function mergeMonthly(oldAgg, newAgg) {
+  // Helper: pick larger { i, o } pair, treating missing as zero
+  const maxIO = (a, b) => ({
+    i: Math.max((a && a.i) || 0, (b && b.i) || 0),
+    o: Math.max((a && a.o) || 0, (b && b.o) || 0),
+  });
+  // Helper: per-key per-month max-merge for catAgg / rtAgg
+  const mergeMonthlyMax = (oldAgg, newAgg) => {
     const out = {};
-    for (const k in (oldAgg || {})) {
+    const keys = new Set([...Object.keys(oldAgg || {}), ...Object.keys(newAgg || {})]);
+    for (const k of keys) {
       out[k] = {};
-      for (const m in oldAgg[k]) if (!deltaMonths.has(m)) out[k][m] = oldAgg[k][m];
-    }
-    for (const k in (newAgg || {})) {
-      if (!out[k]) out[k] = {};
-      for (const m in newAgg[k]) out[k][m] = newAgg[k][m];
+      const months = new Set([...Object.keys((oldAgg || {})[k] || {}), ...Object.keys((newAgg || {})[k] || {})]);
+      for (const m of months) {
+        out[k][m] = maxIO((oldAgg || {})[k] && oldAgg[k][m], (newAgg || {})[k] && newAgg[k][m]);
+      }
     }
     return out;
+  };
+
+  // Index existing + delta SKUs by SKU id
+  const existingBySku = new Map((existing.invSku || []).map(e => [e.s, e]));
+  const deltaBySku    = new Map((delta.invSku || []).map(e => [e.s, e]));
+  const allSkus = new Set([...existingBySku.keys(), ...deltaBySku.keys()]);
+
+  const merged = [];
+  for (const sku of allSkus) {
+    const ex = existingBySku.get(sku);
+    const dx = deltaBySku.get(sku);
+    // Union of months from both sides
+    const months = new Set([
+      ...Object.keys((ex && ex.m) || {}),
+      ...Object.keys((dx && dx.m) || {}),
+    ]);
+    const m = {};
+    let ti = 0, to = 0, net = 0;
+    for (const month of months) {
+      const v = maxIO((ex && ex.m && ex.m[month]) || null, (dx && dx.m && dx.m[month]) || null);
+      m[month] = v;
+      ti += v.i; to += v.o; net += v.i - v.o;
+    }
+    // Per-SKU rt totals: union of ref types, max per type
+    const rt = {};
+    const rtKeys = new Set([
+      ...Object.keys((ex && ex.rt) || {}),
+      ...Object.keys((dx && dx.rt) || {}),
+    ]);
+    for (const r of rtKeys) {
+      rt[r] = maxIO((ex && ex.rt && ex.rt[r]) || null, (dx && dx.rt && dx.rt[r]) || null);
+    }
+    // Batch count: take the larger
+    const bc = Math.max((ex && ex.bc) || 0, (dx && dx.bc) || 0);
+    merged.push({
+      s: sku,
+      p: (dx && dx.p) || (ex && ex.p) || "",
+      c: (dx && dx.c) || (ex && ex.c) || "",
+      u: (dx && dx.u) || (ex && ex.u) || "",
+      m, rt, ti, to, net, bc,
+    });
   }
 
-  // moMovements — fresh wins per MO (overwrite, not add)
-  const mergedMo = { ...(existing.moMovements || {}) };
-  for (const mo in (delta.moMovements || {})) {
-    mergedMo[mo] = delta.moMovements[mo];
+  // moMovements: per-MO max of totalIn and totalOut independently. Carry
+  // over the SKU/prod metadata from whichever side has it (delta wins on
+  // ties because it's likely fresher).
+  const mergedMo = {};
+  const moKeys = new Set([
+    ...Object.keys(existing.moMovements || {}),
+    ...Object.keys(delta.moMovements || {}),
+  ]);
+  for (const mo of moKeys) {
+    const ex = (existing.moMovements || {})[mo];
+    const dx = (delta.moMovements || {})[mo];
+    mergedMo[mo] = {
+      mo,
+      sku: (dx && dx.sku) || (ex && ex.sku) || "",
+      prod: (dx && dx.prod) || (ex && ex.prod) || "",
+      totalIn: Math.max((ex && ex.totalIn) || 0, (dx && dx.totalIn) || 0),
+      totalOut: Math.max((ex && ex.totalOut) || 0, (dx && dx.totalOut) || 0),
+    };
   }
 
   return {
-    invSku: [...skuMap.values()],
-    invCat: mergeMonthly(existing.invCat, delta.invCat),
-    invRt:  mergeMonthly(existing.invRt,  delta.invRt),
+    invSku: merged,
+    invCat: mergeMonthlyMax(existing.invCat, delta.invCat),
+    invRt:  mergeMonthlyMax(existing.invRt,  delta.invRt),
     months: [...new Set([...(existing.months || []), ...(delta.months || [])])].sort(),
     moMovements: mergedMo,
   };
