@@ -1244,6 +1244,339 @@ app.get("/api/cin7/onhand/status", (req, res) => {
   res.json({ ok: true, lastSync: blob.lastSync, rowCount: blob.rowCount, skuCount: blob.skuCount });
 });
 
+// ── MRP Phase 2: BOM + supply settings (lead times, safety stock) ────────────
+//
+// Storage shape:
+//   vf_boms              — { lastImport, parents: { <sku>: [{ version, ... }] } }
+//   vf_supply_settings   — { lastImport, defaults: {...}, perSku: { <sku>: {...} } }
+//
+// Default version (VersionDefault=Yes) is used for MRP requirements; other
+// versions are kept in the parents[sku] array so a UI can show them all.
+
+// Map BOM WorkCentreName → app machine key (or null for "priority 2 — map later")
+const WC_TO_MACHINE = {
+  "Refine":               "refining",
+  "Conch":                "conching",
+  "Drops and Pack":       "depositing",
+  "Pack in Pouch":        "pouching",
+  "Pack from MAC":        "mac_packout",
+  "Clean Seeds":          "seed_clean",
+  "Grape Seeds":          "roaster",
+  "Ground BFC":           "grinder",
+  "Liquor":               "__liquor_split__",  // resolved from fat-type RM
+  "Final Blend":          null,
+  "Hazelnut Free Spread": null,
+  "Concentrate":          null,
+  "Paste":                null,
+  "Testing work center":  null,
+};
+
+// Production lead time per machine, in days (sourced from Capacity & Ops tab)
+const MACHINE_LEAD_DAYS = {
+  seed_clean:  1,
+  roaster:     1,
+  east_mac:    12,
+  west_mac:    12,
+  mac_1250:    1,
+  mac_packout: 10,
+  pouching:    1,
+  fat_melter:  3,
+  refining:    1,
+  conching:    1,
+  depositing:  1,
+  grinder:     1,   // 1000 kg / 2-hr shift; defaults to 1 day for typical runs
+};
+
+// CSV line parser that handles quoted fields and commas-inside-quotes
+function parseCsvLine(line) {
+  const out = []; let cur = ""; let inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQ) {
+      if (ch === '"' && line[i+1] === '"') { cur += '"'; i++; }
+      else if (ch === '"') inQ = false;
+      else cur += ch;
+    } else {
+      if (ch === '"') inQ = true;
+      else if (ch === ',') { out.push(cur); cur = ""; }
+      else cur += ch;
+    }
+  }
+  out.push(cur);
+  return out.map(s => s.trim());
+}
+
+// Parse Cin7 BOM CSV (Action,ProductSKU,...). Returns the canonical vf_boms blob.
+function parseBomCsv(text) {
+  const lines = text.split(/\r?\n/).filter(l => l.trim());
+  if (lines.length < 2) throw new Error("BOM CSV has no data rows");
+  const hdr = parseCsvLine(lines[0]);
+  const idx = {};
+  hdr.forEach((h, i) => idx[h] = i);
+  const required = ["ProductSKU", "ItemType", "ComponentSKU_ResourceCode", "Quantity", "Version"];
+  for (const r of required) if (idx[r] === undefined) throw new Error(`BOM CSV missing column: ${r}`);
+
+  // First pass: bucket rows by parent + version
+  const bucket = {}; // key = parent + '|' + version
+  for (let i = 1; i < lines.length; i++) {
+    const f = parseCsvLine(lines[i]);
+    const parent = f[idx.ProductSKU];
+    if (!parent) continue;
+    const itemType = f[idx.ItemType];
+    if (itemType === "Output" || itemType === "Resource") continue;
+    if (itemType !== "Component") continue;
+    const componentSku = f[idx.ComponentSKU_ResourceCode];
+    if (!componentSku) continue;
+    const version = String(f[idx.Version] || "1");
+    const key = parent + "|" + version;
+    if (!bucket[key]) {
+      bucket[key] = {
+        parent,
+        parentName: f[idx.ProductName] || "",
+        version,
+        versionName: f[idx.VersionName] || "",
+        isDefault: (f[idx.VersionDefault] || "").toLowerCase() === "yes",
+        runSize: parseFloat(f[idx.RunSize]) || 0,
+        minQty: parseFloat(f[idx.MinQuantity]) || 0,
+        maxQty: parseFloat(f[idx.MaxQuantity]) || 0,
+        productionLeadTimeRaw: parseInt(f[idx.ProductionLeadTime], 10) || 0,
+        components: [],
+      };
+    }
+    bucket[key].components.push({
+      sku: componentSku,
+      name: f[idx.ComponentName_ResourceName] || "",
+      qty: parseFloat(f[idx.Quantity]) || 0,
+      wastagePct: parseFloat(f[idx.WastagePercent_ForStockComponentOnly]) || 0,
+      op: parseInt(f[idx.OperationSequence], 10) || 1,
+      opName: f[idx.OperationName] || "",
+      workCentre: f[idx.WorkCentreName] || "",
+    });
+  }
+
+  // Second pass: derive machine + production lead time per BOM
+  const parents = {};
+  for (const key of Object.keys(bucket)) {
+    const b = bucket[key];
+    b.machine = deriveMachineFromBom(b);
+    b.productionLeadTime = b.machine ? (MACHINE_LEAD_DAYS[b.machine] || null) : null;
+    if (!parents[b.parent]) parents[b.parent] = [];
+    parents[b.parent].push(b);
+  }
+  // Sort each parent's versions: default first, then by version number
+  for (const sku of Object.keys(parents)) {
+    parents[sku].sort((a, b) => {
+      if (a.isDefault !== b.isDefault) return a.isDefault ? -1 : 1;
+      return Number(a.version) - Number(b.version);
+    });
+  }
+  return {
+    lastImport: new Date().toISOString(),
+    parents,
+    parentCount: Object.keys(parents).length,
+    rowCount: Object.values(parents).reduce((s, vs) => s + vs.reduce((s2, v) => s2 + v.components.length, 0), 0),
+  };
+}
+
+// Resolve the machine key for a BOM. Most work centres map directly; Liquor
+// splits to east_mac / west_mac based on whether the components include a CBE
+// (RM-120002-00 Coberine) or CBS (RM-120004-00 PK-100) fat.
+function deriveMachineFromBom(bom) {
+  if (!bom.components.length) return null;
+  // Use the first operation's work centre as the primary
+  const wc = bom.components[0].workCentre;
+  const m = WC_TO_MACHINE[wc];
+  if (m === undefined) return null; // unknown WC
+  if (m === null) return null;       // priority-2, deliberately unmapped
+  if (m !== "__liquor_split__") return m;
+  // Liquor split — scan all components for a fat SKU
+  const skus = new Set(bom.components.map(c => c.sku));
+  if (skus.has("RM-120002-00")) return "west_mac"; // Coberine = CBE
+  if (skus.has("RM-120004-00")) return "east_mac"; // PK-100 = CBS
+  return null;
+}
+
+// Parse the lead-time CSV (SKU, Product Name, "WOS & Lead").
+// Per-user: when the cell reads "Xwks & Y Days", use ONLY the days portion.
+// "contract" → flag as contract-managed (no PO suggestions).
+// "more to -00" / similar → alias resolved later in normalizeSupplySettings.
+function parseLeadTimeCsv(text) {
+  const lines = text.split(/\r?\n/).filter(l => l.trim());
+  if (!lines.length) return [];
+  const hdr = parseCsvLine(lines[0]).map(h => h.toLowerCase());
+  const skuIdx = hdr.findIndex(h => h === "sku");
+  const ltIdx  = hdr.findIndex(h => h.includes("lead") || h === "wos & lead");
+  if (skuIdx === -1 || ltIdx === -1) throw new Error("Lead-time CSV needs 'SKU' and 'WOS & Lead' (or 'Lead') columns");
+  const out = [];
+  for (let i = 1; i < lines.length; i++) {
+    const f = parseCsvLine(lines[i]);
+    const sku = f[skuIdx]; if (!sku) continue;
+    const raw = (f[ltIdx] || "").trim();
+    const parsed = parseLeadTimeCell(raw);
+    out.push({ sku, raw, ...parsed });
+  }
+  return out;
+}
+
+// "X Days" / "Xwks & Y Days" / "contract" / "more to -00" / "" → structured
+function parseLeadTimeCell(raw) {
+  if (!raw) return { leadTimeDays: null, isContract: false, alias: null };
+  const lower = raw.toLowerCase();
+  if (lower.includes("contract")) return { leadTimeDays: null, isContract: true, alias: null };
+  // "more to -00" or "more to RM-XXXX" → alias
+  const aliasMatch = raw.match(/more to\s+(\S+)/i);
+  if (aliasMatch) return { leadTimeDays: null, isContract: false, alias: aliasMatch[1] };
+  // "Xwks & Y Days" — per user, take ONLY the days portion
+  const both = raw.match(/(\d+)\s*wk[s]?\s*&\s*(\d+)\s*day/i);
+  if (both) return { leadTimeDays: parseInt(both[2], 10), isContract: false, alias: null };
+  // "X Days"
+  const days = raw.match(/(\d+)\s*day/i);
+  if (days) return { leadTimeDays: parseInt(days[1], 10), isContract: false, alias: null };
+  return { leadTimeDays: null, isContract: false, alias: null };
+}
+
+// Normalize raw lead-time entries into the canonical perSku map. Resolves
+// aliases ("more to -00" → copy target's settings) and drops malformed rows.
+function normalizeSupplySettings(rawEntries, defaults) {
+  const perSku = {};
+  // First pass: direct entries
+  for (const e of rawEntries) {
+    if (!e.sku || e.alias) continue;
+    perSku[e.sku] = {
+      leadTimeDays: e.leadTimeDays,
+      isContract: e.isContract,
+      isAlias: false,
+      raw: e.raw,
+    };
+  }
+  // Second pass: alias entries point to direct entries
+  for (const e of rawEntries) {
+    if (!e.alias) continue;
+    // alias target like "-00" means "same as <prefix>-00" — resolve by prefix match
+    let targetSku = e.alias;
+    if (targetSku.startsWith("-")) {
+      // user shorthand — find a sibling with the same prefix
+      const prefix = e.sku.replace(/-\d+$/, "");
+      targetSku = prefix + targetSku;
+    }
+    const target = perSku[targetSku];
+    if (target) {
+      perSku[e.sku] = { ...target, isAlias: true, aliasOf: targetSku, raw: e.raw };
+    } else {
+      perSku[e.sku] = { leadTimeDays: null, isContract: false, isAlias: true, aliasOf: targetSku, aliasUnresolved: true, raw: e.raw };
+    }
+  }
+  return { lastImport: new Date().toISOString(), defaults, perSku };
+}
+
+// Recursively expand a BOM to leaf-RM requirements for a given parent + qty.
+// Returns { leaves: { sku: {qty, name, leafSku} }, intermediates: [{sku, qty, version, depth}] }
+// Cycles are detected via the visited set; a leaf is anything not in vf_boms.parents.
+function expandBom(parents, parentSku, qty, opts) {
+  opts = opts || {};
+  const applyWastage = opts.applyWastage !== false; // default true
+  const visited = new Set();
+  const leaves = {};
+  const trail = [];
+
+  function recurse(sku, needed, depth) {
+    if (depth > 12) throw new Error(`BOM recursion too deep at ${sku}`);
+    if (visited.has(sku)) {
+      // cycle — log and treat as leaf to bail out gracefully
+      if (!leaves[sku]) leaves[sku] = { sku, qty: 0, name: "(cycle detected)", isCycle: true };
+      leaves[sku].qty += needed;
+      return;
+    }
+    const versions = parents[sku];
+    if (!versions || !versions.length) {
+      // leaf RM
+      if (!leaves[sku]) leaves[sku] = { sku, qty: 0, name: "" };
+      leaves[sku].qty += needed;
+      return;
+    }
+    // Pick default version (first after sort)
+    const bom = versions[0];
+    visited.add(sku);
+    trail.push({ sku, qty: needed, version: bom.version, depth });
+    for (const c of bom.components) {
+      const eff = applyWastage ? c.qty * (1 + (c.wastagePct || 0) / 100) : c.qty;
+      recurse(c.sku, needed * eff, depth + 1);
+    }
+    visited.delete(sku);
+  }
+
+  recurse(parentSku, qty, 0);
+  return { leaves, intermediates: trail };
+}
+
+// POST /api/boms/import — admin-only, accepts raw CSV text in body { csv: "..." }
+app.post("/api/boms/import", requireAdmin, (req, res) => {
+  try {
+    const csv = req.body && req.body.csv;
+    if (!csv) return res.status(400).json({ ok: false, error: "Missing 'csv' field in body" });
+    const blob = parseBomCsv(csv);
+    writeData("vf_boms", blob);
+    res.json({ ok: true, ...blob, parents: undefined });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/supply-settings/import — admin-only. Body: { leadTimeCsv?, packagingCsv?, defaults? }
+app.post("/api/supply-settings/import", requireAdmin, (req, res) => {
+  try {
+    const body = req.body || {};
+    const defaults = Object.assign(
+      { leadTimeDays: 30, safetyStockDays: 14, packagingDefaultDays: 14 },
+      body.defaults || {},
+    );
+    const all = [];
+    if (body.leadTimeCsv) all.push(...parseLeadTimeCsv(body.leadTimeCsv));
+    if (body.packagingCsv) all.push(...parseLeadTimeCsv(body.packagingCsv));
+    // Apply per-prefix defaults: PK-* without explicit value → packagingDefaultDays
+    for (const e of all) {
+      if (e.leadTimeDays == null && !e.isContract && !e.alias && e.sku && e.sku.startsWith("PK-")) {
+        e.leadTimeDays = defaults.packagingDefaultDays;
+        e.appliedPackagingDefault = true;
+      }
+    }
+    const blob = normalizeSupplySettings(all, defaults);
+    writeData("vf_supply_settings", blob);
+    res.json({ ok: true, lastImport: blob.lastImport, defaults: blob.defaults, skuCount: Object.keys(blob.perSku).length });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/boms — full BOM blob (any authed user)
+app.get("/api/boms", (req, res) => {
+  const blob = readData("vf_boms");
+  if (!blob) return res.json({ ok: true, lastImport: null, parents: {}, parentCount: 0 });
+  res.json({ ok: true, ...blob });
+});
+
+// GET /api/boms/expand?sku=X&qty=Y[&wastage=0] — recursive expansion for testing/MRP
+app.get("/api/boms/expand", (req, res) => {
+  try {
+    const sku = req.query.sku;
+    const qty = parseFloat(req.query.qty);
+    if (!sku || !isFinite(qty)) return res.status(400).json({ ok: false, error: "Need sku and numeric qty" });
+    const blob = readData("vf_boms");
+    if (!blob) return res.status(404).json({ ok: false, error: "No BOMs imported" });
+    const result = expandBom(blob.parents, sku, qty, { applyWastage: req.query.wastage !== "0" });
+    res.json({ ok: true, sku, qty, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/supply-settings — current settings
+app.get("/api/supply-settings", (req, res) => {
+  const blob = readData("vf_supply_settings");
+  if (!blob) return res.json({ ok: true, lastImport: null, defaults: { leadTimeDays: 30, safetyStockDays: 14, packagingDefaultDays: 14 }, perSku: {} });
+  res.json({ ok: true, ...blob });
+});
+
 // Nightly on-hand sync at 06:30 UTC (just after the manual movement-upload window)
 if (process.env.CIN7_ACCOUNT_ID && process.env.CIN7_APPLICATION_KEY) {
   cron.schedule("30 6 * * *", async () => {
