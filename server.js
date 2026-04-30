@@ -470,27 +470,52 @@ Machines (use these exact keys):
 - Zone 1 Seed prep: seed_clean (Seed Cleaning), roaster (Alk/Roaster)
 - Zone 1 Mcintyres: east_mac (East Mac CBS), west_mac (West Mac CBE), mac_1250 (1250 Mac), mac_packout (Mac Packout), pouching (Pouching)
 - Zone 2 Chocolate: fat_melter (Fat Melter), refining (Refining), conching (Conching), depositing (Depositing)
+- Zone 2 Other: grinder (Ground BFC line — 1,000 kg per 2-hr shift)
 
 Capacity & runtime constraints (apply these when recommending slots):
 - east_mac / west_mac (Mcintyres): Runtime 12 days. Min 2,250 kg / Max 4,300 kg per batch. EU and US products cannot be mixed on the same run.
 - refining: Runtime 1 day. Max capacity 6,000 kg/day (4 batches × 1,500 kg). Min 500 kg per batch.
 - conching: Runtime 1 day. Min 3,000 kg / Max 6,000 kg per run.
 - roaster: ~325 kg per batch, up to ~4 batches/shift (~1,300 kg/day).
-- fat_melter: 24 hr melt cycle. Runs simultaneously with liquor melting.
+- fat_melter: CBE-based fat 24 hr melt cycle; CBS-based fat 72 hr. Runs simultaneously with liquor melting.
 - Liquor melting (pre-conching): 72 hr.
-- Finished chocolate pipeline: roasting → fat melting (24 hr, parallel with liquor melting 72 hr) → refining (1 day) → conching (1 day) → depositing.
-- Liquor pipeline: roasting → fat melting (24 hr) → Mcintyre (12 days) → packout.
+
+PRODUCTION RECIPE PIPELINE (read carefully — quantities scale DOWN through the chain, not 1:1):
+
+Finished Chocolate (CFC) requires (in this backward order):
+  4. CFC FG ← refining → conching → depositing (Zone 2 chocolate line; ~3 days end-to-end)
+  3. Liquor (10–20% of the FG recipe by weight, recipe-dependent)
+  2. Liquor itself ← Mcintyre run (12 day cycle, east_mac CBS / west_mac CBE)
+  1. Liquor BOM = ~70% roasted seeds + ~30% melted fat
+       ↳ Roasted seeds ← roaster
+       ↳ Melted fat ← fat_melter (24 hr CBE / 72 hr CBS)
+
+So 7,000 kg of finished CFC ≠ 7,000 kg of every input. Rough sanity check:
+  - 7,000 kg CFC needs ~700–1,400 kg of liquor (10–20%)
+  - That liquor needs ~490–980 kg roasted seeds (70% of liquor)
+  - Plus ~210–420 kg melted fat (30% of liquor)
+  - The remaining ~5,600–6,300 kg of CFC weight comes from sugar, packaging, flavorings, etc. as defined in the FG's BOM.
+
+Liquor (sold-as-is) production: roasting → fat melting (24/72 hr) → Mcintyre (12 days) → packout. Liquor IS made on the Mcintyre, not on the chocolate line.
+
+CRITICAL: DO NOT recommend production schedules using straight-line 1:1 scaling of the requested FG qty through every upstream stage. ALWAYS call bom_expand FIRST for any multi-stage production planning so you have BOM-driven quantities at each step. If the user names a product loosely (e.g. "CFC 506 EU"), use find_bom to resolve to the actual SKU before bom_expand.
 
 Order statuses: queued, in-progress, complete, on-hold
 Order priorities: high, med, low
+Order confirmation: 'confirmed' boolean (default false on new). Tentative orders get visual cue on calendar but are still real schedule entries.
 
-When recommending a production slot:
+When recommending a production slot for a finished good or WIP:
 1. Call get_orders to see what's currently scheduled.
-2. Call find_available_slots for the relevant machine(s) to identify open windows.
-3. Check that the requested quantity fits within machine capacity constraints above.
-4. If the product requires multiple machines (e.g. finished chocolate), find slots across the full pipeline.
-5. Present 2–3 concrete options (with start/end dates) and explain the trade-offs.
-6. Do NOT book anything — only recommend. The user must ask you to create or update an order to make it happen.
+2. If the user's product reference is loose, call find_bom to get the right SKU.
+3. Call bom_expand to get per-stage quantities and the upstream WIPs that must be produced. The intermediateStages array tells you each stage's machine + its production lead time.
+4. For multi-stage products, schedule BACKWARD from the desired completion date:
+   - Last step (e.g. depositing) ends at the target completion date
+   - Each upstream stage must finish before its downstream stage starts (i.e. work the lead times backward)
+   - Roasting + fat melting can run in parallel (both feed Mcintyre in the liquor case, or feed downstream stages directly for CFC)
+5. Check that each stage's required qty fits within that machine's capacity constraints above.
+6. Use find_available_slots (or get_orders + reason about gaps) to pick concrete dates that don't collide with existing scheduled work.
+7. Present 2–3 concrete options spanning the full pipeline (each option = a complete set of stage dates) and explain the trade-offs (lead time risk, fat type, batch size fit, etc.).
+8. Do NOT book anything — only recommend. The user must ask you to create or update orders to make it happen.
 
 IMPORTANT: Before calling any write tools (add_order, shift_machine_orders, update_order_dates, update_order_status, update_order_quantity, delete_order), you MUST:
 1. Use get_orders to see the current state
@@ -611,6 +636,29 @@ const AI_TOOLS = [
         order_id: { type: "string", description: "The orderId field of the order to delete" },
       },
       required: ["order_id"],
+    },
+  },
+  {
+    name: "find_bom",
+    description: "Search the BOM library for parent SKUs matching a query. Use this when the user names a product (e.g. 'CFC 506 EU' or 'PFS pouch') and you need to resolve it to a real SKU before calling bom_expand. Returns up to 20 matches. If the user gives an exact SKU, you can skip this and call bom_expand directly.",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Substring to match against parent SKU or product name (case-insensitive)" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "bom_expand",
+    description: "CRITICAL for any multi-stage production planning. Recursively expand a parent SKU's BOM down to leaf-level raw-material requirements for a given quantity. Returns a list of every leaf RM and the kg required, plus the WIP intermediates traversed (with their own qtys, so you can plan upstream production stages). Honors the BOM's wastage% per edge. Use this BEFORE recommending production schedules for finished goods or WIPs — it tells you how much you actually need at each stage of the pipeline (e.g. 7,000 kg of finished chocolate does NOT require 7,000 kg of roasted seeds; the BOM ratios are typically far smaller). The 'machine' field on each intermediate identifies which production line that stage runs on, so you can sequence the schedule.",
+    input_schema: {
+      type: "object",
+      properties: {
+        sku: { type: "string", description: "Parent SKU to expand (FG-… or WIP-…)" },
+        qty: { type: "number", description: "Production quantity in kg (or units, for packaged FGs)" },
+      },
+      required: ["sku", "qty"],
     },
   },
 ];
@@ -793,6 +841,69 @@ async function executeAITool(name, input) {
       const deleted = orders.splice(idx, 1)[0];
       writeData("vf_orders", orders);
       return { ok: true, message: `Deleted order '${order_id}' (${deleted.sku || ""})` };
+    }
+
+    case "find_bom": {
+      const q = String(input.query || "").trim().toLowerCase();
+      if (!q) return { ok: false, error: "query is required" };
+      const blob = readData("vf_boms");
+      if (!blob || !blob.parents) return { ok: false, error: "No BOMs imported yet" };
+      const matches = [];
+      for (const sku of Object.keys(blob.parents)) {
+        const versions = blob.parents[sku];
+        const def = versions[0] || {};
+        const hay = (sku + " " + (def.parentName || "")).toLowerCase();
+        if (hay.includes(q)) {
+          matches.push({
+            sku,
+            name: def.parentName || "",
+            machine: def.machine || null,
+            productionLeadTimeDays: def.productionLeadTime,
+            qtyToProduce: def.qtyToProduce,
+            componentCount: (def.components || []).length,
+            versionCount: versions.length,
+          });
+          if (matches.length >= 20) break;
+        }
+      }
+      return { ok: true, query: q, matchCount: matches.length, matches };
+    }
+
+    case "bom_expand": {
+      const { sku, qty } = input;
+      if (!sku || !isFinite(qty)) return { ok: false, error: "Need sku and numeric qty" };
+      const blob = readData("vf_boms");
+      if (!blob || !blob.parents) return { ok: false, error: "No BOMs imported yet" };
+      if (!blob.parents[sku]) return { ok: false, error: `No BOM defined for '${sku}'. Try find_bom to discover the right SKU.` };
+      let result;
+      try { result = expandBom(blob.parents, sku, qty, { applyWastage: true }); }
+      catch (e) { return { ok: false, error: e.message }; }
+      // Enrich the intermediates with each WIP's machine + production lead
+      // time so the AI can sequence the upstream stages correctly.
+      const enriched = result.intermediates.map(step => {
+        const versions = blob.parents[step.sku] || [];
+        const bom = versions[0] || {};
+        return {
+          sku: step.sku,
+          qtyKg: Math.round(step.qty * 100) / 100,
+          version: step.version,
+          depth: step.depth,
+          machine: bom.machine || null,
+          productionLeadTimeDays: bom.productionLeadTime,
+          parentName: bom.parentName || "",
+        };
+      });
+      const leaves = Object.values(result.leaves)
+        .map(l => ({ sku: l.sku, qtyKg: Math.round(l.qty * 100) / 100, isCycle: !!l.isCycle }))
+        .sort((a, b) => b.qtyKg - a.qtyKg);
+      return {
+        ok: true,
+        parent: sku,
+        qty,
+        leafRequirements: leaves,
+        intermediateStages: enriched,
+        note: "leafRequirements = leaf-level raw materials to procure. intermediateStages = each WIP that must be produced (with its machine and lead time) — use these for backward production scheduling.",
+      };
     }
 
     default:
