@@ -200,6 +200,8 @@ body {
 .mo-block .mo-id { font-size: var(--vf-text-xs); font-weight: var(--vf-weight-medium); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--vf-brand-navy); }
 .mo-block .mo-sku { font-size: 10px; color: var(--vf-text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
 .mo-block .mo-qty { font-size: 10px; font-weight: var(--vf-weight-medium); color: var(--vf-text-primary); margin-top: 1px; white-space: nowrap; }
+.mo-block .mo-qty-actual { font-size: 10px; font-weight: var(--vf-weight-medium); color: var(--vf-success-text); margin-top: 1px; white-space: nowrap; }
+.mo-block--complete .mo-qty-actual { color: var(--vf-success-text); }
 
 /* Category palette — these names match the design guide table */
 .mo-cbe   { background: var(--vf-cat-blue-soft);   border-left-color: var(--vf-cat-blue-base);   color: var(--vf-cat-blue-strong); }
@@ -1317,6 +1319,10 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       <span style="display:block;font-size:11px;color:var(--vf-text-tertiary);font-weight:400;">When unchecked, MRP will only consume materials for this order if "include unconfirmed" is enabled.</span>
     </label>
   </div>
+  <div class="field"><label>Actual produced (kg) — leave blank if unknown</label>
+    <input id="f-actual-qty" type="number" min="0" step="any" placeholder="Pulled from Cin7 inventory if blank">
+    <div style="font-size:11px;color:var(--vf-text-tertiary);margin-top:3px;">Use when actual production differs from the plan (e.g. abandoned mid-run). Wins over inventory-derived totals in calendar / work orders / MO Status displays.</div>
+  </div>
   <div class="field"><label>Notes</label><textarea id="f-notes" placeholder="Special instructions, MO notes..."></textarea></div>
   <div class="modal-actions">
     <button class="btn btn-danger" id="f-delete-btn" onclick="deleteCurrent()" style="margin-right:auto;display:none;">Delete</button>
@@ -1768,6 +1774,7 @@ async function loadInventoryCompletion(){
     if(!r.ok) return;
     const j = await r.json();
     const moMovements = (j && j.exists && j.value && j.value.moMovements) ? j.value.moMovements : {};
+    _moMovementsCache = moMovements; // make accessible to sync render functions
 
     // Sum planned qty across ALL scheduled rows that share an MO number,
     // so a multi-day MO with rows of 1,118 + 559 + 1,397 kg is compared
@@ -1828,6 +1835,28 @@ function isOrderComplete(o){
   if(o && o.status === 'complete') return true;
   const moMatch = (o && o.orderId || '').match(/MO-\d+/);
   return !!(moMatch && inventoryCompletedMOs.has(moMatch[0]));
+}
+
+// Resolve the "actual produced" qty for an order. Manual override (actualQty)
+// wins; falls back to the inventory upload's per-MO totalIn if available;
+// returns null when neither is set. Used by calendar/work-orders/MO-status
+// displays to show planned vs actual when they diverge.
+//
+// _moMovementsCache is populated by loadInventoryCompletion() (which already
+// fetches /api/data/inventory) so render functions can read it synchronously.
+let _moMovementsCache = {};
+function getEffectiveActual(o, moMovements) {
+  const mm = moMovements || _moMovementsCache;
+  if (o && o.actualQty != null && o.actualQty !== '' && isFinite(o.actualQty)) return Number(o.actualQty);
+  const moMatch = (o && o.orderId || '').match(/MO-\d+/);
+  if (!moMatch) return null;
+  const inv = mm[moMatch[0]];
+  if (inv && inv.totalIn > 0) return inv.totalIn;
+  return null;
+}
+function getPlannedQty(o) {
+  if (o.total != null && o.total > 0) return o.total;
+  return (o.qty || 0) * (o.batches || 1);
 }
 
 // Category color mapping for calendar MO blocks (Voyage design system).
@@ -1952,14 +1981,30 @@ function renderCal(){
             const doneMark=done?'<span class="mo-done-mark" aria-label="Completed">✓</span> ':'';
             const isMatch=calSearchTerm && orderMatchesCalSearch(o);
             const matchCls=isMatch?' mo-block--match':'';
-            // Only EXPLICIT confirmed:false → Tentative; legacy undefined → Confirmed
             const isTentative = o.confirmed === false;
             const tentativeCls = isTentative ? ' mo-block--tentative' : '';
-            const titleSuffix = (done ? '\nCompleted' : '') + (isTentative ? '\nTentative — not confirmed for production' : '');
+            // Show actual qty (manual override or inventory-derived) when it
+            // differs meaningfully from planned. Tooltip gets the breakdown.
+            const planned = getPlannedQty(o);
+            const actual = getEffectiveActual(o);
+            const actualSource = (o.actualQty != null && o.actualQty !== '' && isFinite(o.actualQty)) ? 'manual' : 'inventory';
+            const showActual = actual != null && planned > 0 && Math.abs(actual - planned) / planned >= 0.05;
+            let qtyBlock = '';
+            if (planned) {
+              if (showActual) {
+                qtyBlock = `<div class="mo-qty">${planned.toLocaleString()} kg planned</div>
+                            <div class="mo-qty-actual">${actual.toLocaleString()} kg actual</div>`;
+              } else {
+                qtyBlock = `<div class="mo-qty">${planned.toLocaleString()} kg</div>`;
+              }
+            }
+            const titleSuffix = (done ? '\nCompleted' : '') +
+              (isTentative ? '\nTentative — not confirmed for production' : '') +
+              (showActual ? `\nActual: ${actual.toLocaleString()} kg (${actualSource}) vs planned ${planned.toLocaleString()} kg` : '');
             html+=`<div class="mo-block ${chipClass(o)}${done?' mo-block--complete':''}${matchCls}${tentativeCls}"${doneAttr} title="${esc((o.sku||'')+'\n'+(o.notes||''))+titleSuffix}" onclick="event.stopPropagation();editById('${esc(o.id)}')">
               <div class="mo-id">${doneMark}${esc(o.orderId)||'—'}</div>
               ${o.sku?`<div class="mo-sku">${esc(shortSku(o.sku))}</div>`:''}
-              ${o.total?`<div class="mo-qty">${o.total.toLocaleString()} kg</div>`:''}
+              ${qtyBlock}
             </div>`;
           });
         }else html+=`<span class="mo-empty">·</span>`;
@@ -2024,6 +2069,7 @@ function openModal(prefill,mk,ds){
   document.getElementById('f-batches').value='1';document.getElementById('f-total').value='';
   document.getElementById('f-status').value='queued';document.getElementById('f-priority').value='low';
   document.getElementById('f-confirmed').checked=false; // default new orders to unconfirmed
+  document.getElementById('f-actual-qty').value='';
   document.getElementById('wrap-variants').style.display='none';
   document.getElementById('batch-info').style.display='none';
   document.getElementById('bom-box').style.display='none';
@@ -2046,6 +2092,7 @@ function openModal(prefill,mk,ds){
     document.getElementById('f-status').value=prefill.status||'queued';
     document.getElementById('f-priority').value=prefill.priority||'low';
     document.getElementById('f-confirmed').checked=!!prefill.confirmed;
+    document.getElementById('f-actual-qty').value=(prefill.actualQty != null && prefill.actualQty !== '') ? prefill.actualQty : '';
     document.getElementById('f-notes').value=prefill.notes||'';
     calcBOM();
   }
@@ -2105,7 +2152,8 @@ function saveOrder(){
     status:document.getElementById('f-status').value,
     priority:document.getElementById('f-priority').value,
     notes:document.getElementById('f-notes').value.trim(),
-    confirmed:document.getElementById('f-confirmed').checked
+    confirmed:document.getElementById('f-confirmed').checked,
+    actualQty: (function(){ const v=document.getElementById('f-actual-qty').value; return v===''?null:parseFloat(v); })()
   };
   if(editingId){const i=orders.findIndex(x=>x.id===editingId);if(i!==-1)orders[i]=o;}
   else orders.push(o);
@@ -2149,7 +2197,15 @@ function render(){
             <td style="font-size:12px;">${esc(o.machine)||'—'}</td>
             <td style="font-size:12px;">${esc(o.start)||'—'}</td>
             <td style="font-size:12px;${od?'color:var(--vf-danger-text);font-weight:500;':''}">${esc(o.end||o.due)||'—'}</td>
-            <td style="white-space:nowrap;">${o.total?o.total.toLocaleString()+' kg':'—'}</td>
+            <td style="white-space:nowrap;">${(function(){
+              const planned = getPlannedQty(o);
+              const actual = getEffectiveActual(o);
+              const showActual = actual != null && planned > 0 && Math.abs(actual - planned) / planned >= 0.05;
+              if (!planned) return '—';
+              if (!showActual) return planned.toLocaleString() + ' kg';
+              const sourceTag = (o.actualQty != null && o.actualQty !== '' && isFinite(o.actualQty)) ? 'manual' : 'inventory';
+              return planned.toLocaleString() + ' kg<div style="font-size:10px;color:var(--vf-success-text);font-weight:500;margin-top:2px;" title="Actual produced — ' + sourceTag + '">actual: ' + actual.toLocaleString() + ' kg</div>';
+            })()}</td>
             <td><span class="badge badge-${o.priority||'low'}">${{high:'High',med:'Med',low:'Low'}[o.priority]||'—'}</span></td>
             <td><span class="badge badge-${o.status}">${{queued:'Queued','in-progress':'In progress','on-hold':'On hold',complete:'Complete'}[o.status]||o.status}</span></td>
             <td>${confirmedBadge}</td>
@@ -2887,8 +2943,16 @@ async function renderMOStatus() {
       return s + rowPlanned;
     }, 0);
     const inv     = moId ? moMovements[moId] : null;
-    const actual  = inv ? (inv.totalIn || 0) : 0;
-    const pct     = planned > 0 ? Math.min(Math.round(actual / planned * 100), 999) : null;
+    // Manual actualQty override on any row wins over inventory-derived totalIn.
+    // If multiple rows of the same MO each set actualQty (rare), we sum them.
+    const manualActuals = items
+      .map(o => (o.actualQty != null && o.actualQty !== '' && isFinite(o.actualQty)) ? Number(o.actualQty) : null)
+      .filter(v => v != null);
+    const actual = manualActuals.length > 0
+      ? manualActuals.reduce((s, v) => s + v, 0)
+      : (inv ? (inv.totalIn || 0) : 0);
+    const actualSource = manualActuals.length > 0 ? 'manual' : (inv ? 'inventory' : 'none');
+    const pct = planned > 0 ? Math.min(Math.round(actual / planned * 100), 999) : null;
 
     // Earliest start, latest end across all rows
     const starts = items.map(o => o.start).filter(Boolean).sort();
@@ -2906,20 +2970,23 @@ async function renderMOStatus() {
     const sku = items.find(o => o.sku)?.sku || '';
     const displayOrderId = moId || (items[0].orderId || '—');
 
-    // Status precedence across the bucket:
-    //   on-hold > complete (manual) > derived-from-inventory > stored status
+    // Status precedence across the bucket. The user's manual status wins
+    // over the inventory-derived check — important for abandoned-MO scenarios
+    // where actual production is far below the original plan but the order
+    // was deliberately closed out.
+    //   on-hold > manual complete > derived-from-inventory > stored status
     const allOnHold = items.every(o => o.status === 'on-hold');
     const anyComplete = items.some(o => o.status === 'complete');
     let status;
     if (allOnHold) {
       status = 'on-hold';
+    } else if (anyComplete) {
+      status = 'complete';
     } else if (hasInvData && moId) {
       if (actual === 0)                                       status = 'not-started';
       else if (planned === 0 && actual > 0)                   status = 'complete';
       else if (!planned || pct < 85)                          status = 'in-progress';
       else                                                    status = 'complete';
-    } else if (anyComplete) {
-      status = 'complete';
     } else {
       // Mixed/no inventory — promote highest-progress status from items
       const stored = items.map(o => o.status || 'queued');
@@ -2940,7 +3007,7 @@ async function renderMOStatus() {
 
     rows.push({
       o: { ...items[0], orderId: displayOrderId, sku, machine: machineKeys[0] || '', start, end },
-      moId, inv, planned, actual, pct, status, tracking,
+      moId, inv, planned, actual, actualSource, pct, status, tracking,
       itemCount: items.length,
       machineLabel,
     });
@@ -3027,23 +3094,28 @@ async function renderMOStatus() {
 
   document.getElementById('mo-status-tbody').innerHTML = filtered.length === 0
     ? `<tr><td colspan="9" class="empty">No orders match the current filters.</td></tr>`
-    : filtered.map(({ o, moId, actual, planned, pct, status, tracking, itemCount, machineLabel }) => {
+    : filtered.map(({ o, moId, actual, actualSource, planned, pct, status, tracking, itemCount, machineLabel }) => {
         const moCell = moId
           ? `<span class="mo-id">${moId}</span>${itemCount > 1 ? `<div style="font-size:10px;color:var(--vf-text-tertiary);margin-top:2px;">${itemCount} scheduled rows</div>` : ''}`
           : `<span class="tbd-id">${escapeHtml(o.orderId || '—')}</span>`;
         const dateRange = (o.start && o.end && o.start !== o.end)
           ? `${o.start} → ${o.end}`
           : (o.start || o.end || '—');
-        const progressCell = (moId && hasInvData && planned > 0)
+        // Manual actualQty counts as data even when no inventory upload exists
+        const hasActualForRow = (moId && hasInvData) || actualSource === 'manual';
+        const progressCell = (hasActualForRow && planned > 0)
           ? `<div class="progress-bar-wrap"><div class="progress-bar-fill${pct>100?' over':pct>=85?' near':''}" style="width:${Math.min(pct,100)}%"></div></div>${pct}%`
           : `<span style="color:var(--vf-text-tertiary);font-size:11px;">—</span>`;
+        const actualCell = hasActualForRow
+          ? `${fmtQty(actual)}${actualSource === 'manual' ? '<div style="font-size:10px;color:var(--vf-text-tertiary);">manual override</div>' : ''}`
+          : '—';
         return `<tr>
           <td>${moCell}</td>
           <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(o.sku||'')}">${escapeHtml(o.sku||'—')}</td>
           <td style="font-size:12px;">${escapeHtml(machineLabel)}</td>
           <td style="white-space:nowrap;font-size:12px;">${dateRange}</td>
           <td style="text-align:right;">${fmtQty(planned)}</td>
-          <td style="text-align:right;">${moId && hasInvData ? fmtQty(actual) : '—'}</td>
+          <td style="text-align:right;">${actualCell}</td>
           <td style="white-space:nowrap;">${progressCell}</td>
           <td>${statusBadge(status)}</td>
           <td>${status === 'no-mo'        ? '<span class="badge badge-queued">MO needs to be added</span>'

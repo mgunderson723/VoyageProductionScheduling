@@ -304,7 +304,7 @@ const AUDIT_MAX = 5000;
 const AUDITED_FIELDS = [
   "orderId", "sku", "due", "start", "end", "cat", "sub", "region", "temper",
   "machine", "qty", "batches", "total", "status", "priority", "notes",
-  "confirmed",
+  "confirmed", "actualQty",
 ];
 
 function actorFromRequest(req) {
