@@ -2085,6 +2085,257 @@ if (process.env.CIN7_ACCOUNT_ID && process.env.CIN7_APPLICATION_KEY) {
   console.log("[Cin7 OnHand] Nightly sync scheduled at 06:30 UTC");
 }
 
+// ── MRP Phase 3: requirements engine ─────────────────────────────────────────
+//
+// Forward-walk allocation MRP. For each production order in the horizon:
+//   1. Recursively expand the FG's BOM to leaf-RM requirements
+//   2. Date-stamp each requirement at the order's start date (when the
+//      material is needed on the production floor)
+//   3. Sort all requirements globally by date
+//   4. Walk forward, allocating from (on-hand + on-order + in-transit) per SKU
+//   5. When we hit a shortfall, that's an at-risk MO + a suggested PO
+//      (qty = the shortfall, must-order-by = need-date − leadTimeDays)
+//
+// Toggles:
+//   - includeUnconfirmed: when false, orders with confirmed===false are
+//     skipped entirely (conservative — only buys for committed plan)
+//   - applyWastage: when true, expandBom multiplies each component qty by
+//     (1 + wastagePct/100)
+//   - horizonDays: how far forward to look (default 120 ≈ 4 months)
+
+function getMrpInputs() {
+  const orders = readData("vf_orders") || [];
+  const bomBlob = readData("vf_boms") || { parents: {} };
+  const supplyBlob = readData("vf_supply_settings") || { defaults: {}, perSku: {} };
+  const onHandBlob = readData("inventory_onhand") || { bySku: [] };
+  const onHandBySku = {};
+  for (const row of onHandBlob.bySku || []) onHandBySku[row.sku] = row;
+  return { orders, bomParents: bomBlob.parents || {}, supply: supplyBlob, onHandBySku };
+}
+
+// Resolve effective lead time for a SKU. Aliases follow once. Contract SKUs
+// are flagged so the PO logic can exclude them.
+function resolveLeadTime(sku, supply) {
+  const defaults = supply.defaults || {};
+  const perSku = supply.perSku || {};
+  const seen = new Set();
+  let cur = sku;
+  while (cur && perSku[cur] && perSku[cur].isAlias && !seen.has(cur)) {
+    seen.add(cur);
+    cur = perSku[cur].aliasOf;
+  }
+  const entry = perSku[cur];
+  if (entry && entry.isContract) {
+    return { leadTimeDays: null, isContract: true, source: "contract" };
+  }
+  if (entry && entry.leadTimeDays != null) {
+    return { leadTimeDays: entry.leadTimeDays, isContract: false, source: cur === sku ? "explicit" : `alias:${cur}` };
+  }
+  // Per-prefix default for packaging
+  if (sku && sku.startsWith("PK-") && defaults.packagingDefaultDays != null) {
+    return { leadTimeDays: defaults.packagingDefaultDays, isContract: false, source: "packaging-default" };
+  }
+  return { leadTimeDays: defaults.leadTimeDays != null ? defaults.leadTimeDays : 30, isContract: false, source: "default" };
+}
+
+function mrpAddDays(dateStr, days) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+// Build a flat list of dated leaf-RM requirements from the production plan.
+// Each entry: { sku, qtyKg, neededByDate, sourceOrderId, sourceFgSku, sourceQty }
+function buildRequirements(orders, bomParents, opts) {
+  const horizonEnd = mrpAddDays(opts.today, opts.horizonDays);
+  const requirements = [];
+  const skipped = { unconfirmed: 0, complete: 0, noStart: 0, outsideHorizon: 0, noBom: 0 };
+
+  for (const o of orders) {
+    if (!opts.includeUnconfirmed && o.confirmed === false) { skipped.unconfirmed++; continue; }
+    if (o.status === "complete") { skipped.complete++; continue; }
+    if (!o.start) { skipped.noStart++; continue; }
+    if (o.start > horizonEnd) { skipped.outsideHorizon++; continue; }
+    if (o.start < opts.today) {
+      // Past-start orders that aren't complete: still need their materials,
+      // but treat needed-by as today (already overdue)
+    }
+    const fgSku = o.sku;
+    const plannedQty = o.total || (o.qty || 0) * (o.batches || 1);
+    if (!fgSku || plannedQty <= 0) { skipped.noBom++; continue; }
+    if (!bomParents[fgSku]) { skipped.noBom++; continue; }
+
+    let expansion;
+    try { expansion = expandBom(bomParents, fgSku, plannedQty, { applyWastage: opts.applyWastage }); }
+    catch (e) { skipped.noBom++; continue; }
+
+    const neededBy = o.start < opts.today ? opts.today : o.start;
+    for (const leaf of Object.values(expansion.leaves || {})) {
+      if (leaf.qty <= 0) continue;
+      requirements.push({
+        sku: leaf.sku,
+        qtyKg: leaf.qty,
+        neededByDate: neededBy,
+        sourceOrderId: o.orderId || o.id,
+        sourceFgSku: fgSku,
+        sourceFgQty: plannedQty,
+      });
+    }
+  }
+  return { requirements, skipped };
+}
+
+// Forward-walk allocation. For each SKU, walk requirements in date order,
+// drawing from running supply (on-hand + on-order). When supply hits zero,
+// every subsequent need becomes a shortfall → suggested PO.
+function allocateAndPlan(requirements, onHandBySku, supply, today) {
+  // Group requirements by SKU
+  const bySku = {};
+  for (const r of requirements) {
+    if (!bySku[r.sku]) bySku[r.sku] = [];
+    bySku[r.sku].push(r);
+  }
+
+  const skuResults = [];
+  const allAtRiskOrders = new Map(); // orderId → { orderId, shortages: [{sku, qtyShort, neededByDate}] }
+  const suggestedPOs = [];
+
+  for (const sku of Object.keys(bySku)) {
+    const reqs = bySku[sku].sort((a, b) => a.neededByDate.localeCompare(b.neededByDate));
+    const lead = resolveLeadTime(sku, supply);
+    const onHand = onHandBySku[sku] || { onHand: 0, allocated: 0, available: 0, onOrder: 0, inTransit: 0, name: "" };
+
+    // Starting supply pool: available (on-hand minus already-allocated to other things in Cin7)
+    // + onOrder + inTransit. We model this as a single pool for v1; per-receipt-date
+    // bucketing would be a Phase 4 refinement.
+    let supplyPool = (onHand.available || 0) + (onHand.onOrder || 0) + (onHand.inTransit || 0);
+    const startingSupply = supplyPool;
+
+    let totalDemand = 0;
+    let totalShort = 0;
+    let earliestShortDate = null;
+    const allocations = [];
+
+    for (const r of reqs) {
+      totalDemand += r.qtyKg;
+      const allocFromPool = Math.min(supplyPool, r.qtyKg);
+      const shortage = r.qtyKg - allocFromPool;
+      supplyPool -= allocFromPool;
+      allocations.push({
+        ...r,
+        allocatedFromSupply: allocFromPool,
+        shortage,
+        runningSupplyAfter: supplyPool,
+      });
+      if (shortage > 0) {
+        totalShort += shortage;
+        if (!earliestShortDate || r.neededByDate < earliestShortDate) earliestShortDate = r.neededByDate;
+        // Record at-risk for this MO
+        if (!allAtRiskOrders.has(r.sourceOrderId)) {
+          allAtRiskOrders.set(r.sourceOrderId, {
+            orderId: r.sourceOrderId,
+            sourceFgSku: r.sourceFgSku,
+            sourceFgQty: r.sourceFgQty,
+            shortages: [],
+          });
+        }
+        allAtRiskOrders.get(r.sourceOrderId).shortages.push({
+          sku: r.sku,
+          qtyShort: shortage,
+          neededByDate: r.neededByDate,
+        });
+      }
+    }
+
+    // Suggest a PO if there's a shortfall AND the SKU isn't contract-managed
+    if (totalShort > 0 && !lead.isContract) {
+      const mustOrderBy = lead.leadTimeDays != null ? mrpAddDays(earliestShortDate, -lead.leadTimeDays) : null;
+      const isOverdue = mustOrderBy != null && mustOrderBy < today;
+      suggestedPOs.push({
+        sku,
+        name: onHand.name || "",
+        qtyToOrder: Math.ceil(totalShort),
+        earliestNeedDate: earliestShortDate,
+        leadTimeDays: lead.leadTimeDays,
+        leadTimeSource: lead.source,
+        mustOrderByDate: mustOrderBy,
+        isOverdue,
+        projectedReceiptDate: lead.leadTimeDays != null ? mrpAddDays(today, lead.leadTimeDays) : null,
+      });
+    }
+
+    skuResults.push({
+      sku,
+      name: onHand.name || "",
+      isContract: lead.isContract,
+      leadTimeDays: lead.leadTimeDays,
+      leadTimeSource: lead.source,
+      startingSupply,
+      onHand: onHand.onHand || 0,
+      available: onHand.available || 0,
+      onOrder: onHand.onOrder || 0,
+      inTransit: onHand.inTransit || 0,
+      totalDemand,
+      totalShort,
+      allocations, // detailed timeline for drill-down
+    });
+  }
+
+  // Sort outputs for stable presentation
+  suggestedPOs.sort((a, b) => {
+    // Overdue first, then by must-order-by date
+    if (a.isOverdue !== b.isOverdue) return a.isOverdue ? -1 : 1;
+    return (a.mustOrderByDate || "").localeCompare(b.mustOrderByDate || "");
+  });
+
+  const atRiskOrders = [...allAtRiskOrders.values()].sort((a, b) => {
+    const aMin = a.shortages.reduce((m, s) => m && m < s.neededByDate ? m : s.neededByDate, null);
+    const bMin = b.shortages.reduce((m, s) => m && m < s.neededByDate ? m : s.neededByDate, null);
+    return (aMin || "").localeCompare(bMin || "");
+  });
+
+  return { skuResults, suggestedPOs, atRiskOrders };
+}
+
+// GET /api/mrp/run?includeUnconfirmed=0&horizonDays=120&applyWastage=1
+app.get("/api/mrp/run", (req, res) => {
+  try {
+    const includeUnconfirmed = req.query.includeUnconfirmed === "1" || req.query.includeUnconfirmed === "true";
+    const applyWastage = req.query.applyWastage !== "0" && req.query.applyWastage !== "false";
+    const horizonDays = Math.max(1, Math.min(365, parseInt(req.query.horizonDays, 10) || 120));
+    const today = new Date().toISOString().slice(0, 10);
+
+    const { orders, bomParents, supply, onHandBySku } = getMrpInputs();
+    const { requirements, skipped } = buildRequirements(orders, bomParents, {
+      today, horizonDays, includeUnconfirmed, applyWastage,
+    });
+    const { skuResults, suggestedPOs, atRiskOrders } = allocateAndPlan(requirements, onHandBySku, supply, today);
+
+    res.json({
+      ok: true,
+      runAt: new Date().toISOString(),
+      today,
+      settings: { includeUnconfirmed, applyWastage, horizonDays },
+      summary: {
+        ordersConsidered: orders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom),
+        ordersSkipped: skipped,
+        requirementCount: requirements.length,
+        skuCount: skuResults.length,
+        atRiskOrderCount: atRiskOrders.length,
+        suggestedPoCount: suggestedPOs.length,
+        overduePoCount: suggestedPOs.filter(p => p.isOverdue).length,
+      },
+      suggestedPOs,
+      atRiskOrders,
+      skuResults,
+    });
+  } catch (e) {
+    console.error("[mrp] Run failed:", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
