@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "issue-token": "node scripts/issue-token.js",
+    "gen-token": "node scripts/gen-token.js",
     "test": "node --test"
   },
   "dependencies": {

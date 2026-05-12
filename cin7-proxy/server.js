@@ -6,10 +6,16 @@
 //
 // Flow per request:
 //   1. /healthz                       → 200, no auth
-//   2. Authorization: Bearer <token>  → hash, look up in tokens.json. Bad/missing → 401.
+//   2. Authorization: Bearer <token>  → look up in TOKENS map. Bad/missing → 401.
 //   3. req.method === 'GET'           → otherwise 403 (this is the whole point).
 //   4. Forward to https://inventory.dearsystems.com<path> with Cin7 creds injected.
 //   5. Append a line to proxy_audit.jsonl no matter what happened.
+//
+// Tokens are configured as env vars: PROXY_TOKEN_<USER>=vf_<random>. Each var
+// adds one user. Revoking a user = delete the env var and restart. We chose
+// this over a file-backed store because Railway doesn't give us a shell to
+// run a token-issuance CLI inside the container, and for a handful of users
+// env vars are easier to operate anyway.
 
 const express = require("express");
 const crypto  = require("crypto");
@@ -21,7 +27,6 @@ const CIN7_BASE     = "https://inventory.dearsystems.com";
 const CIN7_ACCOUNT  = process.env.CIN7_ACCOUNT_ID;
 const CIN7_APPKEY   = process.env.CIN7_APPLICATION_KEY;
 const DATA_DIR      = process.env.PROXY_DATA_DIR || path.join(__dirname, "data");
-const TOKENS_FILE   = path.join(DATA_DIR, "proxy_tokens.json");
 const AUDIT_FILE    = path.join(DATA_DIR, "proxy_audit.jsonl");
 const FORWARD_TIMEOUT_MS = 30_000;
 
@@ -33,40 +38,30 @@ if (!CIN7_ACCOUNT || !CIN7_APPKEY) {
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ── token store ───────────────────────────────────────────────────────────────
-// Tokens are SHA-256 hashed at rest. The raw token is shown to the operator
-// exactly once at issuance. Format on disk:
-//   [ { token_hash, user_label, created_at, revoked_at | null, note? } ]
-function loadTokens() {
-  try {
-    return JSON.parse(fs.readFileSync(TOKENS_FILE, "utf8"));
-  } catch (e) {
-    if (e.code === "ENOENT") return [];
-    throw e;
-  }
-}
-
+// Scan process.env on boot for PROXY_TOKEN_<USER>=<value>. We hash the values
+// once at startup so the in-memory map doesn't hold raw tokens — only the
+// hashes — which slightly limits exposure if anything ever dumps memory.
 function hashToken(raw) {
   return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
 }
 
-// Cached on startup, reloaded on SIGHUP so token revocations take effect
-// without a redeploy. (Issuing tokens still requires the CLI script.)
-let TOKENS = loadTokens();
-process.on("SIGHUP", () => {
-  try {
-    TOKENS = loadTokens();
-    console.log(`[proxy] reloaded tokens (${TOKENS.length} entries)`);
-  } catch (e) {
-    console.error("[proxy] token reload failed:", e.message);
+function loadTokensFromEnv() {
+  const map = new Map(); // hash → user_label
+  for (const [k, v] of Object.entries(process.env)) {
+    const m = k.match(/^PROXY_TOKEN_(.+)$/);
+    if (!m || !v) continue;
+    map.set(hashToken(v), m[1].toLowerCase());
   }
-});
+  return map;
+}
+
+let TOKENS = loadTokensFromEnv();
+console.log(`[proxy] loaded ${TOKENS.size} token(s) from PROXY_TOKEN_* env vars`);
 
 function lookupToken(raw) {
   if (!raw) return null;
-  const h = hashToken(raw);
-  const hit = TOKENS.find(t => t.token_hash === h);
-  if (!hit || hit.revoked_at) return null;
-  return hit;
+  const user = TOKENS.get(hashToken(raw));
+  return user || null;
 }
 
 // ── audit log ─────────────────────────────────────────────────────────────────
@@ -86,7 +81,7 @@ app.disable("x-powered-by");
 app.set("trust proxy", true); // Railway terminates TLS in front of us
 
 app.get("/healthz", (_req, res) => {
-  res.json({ ok: true, tokens: TOKENS.filter(t => !t.revoked_at).length });
+  res.json({ ok: true, tokens: TOKENS.size });
 });
 
 // Everything else: auth → method check → forward.
@@ -97,14 +92,12 @@ app.all("*", async (req, res) => {
   // ── 1. auth ───────────────────────────────────────────────────────────────
   const authHeader = req.get("authorization") || "";
   const m = authHeader.match(/^Bearer\s+(.+)$/i);
-  const tokenRecord = m ? lookupToken(m[1].trim()) : null;
+  const user = m ? lookupToken(m[1].trim()) : null;
 
-  if (!tokenRecord) {
+  if (!user) {
     audit({ user: null, ip, method: req.method, path: req.path, outcome: "auth_fail", status: 401 });
     return res.status(401).json({ error: "invalid or missing bearer token" });
   }
-
-  const user = tokenRecord.user_label;
 
   // ── 2. method gate (the whole point of this service) ──────────────────────
   if (req.method !== "GET") {
@@ -160,5 +153,5 @@ app.all("*", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`[proxy] listening on ${PORT} — ${TOKENS.filter(t => !t.revoked_at).length} active tokens`);
+  console.log(`[proxy] listening on ${PORT} — ${TOKENS.size} active token(s)`);
 });
