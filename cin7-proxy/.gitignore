@@ -1,0 +1,5 @@
+node_modules/
+data/proxy_tokens.json
+data/proxy_audit.jsonl
+.env
+.env.local
