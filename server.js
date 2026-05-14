@@ -1389,6 +1389,80 @@ app.get("/api/cin7/onhand/status", (req, res) => {
   res.json({ ok: true, lastSync: blob.lastSync, rowCount: blob.rowCount, skuCount: blob.skuCount });
 });
 
+// ── Cin7 product cost cache ─────────────────────────────────────────────────
+// Pulls AverageCost per SKU from /product (paginated). Used by the MRP $$
+// summary view to translate suggested PO qtys into capital commitments.
+async function fetchCin7ProductCosts() {
+  if (!process.env.CIN7_ACCOUNT_ID || !process.env.CIN7_APPLICATION_KEY) {
+    throw new Error("CIN7_ACCOUNT_ID or CIN7_APPLICATION_KEY environment variable not set");
+  }
+  const all = [];
+  let page = 1;
+  const limit = 1000;
+  while (true) {
+    const url = `https://inventory.dearsystems.com/ExternalApi/v2/product?Page=${page}&Limit=${limit}`;
+    const resp = await fetch(url, { headers: cin7Headers(), redirect: "follow" });
+    const ct = resp.headers.get("content-type") || "";
+    const text = await resp.text().catch(() => "");
+    if (!resp.ok) throw new Error(`Cin7 product list ${resp.status} [${ct}]: ${text.slice(0, 300)}`);
+    let data;
+    try { data = JSON.parse(text); }
+    catch (_) { throw new Error(`Cin7 product list ${resp.status} non-JSON [${ct}]: ${text.slice(0, 300)}`); }
+    const batch = data.Products || [];
+    all.push(...batch);
+    if (batch.length < limit) break;
+    page++;
+    if (page > 20) throw new Error("Cin7 product pagination exceeded 20 pages — aborting");
+  }
+  return all;
+}
+
+async function performCin7ProductCostsSync() {
+  const products = await fetchCin7ProductCosts();
+  const now = new Date().toISOString();
+  const bySku = {};
+  let withCost = 0;
+  for (const p of products) {
+    if (!p.SKU) continue;
+    const cost = Number(p.AverageCost) || 0;
+    bySku[p.SKU] = {
+      sku: p.SKU,
+      name: p.Name || "",
+      averageCost: cost,
+      costingMethod: p.CostingMethod || "",
+      category: p.Category || "",
+    };
+    if (cost > 0) withCost++;
+  }
+  const blob = {
+    lastSync: now,
+    productCount: products.length,
+    withCostCount: withCost,
+    currency: "USD",
+    bySku,
+  };
+  writeData("product_costs", blob);
+  return { ok: true, lastSync: now, productCount: products.length, withCostCount: withCost };
+}
+
+// POST /api/cin7/product-costs/sync — admin-triggered live pull
+app.post("/api/cin7/product-costs/sync", requireAdmin, async (req, res) => {
+  try {
+    const status = await performCin7ProductCostsSync();
+    res.json(status);
+  } catch (e) {
+    console.error("[Cin7 Costs] Sync error:", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/cin7/product-costs — return the cached cost map (any authed user)
+app.get("/api/cin7/product-costs", (req, res) => {
+  const blob = readData("product_costs");
+  if (!blob) return res.json({ ok: true, lastSync: null, bySku: {} });
+  res.json({ ok: true, ...blob });
+});
+
 // ── Cin7 Inventory Movement Details ingest (Apps Script → app webhook) ───────
 //
 // The user's Cin7 daily report drops an XLSX file into a Google Drive folder.
@@ -2083,6 +2157,20 @@ if (process.env.CIN7_ACCOUNT_ID && process.env.CIN7_APPLICATION_KEY) {
     }
   });
   console.log("[Cin7 OnHand] Nightly sync scheduled at 06:30 UTC");
+
+  // Product costs run a bit later so the on-hand sync doesn't fight for the
+  // Cin7 rate limit. Costs change slowly so daily cadence is overkill but
+  // matches the on-hand pattern and means the MRP $$ summary is always fresh.
+  cron.schedule("45 6 * * *", async () => {
+    console.log("[Cin7 Costs] Nightly sync starting…");
+    try {
+      const s = await performCin7ProductCostsSync();
+      console.log(`[Cin7 Costs] Sync done — ${s.productCount} products, ${s.withCostCount} with non-zero cost`);
+    } catch (e) {
+      console.error("[Cin7 Costs] Nightly sync failed:", e.message);
+    }
+  });
+  console.log("[Cin7 Costs] Nightly sync scheduled at 06:45 UTC");
 }
 
 // ── MRP Phase 3: requirements engine ─────────────────────────────────────────
@@ -2110,7 +2198,16 @@ function getMrpInputs() {
   const onHandBlob = readData("inventory_onhand") || { bySku: [] };
   const onHandBySku = {};
   for (const row of onHandBlob.bySku || []) onHandBySku[row.sku] = row;
-  return { orders, bomParents: bomBlob.parents || {}, supply: supplyBlob, onHandBySku };
+  // Product costs (optional — MRP runs without them, dollar fields are null)
+  const costsBlob = readData("product_costs") || { bySku: {} };
+  return {
+    orders,
+    bomParents: bomBlob.parents || {},
+    supply: supplyBlob,
+    onHandBySku,
+    costsBySku: costsBlob.bySku || {},
+    costsLastSync: costsBlob.lastSync || null,
+  };
 }
 
 // Resolve effective lead time for a SKU. Aliases follow once. Contract SKUs
@@ -2353,11 +2450,41 @@ app.get("/api/mrp/run", (req, res) => {
     const horizonDays = Math.max(1, Math.min(365, parseInt(req.query.horizonDays, 10) || 120));
     const today = new Date().toISOString().slice(0, 10);
 
-    const { orders, bomParents, supply, onHandBySku } = getMrpInputs();
+    const { orders, bomParents, supply, onHandBySku, costsBySku, costsLastSync } = getMrpInputs();
     const { requirements, skipped, noBomExamples } = buildRequirements(orders, bomParents, {
       today, horizonDays, includeUnconfirmed, applyWastage,
     });
     const { skuResults, suggestedPOs, atRiskOrders } = allocateAndPlan(requirements, onHandBySku, supply, today);
+
+    // Enrich each suggested PO with $$ — unit cost from Cin7 product cache,
+    // line cost = unitCost × qtyToOrder. Mark missing-cost SKUs explicitly so
+    // the UI can flag them rather than silently treating them as $0.
+    let totalDollars = 0;
+    let overdueDollars = 0;
+    let missingCostCount = 0;
+    const dollarsByMonth = {}; // YYYY-MM -> { total, overdue, count }
+    for (const po of suggestedPOs) {
+      const c = costsBySku[po.sku];
+      const unitCost = c && c.averageCost > 0 ? c.averageCost : null;
+      po.unitCost = unitCost;
+      po.lineCost = unitCost != null ? unitCost * po.qtyToOrder : null;
+      po.costMissing = unitCost == null;
+      if (po.costMissing) missingCostCount++;
+      else {
+        totalDollars += po.lineCost;
+        if (po.isOverdue) overdueDollars += po.lineCost;
+        // Bucket by must-order-by month (or earliestNeedDate as fallback)
+        const bucketDate = po.mustOrderByDate || po.earliestNeedDate;
+        if (bucketDate) {
+          const month = bucketDate.slice(0, 7);
+          if (!dollarsByMonth[month]) dollarsByMonth[month] = { month, total: 0, overdue: 0, count: 0 };
+          dollarsByMonth[month].total += po.lineCost;
+          if (po.isOverdue) dollarsByMonth[month].overdue += po.lineCost;
+          dollarsByMonth[month].count += 1;
+        }
+      }
+    }
+    const dollarsByMonthArr = Object.values(dollarsByMonth).sort((a, b) => a.month.localeCompare(b.month));
 
     res.json({
       ok: true,
@@ -2373,6 +2500,13 @@ app.get("/api/mrp/run", (req, res) => {
         atRiskOrderCount: atRiskOrders.length,
         suggestedPoCount: suggestedPOs.length,
         overduePoCount: suggestedPOs.filter(p => p.isOverdue).length,
+        // $$ planning
+        currency: "USD",
+        totalDollars: Math.round(totalDollars * 100) / 100,
+        overdueDollars: Math.round(overdueDollars * 100) / 100,
+        missingCostCount,
+        costsLastSync,
+        dollarsByMonth: dollarsByMonthArr,
       },
       suggestedPOs,
       atRiskOrders,

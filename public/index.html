@@ -1063,6 +1063,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       <!-- Sub-section selector -->
       <div style="display:flex;gap:var(--vf-space-2);margin-bottom:var(--vf-space-4);border-bottom:1px solid var(--vf-border-default);">
         <button class="btn btn-sm" id="mrp-tab-pos"     onclick="switchMrpSection('pos')"     style="border-radius:0;border-bottom:2px solid var(--vf-brand-orange);">Suggested POs</button>
+        <button class="btn btn-sm" id="mrp-tab-summary" onclick="switchMrpSection('summary')" style="border-radius:0;background:transparent;">$ Summary</button>
         <button class="btn btn-sm" id="mrp-tab-risk"    onclick="switchMrpSection('risk')"    style="border-radius:0;background:transparent;">At-risk MOs</button>
         <button class="btn btn-sm" id="mrp-tab-skus"    onclick="switchMrpSection('skus')"    style="border-radius:0;background:transparent;">All SKUs</button>
         <span style="margin-left:auto;display:flex;align-items:center;gap:8px;">
@@ -1081,9 +1082,38 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
         </div>
         <div style="overflow-x:auto;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);">
           <table class="status-table" id="mrp-po-table" style="margin-top:0;">
-            <thead><tr><th>SKU</th><th>Name</th><th style="text-align:right;">Qty to order</th><th>Lead time</th><th>Order by</th><th>Earliest need</th><th>Source</th></tr></thead>
+            <thead><tr><th>SKU</th><th>Name</th><th style="text-align:right;">Qty to order</th><th style="text-align:right;">Unit cost</th><th style="text-align:right;">Line cost</th><th>Lead time</th><th>Order by</th><th>Earliest need</th><th>Source</th></tr></thead>
             <tbody id="mrp-po-tbody"></tbody>
           </table>
+        </div>
+      </div>
+
+      <!-- $ Summary sub-view — capital-planning view of suggested POs -->
+      <div id="mrp-section-summary" style="display:none;">
+        <div id="mrp-summary-empty" class="no-inv-note" style="display:none;">
+          No cost data loaded yet. An admin can sync from <strong>MRP Setup → Sync product costs</strong> to enable the $ Summary view.
+        </div>
+        <div id="mrp-summary-content">
+          <div class="status-summary" id="mrp-summary-kpis"></div>
+          <div style="margin-bottom:var(--vf-space-4);">
+            <h3 style="font-size:var(--vf-text-base);margin:var(--vf-space-3) 0 var(--vf-space-2);color:var(--vf-text-primary);">By must-order-by month</h3>
+            <div style="overflow-x:auto;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);">
+              <table class="status-table" style="margin-top:0;">
+                <thead><tr><th>Month</th><th style="text-align:right;">Suggested POs</th><th style="text-align:right;">Capital ($)</th><th style="text-align:right;">Of which overdue ($)</th></tr></thead>
+                <tbody id="mrp-summary-month-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3 style="font-size:var(--vf-text-base);margin:var(--vf-space-3) 0 var(--vf-space-2);color:var(--vf-text-primary);">Top capital lines</h3>
+            <div style="overflow-x:auto;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);">
+              <table class="status-table" style="margin-top:0;">
+                <thead><tr><th>SKU</th><th>Name</th><th style="text-align:right;">Qty</th><th style="text-align:right;">Unit cost</th><th style="text-align:right;">Line cost</th><th>Order by</th></tr></thead>
+                <tbody id="mrp-summary-top-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+          <div id="mrp-summary-missing" style="display:none;margin-top:var(--vf-space-3);padding:var(--vf-space-3) var(--vf-space-4);background:var(--vf-warning-soft);color:var(--vf-warning-text);border-left:3px solid var(--vf-warning-base);border-radius:var(--vf-radius-md);font-size:var(--vf-text-sm);"></div>
         </div>
       </div>
 
@@ -1119,8 +1149,14 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
   <!-- MRP SETUP (admin-only) — BOMs, lead times, safety stock for the MRP feature -->
   <div id="tab-mrp-setup" style="display:none;">
     <div class="header">
-      <h2>MRP Setup</h2>
-      <span style="font-size:var(--vf-text-sm);color:var(--vf-text-tertiary);">BOMs · Supply settings · Recursive expand</span>
+      <div>
+        <h2>MRP Setup</h2>
+        <span style="font-size:var(--vf-text-sm);color:var(--vf-text-tertiary);">BOMs · Supply settings · Product costs · Recursive expand</span>
+      </div>
+      <div style="display:flex;gap:var(--vf-space-2);align-items:center;">
+        <span id="mrp-costs-ts" style="font-size:var(--vf-text-xs);color:var(--vf-text-tertiary);"></span>
+        <button class="btn btn-sm" onclick="syncProductCosts()">↻ Sync product costs</button>
+      </div>
     </div>
 
     <div class="status-summary" id="mrp-setup-kpis"></div>
@@ -2528,7 +2564,7 @@ async function runMrp() {
 
 function switchMrpSection(name) {
   mrpSection = name;
-  ['pos','risk','skus'].forEach(k => {
+  ['pos','summary','risk','skus'].forEach(k => {
     document.getElementById('mrp-section-' + k).style.display = (k === name) ? '' : 'none';
     const btn = document.getElementById('mrp-tab-' + k);
     if (btn) {
@@ -2538,19 +2574,40 @@ function switchMrpSection(name) {
   });
 }
 
+// Format dollars consistently across the MRP views. Compact (k/M) above
+// $10k since the per-month buckets often run to six-figure totals and
+// raw "$1,234,567" eats too much horizontal space.
+function fmtUsd(v, opts) {
+  if (v == null || !isFinite(v)) return '—';
+  if (opts && opts.full) return '$' + Math.round(v).toLocaleString();
+  if (Math.abs(v) >= 1000000) return '$' + (v/1000000).toFixed(2) + 'M';
+  if (Math.abs(v) >= 10000)   return '$' + (v/1000).toFixed(1) + 'k';
+  return '$' + (Math.round(v * 100) / 100).toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+}
+
 function renderMrp() {
   if (!mrpData) return;
   const s = mrpData.summary || {};
 
-  // KPI strip
-  document.getElementById('mrp-kpis').innerHTML = [
-    { label:'Orders considered', val: (s.ordersConsidered||0).toLocaleString(),    accent:'' },
-    { label:'Suggested POs',     val: (s.suggestedPoCount||0).toLocaleString(),    accent:'var(--vf-info-base)' },
-    { label:'Overdue POs',       val: (s.overduePoCount||0).toLocaleString(),      accent: s.overduePoCount > 0 ? 'var(--vf-danger-base)' : 'var(--vf-success-base)' },
-    { label:'At-risk MOs',       val: (s.atRiskOrderCount||0).toLocaleString(),    accent: s.atRiskOrderCount > 0 ? 'var(--vf-warning-base)' : 'var(--vf-success-base)' },
-  ].map(x => `<div class="metric" style="${x.accent?'border-left:3px solid '+x.accent+';':''}"><div class="metric-label">${x.label}</div><div class="metric-value">${x.val}</div></div>`).join('');
+  // KPI strip — now includes capital totals when costs are loaded
+  const haveCost = (s.totalDollars != null) && (s.totalDollars > 0 || s.missingCostCount === 0);
+  const kpis = [
+    { label:'Suggested POs', val: (s.suggestedPoCount||0).toLocaleString(),    accent:'var(--vf-info-base)' },
+    { label:'Overdue POs',   val: (s.overduePoCount||0).toLocaleString(),      accent: s.overduePoCount > 0 ? 'var(--vf-danger-base)' : 'var(--vf-success-base)' },
+    { label:'At-risk MOs',   val: (s.atRiskOrderCount||0).toLocaleString(),    accent: s.atRiskOrderCount > 0 ? 'var(--vf-warning-base)' : 'var(--vf-success-base)' },
+  ];
+  if (haveCost) {
+    kpis.push({ label:'Capital ($)',          val: fmtUsd(s.totalDollars),   accent:'var(--vf-cat-purple-base)' });
+    kpis.push({ label:'Of which overdue ($)', val: fmtUsd(s.overdueDollars), accent: s.overdueDollars > 0 ? 'var(--vf-danger-base)' : 'var(--vf-success-base)' });
+  } else {
+    kpis.push({ label:'Capital ($)', val: '—', accent: '' });
+  }
+  document.getElementById('mrp-kpis').innerHTML = kpis.map(x =>
+    `<div class="metric" style="${x.accent?'border-left:3px solid '+x.accent+';':''}"><div class="metric-label">${x.label}</div><div class="metric-value">${x.val}</div></div>`
+  ).join('');
 
   renderMrpPos();
+  renderMrpSummary();
   renderMrpRisk();
   renderMrpSkus();
 }
@@ -2565,16 +2622,97 @@ function renderMrpPos() {
     if (search && !p.sku.toLowerCase().includes(search) && !(p.name || '').toLowerCase().includes(search)) return false;
     return true;
   });
-  tbody.innerHTML = filtered.length === 0 ? `<tr><td colspan="7" class="empty">No POs match.</td></tr>` :
-    filtered.map(p => `<tr>
-      <td><span class="mo-id">${escapeHtml(p.sku)}</span></td>
-      <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--vf-text-secondary);" title="${escapeHtml(p.name||'')}">${escapeHtml(p.name||'—')}</td>
-      <td style="text-align:right;font-variant-numeric:tabular-nums;">${(p.qtyToOrder||0).toLocaleString()}</td>
-      <td>${p.leadTimeDays != null ? p.leadTimeDays + 'd' : '—'}<div style="font-size:10px;color:var(--vf-text-tertiary);">${escapeHtml(p.leadTimeSource||'')}</div></td>
-      <td style="white-space:nowrap;font-size:12px;${p.isOverdue?'color:var(--vf-danger-text);font-weight:600;':''}">${p.mustOrderByDate || '—'}${p.isOverdue ? ' 🚨' : ''}</td>
-      <td style="white-space:nowrap;font-size:12px;color:var(--vf-text-tertiary);">${p.earliestNeedDate || '—'}</td>
-      <td style="font-size:11px;color:var(--vf-text-secondary);">first triggered by upcoming demand</td>
-    </tr>`).join('');
+  tbody.innerHTML = filtered.length === 0 ? `<tr><td colspan="9" class="empty">No POs match.</td></tr>` :
+    filtered.map(p => {
+      const unitCell = p.costMissing
+        ? `<span style="color:var(--vf-warning-text);font-size:11px;" title="No cost in Cin7 product cache">—</span>`
+        : `<span style="font-variant-numeric:tabular-nums;">${fmtUsd(p.unitCost, { full: true })}</span>`;
+      const lineCell = p.costMissing
+        ? `<span style="color:var(--vf-warning-text);font-size:11px;">—</span>`
+        : `<span style="font-variant-numeric:tabular-nums;font-weight:500;">${fmtUsd(p.lineCost)}</span>`;
+      return `<tr>
+        <td><span class="mo-id">${escapeHtml(p.sku)}</span></td>
+        <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--vf-text-secondary);" title="${escapeHtml(p.name||'')}">${escapeHtml(p.name||'—')}</td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;">${(p.qtyToOrder||0).toLocaleString()}</td>
+        <td style="text-align:right;">${unitCell}</td>
+        <td style="text-align:right;">${lineCell}</td>
+        <td>${p.leadTimeDays != null ? p.leadTimeDays + 'd' : '—'}<div style="font-size:10px;color:var(--vf-text-tertiary);">${escapeHtml(p.leadTimeSource||'')}</div></td>
+        <td style="white-space:nowrap;font-size:12px;${p.isOverdue?'color:var(--vf-danger-text);font-weight:600;':''}">${p.mustOrderByDate || '—'}${p.isOverdue ? ' 🚨' : ''}</td>
+        <td style="white-space:nowrap;font-size:12px;color:var(--vf-text-tertiary);">${p.earliestNeedDate || '—'}</td>
+        <td style="font-size:11px;color:var(--vf-text-secondary);">first triggered by upcoming demand</td>
+      </tr>`;
+    }).join('');
+}
+
+function renderMrpSummary() {
+  if (!mrpData) return;
+  const s = mrpData.summary || {};
+  const haveAnyCost = s.totalDollars != null && (s.totalDollars > 0 || (s.suggestedPoCount > 0 && s.missingCostCount < s.suggestedPoCount));
+  const emptyEl = document.getElementById('mrp-summary-empty');
+  const contentEl = document.getElementById('mrp-summary-content');
+  if (!haveAnyCost) {
+    if (emptyEl) emptyEl.style.display = 'block';
+    if (contentEl) contentEl.style.display = 'none';
+    return;
+  }
+  if (emptyEl) emptyEl.style.display = 'none';
+  if (contentEl) contentEl.style.display = '';
+
+  // KPI strip specific to the summary view
+  const kpiEl = document.getElementById('mrp-summary-kpis');
+  if (kpiEl) {
+    const kpis = [
+      { label:'Total capital',     val: fmtUsd(s.totalDollars),    accent:'var(--vf-cat-purple-base)' },
+      { label:'Overdue capital',   val: fmtUsd(s.overdueDollars),  accent: s.overdueDollars > 0 ? 'var(--vf-danger-base)' : 'var(--vf-success-base)' },
+      { label:'POs with cost',     val: ((s.suggestedPoCount||0) - (s.missingCostCount||0)).toLocaleString() + ' / ' + (s.suggestedPoCount||0).toLocaleString(), accent: 'var(--vf-info-base)' },
+      { label:'Months covered',    val: (s.dollarsByMonth||[]).length.toLocaleString(), accent:'' },
+    ];
+    kpiEl.innerHTML = kpis.map(x =>
+      `<div class="metric" style="${x.accent?'border-left:3px solid '+x.accent+';':''}"><div class="metric-label">${x.label}</div><div class="metric-value">${x.val}</div></div>`
+    ).join('');
+  }
+
+  // Per-month buckets
+  const monthTbody = document.getElementById('mrp-summary-month-tbody');
+  if (monthTbody) {
+    const months = s.dollarsByMonth || [];
+    monthTbody.innerHTML = months.length === 0 ? `<tr><td colspan="4" class="empty">No PO buckets yet.</td></tr>` :
+      months.map(m => `<tr>
+        <td style="white-space:nowrap;"><strong>${m.month}</strong></td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;">${m.count.toLocaleString()}</td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;font-weight:500;">${fmtUsd(m.total, { full: true })}</td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;color:${m.overdue > 0 ? 'var(--vf-danger-text)' : 'var(--vf-text-tertiary)'};">${m.overdue > 0 ? fmtUsd(m.overdue, { full: true }) : '—'}</td>
+      </tr>`).join('');
+  }
+
+  // Top capital lines (10 biggest single POs by line cost)
+  const topTbody = document.getElementById('mrp-summary-top-tbody');
+  if (topTbody) {
+    const top = (mrpData.suggestedPOs || [])
+      .filter(p => !p.costMissing && p.lineCost > 0)
+      .sort((a, b) => (b.lineCost || 0) - (a.lineCost || 0))
+      .slice(0, 10);
+    topTbody.innerHTML = top.length === 0 ? `<tr><td colspan="6" class="empty">No costed POs.</td></tr>` :
+      top.map(p => `<tr>
+        <td><span class="mo-id">${escapeHtml(p.sku)}</span></td>
+        <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--vf-text-secondary);" title="${escapeHtml(p.name||'')}">${escapeHtml(p.name||'—')}</td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;">${(p.qtyToOrder||0).toLocaleString()}</td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;">${fmtUsd(p.unitCost, { full: true })}</td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;font-weight:500;">${fmtUsd(p.lineCost, { full: true })}</td>
+        <td style="white-space:nowrap;font-size:12px;${p.isOverdue?'color:var(--vf-danger-text);font-weight:600;':''}">${p.mustOrderByDate || '—'}</td>
+      </tr>`).join('');
+  }
+
+  // Missing-cost notice
+  const missingEl = document.getElementById('mrp-summary-missing');
+  if (missingEl) {
+    if (s.missingCostCount > 0) {
+      missingEl.style.display = '';
+      missingEl.innerHTML = `⚠ ${s.missingCostCount} of ${s.suggestedPoCount} suggested POs have no cost data in Cin7. Their lines are excluded from the totals above. Sync product costs from MRP Setup to refresh, or add the missing AverageCost values in Cin7.`;
+    } else {
+      missingEl.style.display = 'none';
+    }
+  }
 }
 
 function renderMrpRisk() {
@@ -2625,9 +2763,12 @@ function exportMrpCsv() {
     alert('No POs to export. Run MRP first.');
     return;
   }
-  const headers = ['SKU','Name','QtyToOrder','LeadTimeDays','LeadTimeSource','MustOrderBy','EarliestNeed','ProjectedReceipt','Overdue'];
+  const headers = ['SKU','Name','QtyToOrder','UnitCostUSD','LineCostUSD','LeadTimeDays','LeadTimeSource','MustOrderBy','EarliestNeed','ProjectedReceipt','Overdue'];
   const rows = mrpData.suggestedPOs.map(p => [
-    p.sku, p.name || '', p.qtyToOrder, p.leadTimeDays != null ? p.leadTimeDays : '',
+    p.sku, p.name || '', p.qtyToOrder,
+    p.unitCost != null ? p.unitCost : '',
+    p.lineCost != null ? Math.round(p.lineCost * 100) / 100 : '',
+    p.leadTimeDays != null ? p.leadTimeDays : '',
     p.leadTimeSource, p.mustOrderByDate || '', p.earliestNeedDate || '',
     p.projectedReceiptDate || '', p.isOverdue ? 'YES' : 'no',
   ].map(v => {
@@ -2655,20 +2796,56 @@ let mrpSetupSection = 'boms';
 
 async function loadMrpSetup() {
   try {
-    const [b, s] = await Promise.all([
+    const [b, s, c] = await Promise.all([
       fetch('/api/boms').then(r => r.json()),
       fetch('/api/supply-settings').then(r => r.json()),
+      fetch('/api/cin7/product-costs').then(r => r.json()),
     ]);
     mrpBomsData = b;
     mrpSupplyData = s;
+    mrpCostsData = c;
   } catch (e) {
     mrpBomsData = { ok:false, parents:{}, parentCount:0 };
     mrpSupplyData = { ok:false, perSku:{}, defaults:{} };
+    mrpCostsData = { ok:false, bySku:{}, lastSync:null };
   }
   renderMrpSetupKpis();
+  renderCostsTimestamp();
   populateMrpMachineFilter();
   renderMrpBoms();
   renderMrpSupply();
+}
+
+let mrpCostsData = null;
+function renderCostsTimestamp() {
+  const el = document.getElementById('mrp-costs-ts');
+  if (!el) return;
+  const c = mrpCostsData || {};
+  if (!c.lastSync) {
+    el.textContent = 'Costs: never synced';
+    el.style.color = 'var(--vf-warning-text)';
+    return;
+  }
+  const d = new Date(c.lastSync);
+  const ageMin = Math.round((Date.now() - d.getTime()) / 60000);
+  const ageStr = ageMin < 60 ? `${ageMin}m ago` : ageMin < 1440 ? `${Math.round(ageMin/60)}h ago` : `${Math.round(ageMin/1440)}d ago`;
+  el.textContent = `Costs synced ${ageStr} · ${(c.withCostCount||0).toLocaleString()} of ${(c.productCount||0).toLocaleString()} products with cost`;
+  el.style.color = 'var(--vf-text-tertiary)';
+}
+
+async function syncProductCosts() {
+  const el = document.getElementById('mrp-costs-ts');
+  if (el) { el.textContent = 'Syncing…'; el.style.color = 'var(--vf-text-tertiary)'; }
+  try {
+    const r = await fetch('/api/cin7/product-costs/sync', { method: 'POST' });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    // Reload the cost cache so the timestamp updates
+    mrpCostsData = await fetch('/api/cin7/product-costs').then(r => r.json());
+    renderCostsTimestamp();
+  } catch (e) {
+    if (el) { el.textContent = 'Sync failed: ' + e.message; el.style.color = 'var(--vf-danger-text)'; }
+  }
 }
 
 function renderMrpSetupKpis() {
