@@ -523,7 +523,9 @@ When recommending a production slot for a finished good or WIP:
 7. Present 2–3 concrete options spanning the full pipeline (each option = a complete set of stage dates) and explain the trade-offs (lead time risk, fat type, batch size fit, etc.).
 8. Do NOT book anything — only recommend. The user must ask you to create or update orders to make it happen.
 
-IMPORTANT: Before calling any write tools (add_order, shift_machine_orders, update_order_dates, update_order_status, update_order_quantity, delete_order), you MUST:
+For metadata edits — renaming an MO (orderId), changing the SKU on a row, editing notes, flipping priority, marking confirmed/tentative, or recording actual produced qty — use update_order_metadata. It accepts any subset of those fields in one call. Do NOT just describe the change in text; if the user asked you to change a field, you MUST call this tool to persist it, otherwise the user will see no effect when they click the order on the calendar.
+
+IMPORTANT: Before calling any write tools (add_order, shift_machine_orders, update_order_dates, update_order_status, update_order_quantity, update_order_metadata, delete_order), you MUST:
 1. Use get_orders to see the current state
 2. Clearly describe to the user exactly what changes you plan to make
 3. Wait for them to explicitly confirm (e.g. "yes", "go ahead", "confirm") before executing writes
@@ -542,6 +544,7 @@ const MUTATING_AI_TOOLS = new Set([
   "add_order",
   "update_order_quantity",
   "delete_order",
+  "update_order_metadata",
 ]);
 
 const AI_TOOLS = [
@@ -640,6 +643,23 @@ const AI_TOOLS = [
       type: "object",
       properties: {
         order_id: { type: "string", description: "The orderId field of the order to delete" },
+      },
+      required: ["order_id"],
+    },
+  },
+  {
+    name: "update_order_metadata",
+    description: "Update one or more metadata fields on a work order — the catch-all for fields not covered by the dedicated update tools (dates, status, qty). Use this for renames (orderId), SKU corrections, notes edits, priority changes, confirming/un-confirming an order, and setting actual produced qty. Only the fields you provide are updated; omit a field to leave it unchanged. Always confirm with the user before calling this on an existing order.",
+    input_schema: {
+      type: "object",
+      properties: {
+        order_id: { type: "string", description: "The CURRENT orderId of the order to update (used to find the row). To rename, also pass new_order_id." },
+        new_order_id: { type: "string", description: "Replace the order's orderId / name with this value. Use for renaming MOs (e.g. 'MO-00783' → 'MO-00783-A')." },
+        sku: { type: "string", description: "Replace the SKU. Pass the full SKU string." },
+        notes: { type: "string", description: "Replace the notes/free-text field. Pass an empty string to clear." },
+        priority: { type: "string", enum: ["low", "med", "high"], description: "Set priority." },
+        confirmed: { type: "boolean", description: "Set the confirmed-for-production flag. true = confirmed, false = tentative." },
+        actual_qty: { type: "number", description: "Set the actual produced qty (kg). Use when actual differs from planned (e.g. abandoned mid-run). Pass 0 to clear or null to remove the override." },
       },
       required: ["order_id"],
     },
@@ -847,6 +867,55 @@ async function executeAITool(name, input) {
       const deleted = orders.splice(idx, 1)[0];
       writeData("vf_orders", orders);
       return { ok: true, message: `Deleted order '${order_id}' (${deleted.sku || ""})` };
+    }
+
+    case "update_order_metadata": {
+      const { order_id } = input;
+      const idx = orders.findIndex(o => o.orderId === order_id || o.id === order_id);
+      if (idx === -1) return { ok: false, error: `Order '${order_id}' not found` };
+      const order = orders[idx];
+      const before = { ...order };
+      const changes = [];
+      if (input.new_order_id !== undefined && input.new_order_id !== order.orderId) {
+        const newId = String(input.new_order_id).trim();
+        if (!newId) return { ok: false, error: "new_order_id cannot be empty" };
+        // Detect a duplicate orderId (otherwise renaming creates an ambiguous lookup)
+        const conflict = orders.find((o, i) => i !== idx && o.orderId === newId);
+        if (conflict) return { ok: false, error: `Cannot rename — '${newId}' already exists on another order (id ${conflict.id})` };
+        order.orderId = newId;
+        changes.push(`orderId: '${before.orderId}' → '${newId}'`);
+      }
+      if (input.sku !== undefined && input.sku !== order.sku) {
+        order.sku = String(input.sku);
+        changes.push(`sku: '${before.sku || ""}' → '${order.sku}'`);
+      }
+      if (input.notes !== undefined && input.notes !== order.notes) {
+        order.notes = String(input.notes);
+        changes.push("notes updated");
+      }
+      if (input.priority !== undefined && input.priority !== order.priority) {
+        const allowed = ["low", "med", "high"];
+        if (!allowed.includes(input.priority)) return { ok: false, error: `priority must be one of ${allowed.join(", ")}` };
+        order.priority = input.priority;
+        changes.push(`priority: '${before.priority || ""}' → '${input.priority}'`);
+      }
+      if (input.confirmed !== undefined && !!input.confirmed !== !!order.confirmed) {
+        order.confirmed = !!input.confirmed;
+        changes.push(`confirmed: ${!!before.confirmed} → ${!!input.confirmed}`);
+      }
+      if (input.actual_qty !== undefined) {
+        const newActual = (input.actual_qty === null || input.actual_qty === "") ? null : Number(input.actual_qty);
+        if (newActual !== null && !isFinite(newActual)) return { ok: false, error: "actual_qty must be a number or null" };
+        if (newActual !== (order.actualQty == null ? null : Number(order.actualQty))) {
+          order.actualQty = newActual;
+          changes.push(`actualQty: ${before.actualQty == null ? "null" : before.actualQty} → ${newActual == null ? "null" : newActual}`);
+        }
+      }
+      if (changes.length === 0) {
+        return { ok: true, message: `No changes made to '${order_id}' — fields already match.` };
+      }
+      writeData("vf_orders", orders);
+      return { ok: true, message: `Updated '${order_id}': ${changes.join("; ")}.` };
     }
 
     case "find_bom": {
