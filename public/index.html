@@ -1541,13 +1541,30 @@ function togglePwReveal(inputId, btn){
   }
 }
 
-async function serverGet(key){
+// Returns:
+//   { ok: true,  value: <data> }      — server has data
+//   { ok: true,  value: null }        — server says "no data" (exists:false)
+//   { ok: false, transient: true }    — fetch failed / 5xx / non-JSON
+//                                       (auth 401 also lands here — caller
+//                                       should NOT seed/overwrite on transient)
+// Callers that wrote a back-fill on null were silently overwriting live data
+// when the server was momentarily unreachable (e.g. during a Railway redeploy).
+async function serverGetEx(key){
   try{
     const r=await fetch('/api/data/'+key);
-    if(!r.ok)return null;
+    if(!r.ok) return { ok:false, transient:true, status:r.status };
     const j=await r.json();
-    return j.exists?j.value:null;
-  }catch(e){return null;}
+    return { ok:true, value: j.exists ? j.value : null };
+  }catch(e){
+    return { ok:false, transient:true, error:e.message };
+  }
+}
+// Back-compat shim — existing callers that just want "the data or null"
+// keep working. NEW init logic uses serverGetEx directly so it can tell
+// "no data" apart from "request failed".
+async function serverGet(key){
+  const r = await serverGetEx(key);
+  return r.ok ? r.value : null;
 }
 async function serverPut(key,value,extra){
   try{
@@ -1842,18 +1859,45 @@ async function init(){
   }
   const n=document.getElementById('notice');
   if(!storageOK){n.style.display='block';n.textContent='⚠ Persistent storage not active — publish this artifact to enable it.';}
+  // Three-state fetch — see serverGetEx. We MUST distinguish "server has no
+  // data, please seed" from "couldn't reach server, leave alone": persisting
+  // SEED on a transient failure (e.g. mid-redeploy 502) would silently nuke
+  // every live order. May 2026 incident cause: this exact path.
   try{
-    let data=await serverGet('vf_orders');
-    if(data){orders=data;}
-    else{
+    const fetched = await serverGetEx('vf_orders');
+    if (fetched.ok && fetched.value && Array.isArray(fetched.value) && fetched.value.length) {
+      // Happy path — server returned real data.
+      orders = fetched.value;
+      // Don't re-PUT on every load; the only persist on init was historical
+      // and is the bug. Subsequent saves (via persist()) carry source tags.
+    } else if (fetched.ok && (fetched.value == null || (Array.isArray(fetched.value) && !fetched.value.length))) {
+      // Server confirmed: no data. Safe to seed from localStorage / SEED.
       let raw;
       if(window.storage){const r=await window.storage.get('vf_orders');raw=r&&r.value?r.value:null;}
       else{raw=localStorage.getItem('vf_orders');}
-      orders=raw?JSON.parse(raw):JSON.parse(JSON.stringify(SEED));
+      orders = raw ? JSON.parse(raw) : JSON.parse(JSON.stringify(SEED));
+      if(!orders.length) orders = JSON.parse(JSON.stringify(SEED));
+      await persist('seed');
+    } else {
+      // Transient fetch failure (offline, redeploy, 5xx). Show the user a
+      // clear error and DO NOT write anything to the server. Loading SEED
+      // here would nuke live data on the next persist().
+      orders = [];
+      const n = document.getElementById('notice');
+      if (n) {
+        n.style.display = 'block';
+        n.textContent = '⚠ Could not load orders from server (status ' + (fetched.status||'network') + '). Refresh once the server is reachable. Local edits are disabled until then.';
+      }
+      console.error('[init] vf_orders fetch failed; refusing to seed', fetched);
+      // Mark a flag so persist() / saveOrder() can refuse to write
+      window.__vfLoadFailed = true;
     }
-    if(!orders.length) {orders=JSON.parse(JSON.stringify(SEED));}
-    await persist('seed');
-  }catch(e){orders=JSON.parse(JSON.stringify(SEED));}
+  }catch(e){
+    // Hard parse error etc. — also treat as transient; don't seed.
+    orders = [];
+    window.__vfLoadFailed = true;
+    console.error('[init] vf_orders load threw', e);
+  }
   try{
     let data=await serverGet('vf_collapsed');
     if(data){collapsed=data;}
@@ -1874,6 +1918,16 @@ async function init(){
 }
 
 async function persist(source){
+  // Refuse to overwrite the server when the initial load failed — otherwise
+  // we'd push a stale/empty `orders` array on top of live data. This is the
+  // failsafe for the May 2026 wipe scenario (init() couldn't fetch during a
+  // brief redeploy and would have written SEED on top of 130+ live orders).
+  if (window.__vfLoadFailed) {
+    console.warn('[persist] skipped — initial load failed; will not overwrite server data. Refresh the page.');
+    const ind=document.getElementById('save-ind');
+    if (ind) { ind.textContent='⚠ Save blocked — refresh page'; ind.style.opacity='1'; setTimeout(()=>{ind.style.opacity='0';},4000); }
+    return;
+  }
   const ind=document.getElementById('save-ind');
   ind.textContent='Saving…';ind.style.opacity='1';
   try{
