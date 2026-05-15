@@ -1416,6 +1416,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
         <option value="west_mac">West Mcintyre (CBE)</option>
         <option value="mac_1250">1250 Mac</option>
         <option value="mac_packout">5k Mac Packout</option>
+        <option value="pouching">Pouching</option>
         <option value="grinder">Grinder (coffee)</option>
       </optgroup>
       <optgroup label="Zone 2">
@@ -2222,7 +2223,24 @@ function openModal(prefill,mk,ds){
     document.getElementById('f-sub').value=prefill.sub||'';onSubChange();
     document.getElementById('f-region').value=prefill.region||'';
     document.getElementById('f-temper').value=prefill.temper||'';
-    document.getElementById('f-machine').value=prefill.machine||'';
+    (function(){
+      const sel=document.getElementById('f-machine');
+      sel.value=prefill.machine||'';
+      // If the prefill machine isn't a valid option in the dropdown, the
+      // browser silently reverts the value to '' — which then gets persisted
+      // on save and the order vanishes from the calendar (machine='' matches
+      // no row). Detect that and re-add the missing option so the value
+      // sticks. Also tags the unknown machine in the modal so the next save
+      // doesn't quietly destroy it.
+      if ((prefill.machine||'') && sel.value !== prefill.machine) {
+        const opt=document.createElement('option');
+        opt.value=prefill.machine;
+        opt.textContent=prefill.machine+' (unmapped — fix in code)';
+        sel.appendChild(opt);
+        sel.value=prefill.machine;
+        console.warn('[openModal] machine "'+prefill.machine+'" is not in the dropdown; added on the fly');
+      }
+    })();
     document.getElementById('f-qty').value=prefill.qty||'';
     document.getElementById('f-batches').value=prefill.batches||'1';
     document.getElementById('f-status').value=prefill.status||'queued';

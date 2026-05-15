@@ -510,6 +510,15 @@ Order statuses: queued, in-progress, complete, on-hold
 Order priorities: high, med, low
 Order confirmation: 'confirmed' boolean (default false on new). Tentative orders get visual cue on calendar but are still real schedule entries.
 
+PRODUCT CATEGORIES (the front-end's edit modal validates these — picking the wrong combo will silently strip fields when a user opens the order):
+- cat='coffee', sub ∈ {coffee_beans, coffee_ground} — coffee line, runs on the grinder
+- cat='liquor',    sub='liquor'    — chocolate liquor + Mcintyre line products (incl. Final Blends like PFS Final Blend)
+- cat='chocolate', sub='chocolate' — finished chocolate, fat melter, refining/conching/depositing, AND pouching (per the design system: "purple = finished chocolate, including final blends, bars, pouched product")
+- region: 'eu' or 'us', only meaningful for liquor
+- temper: 'cbe' or 'cbs' — east_mac is always cbs, west_mac is always cbe; chocolate-line machines run both, supply explicitly when known
+
+When you call add_order: if the machine maps unambiguously, omitting cat/sub is fine — defaults are inferred. But if you know the product (e.g. PFS pouches → cat='chocolate', sub='chocolate'), pass cat/sub explicitly. Use update_order_metadata to fix cat/sub/region/temper/machine on existing orders.
+
 When recommending a production slot for a finished good or WIP:
 1. Call get_orders to see what's currently scheduled.
 2. If the user's product reference is loose, call find_bom to get the right SKU.
@@ -546,6 +555,54 @@ const MUTATING_AI_TOOLS = new Set([
   "delete_order",
   "update_order_metadata",
 ]);
+
+// Category model — must match SUBTYPES in public/index.html. The front-end's
+// edit modal validates (cat, sub) on save; if either is empty or sub doesn't
+// belong to cat, save throws and the row never persists. Bot tools enforce
+// the same constraints so AI-created orders can be opened + edited cleanly.
+const CATEGORY_SUBS = {
+  coffee:    ["coffee_beans", "coffee_ground"],
+  liquor:    ["liquor"],
+  chocolate: ["chocolate"],
+};
+const ALL_SUBS = Object.values(CATEGORY_SUBS).flat();
+const VALID_REGIONS = ["eu", "us"];
+const VALID_TEMPERS = ["cbe", "cbs"];
+
+// Default cat/sub for a given machine when the bot doesn't supply them.
+// Pouching is intentionally chocolate (matches the design-system note that
+// "purple = finished chocolate (final blends, bars, pouched product)") and
+// puts pouched FGs on the chocolate-coloured chip rather than the generic
+// teal "grind" fallback. grinder is the only coffee-line machine.
+function inferCatSubFromMachine(machine) {
+  switch (machine) {
+    case "grinder":
+      return { cat: "coffee", sub: "coffee_ground" };
+    case "fat_melter":
+    case "refining":
+    case "conching":
+    case "depositing":
+    case "pouching":
+      return { cat: "chocolate", sub: "chocolate" };
+    case "roaster":
+    case "seed_clean":
+    case "east_mac":
+    case "west_mac":
+    case "mac_1250":
+    case "mac_packout":
+    default:
+      return { cat: "liquor", sub: "liquor" };
+  }
+}
+
+// Default temper inference from machine, used only when the bot omits it.
+// Only the Mcintyres are unambiguously typed (east=CBS, west=CBE); everything
+// else is left null because chocolate-line machines run both tempers.
+function inferTemperFromMachine(machine) {
+  if (machine === "east_mac") return "cbs";
+  if (machine === "west_mac") return "cbe";
+  return "";
+}
 
 const AI_TOOLS = [
   {
@@ -592,18 +649,24 @@ const AI_TOOLS = [
   },
   {
     name: "add_order",
-    description: "Create a new work order on the production schedule. Only call this after the user has confirmed they want to proceed with a specific slot.",
+    description: "Create a new work order on the production schedule. Only call this after the user has confirmed they want to proceed with a specific slot. PICK THE RIGHT cat AND sub for the product — these drive the calendar chip color and are validated by the edit modal. Defaults are inferred from machine if you omit them, but those defaults are only correct when the machine maps unambiguously (Mcintyres → liquor, chocolate-line → chocolate, grinder → coffee, pouching → chocolate). Override when you know better — e.g. PFS Final Blend on mac_1250 is technically a peanut-free spread and still uses cat='liquor' sub='liquor', but if you're booking coffee on the grinder, set cat='coffee'.",
     input_schema: {
       type: "object",
       properties: {
         sku:      { type: "string", description: "SKU / product description" },
-        machine:  { type: "string", description: "Machine key (e.g. east_mac, conching, roaster)" },
+        machine:  { type: "string", description: "Machine key (e.g. east_mac, conching, roaster, pouching)" },
         start:    { type: "string", description: "Start date YYYY-MM-DD" },
         end:      { type: "string", description: "End date YYYY-MM-DD" },
         qty:      { type: "number", description: "Batch quantity in kg" },
+        batches:  { type: "number", description: "Number of batches (default 1). Total = qty × batches." },
         orderId:  { type: "string", description: "MO number if known (e.g. MO-00999), otherwise omit and one will be generated" },
         priority: { type: "string", enum: ["high", "med", "low"], description: "Priority (default: med)" },
         notes:    { type: "string", description: "Any notes or special instructions" },
+        cat:      { type: "string", enum: ["coffee", "liquor", "chocolate"], description: "Product category. Drives chip color and which sub-types are valid. Defaults from machine if omitted." },
+        sub:      { type: "string", enum: ["coffee_beans", "coffee_ground", "liquor", "chocolate"], description: "Product sub-type. Must belong to its category: coffee→{coffee_beans, coffee_ground}, liquor→{liquor}, chocolate→{chocolate}. Defaults from machine if omitted." },
+        region:   { type: "string", enum: ["eu", "us"], description: "Region — only meaningful for liquor (EU vs US recipes). Omit for non-liquor." },
+        temper:   { type: "string", enum: ["cbe", "cbs"], description: "Temper type — CBE or CBS. Auto-set for east_mac (cbs) / west_mac (cbe); supply explicitly for other machines if known." },
+        confirmed:{ type: "boolean", description: "Confirmed-for-production flag. New orders default to false (tentative) so the user can review before committing." },
       },
       required: ["sku", "machine", "start", "end"],
     },
@@ -649,7 +712,7 @@ const AI_TOOLS = [
   },
   {
     name: "update_order_metadata",
-    description: "Update one or more metadata fields on a work order — the catch-all for fields not covered by the dedicated update tools (dates, status, qty). Use this for renames (orderId), SKU corrections, notes edits, priority changes, confirming/un-confirming an order, and setting actual produced qty. Only the fields you provide are updated; omit a field to leave it unchanged. Always confirm with the user before calling this on an existing order.",
+    description: "Update one or more metadata fields on a work order — the catch-all for fields not covered by the dedicated update tools (dates, status, qty). Use this for renames (orderId), SKU corrections, notes edits, priority changes, confirming/un-confirming, recording actual produced qty, fixing the machine assignment, and re-categorizing (cat / sub / region / temper). Only the fields you provide are updated; omit a field to leave it unchanged. Always confirm with the user before calling this on an existing order.",
     input_schema: {
       type: "object",
       properties: {
@@ -660,6 +723,12 @@ const AI_TOOLS = [
         priority: { type: "string", enum: ["low", "med", "high"], description: "Set priority." },
         confirmed: { type: "boolean", description: "Set the confirmed-for-production flag. true = confirmed, false = tentative." },
         actual_qty: { type: "number", description: "Set the actual produced qty (kg). Use when actual differs from planned (e.g. abandoned mid-run). Pass 0 to clear or null to remove the override." },
+        machine: { type: "string", description: "Re-assign to a different machine line (e.g. 'pouching', 'east_mac'). Use the machine keys from the system prompt — passing an unknown key is an error." },
+        cat: { type: "string", enum: ["coffee", "liquor", "chocolate"], description: "Re-categorize. If you change cat you usually need to update sub too (and possibly clear region/temper)." },
+        sub: { type: "string", enum: ["coffee_beans", "coffee_ground", "liquor", "chocolate"], description: "Sub-type. Must belong to its category." },
+        region: { type: "string", enum: ["eu", "us"], description: "Region (liquor only). Pass empty string to clear." },
+        temper: { type: "string", enum: ["cbe", "cbs"], description: "Temper (cbe / cbs). Pass empty string to clear." },
+        batches: { type: "number", description: "Number of batches. Total auto-recalcs as qty × batches." },
       },
       required: ["order_id"],
     },
@@ -768,20 +837,49 @@ async function executeAITool(name, input) {
     }
 
     case "add_order": {
-      const { sku, machine, start, end, qty = 0, orderId, priority = "med", notes = "" } = input;
+      const { sku, machine, start, end, qty = 0, batches = 1, orderId, priority = "med", notes = "" } = input;
+      // Resolve cat/sub: respect the bot's explicit values; otherwise infer
+      // from machine. Validate that sub belongs to cat — if either is bad,
+      // fail loudly rather than persisting an order the modal can't save.
+      let cat = input.cat;
+      let sub = input.sub;
+      if (!cat || !sub) {
+        const inferred = inferCatSubFromMachine(machine);
+        cat = cat || inferred.cat;
+        sub = sub || inferred.sub;
+      }
+      if (!CATEGORY_SUBS[cat]) {
+        return { ok: false, error: `Invalid cat '${cat}'. Valid: ${Object.keys(CATEGORY_SUBS).join(", ")}` };
+      }
+      if (!CATEGORY_SUBS[cat].includes(sub)) {
+        return { ok: false, error: `sub '${sub}' is not valid for cat '${cat}'. Valid subs for ${cat}: ${CATEGORY_SUBS[cat].join(", ")}` };
+      }
+      // Region only applies to liquor; silently drop for other cats so we
+      // don't pollute downstream filters.
+      let region = input.region != null ? String(input.region) : "";
+      if (region && !VALID_REGIONS.includes(region)) {
+        return { ok: false, error: `Invalid region '${region}'. Valid: ${VALID_REGIONS.join(", ")}` };
+      }
+      if (cat !== "liquor") region = "";
+      // Temper: prefer explicit input, otherwise infer from machine.
+      let temper = input.temper != null ? String(input.temper) : inferTemperFromMachine(machine);
+      if (temper && !VALID_TEMPERS.includes(temper)) {
+        return { ok: false, error: `Invalid temper '${temper}'. Valid: ${VALID_TEMPERS.join(", ")}` };
+      }
+      const confirmed = input.confirmed === undefined ? false : !!input.confirmed;
       const id = `ai-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       const generatedOrderId = orderId || `TBD-${machine}-${(start || "").replace(/-/g, "")}`;
       const newOrder = {
         id, orderId: generatedOrderId, sku, machine,
         start, end, due: end,
-        qty, batches: 1, total: qty,
+        qty, batches, total: qty * batches,
         status: "queued", priority, notes,
-        cat: "liquor", sub: "liquor",
-        confirmed: false,
+        cat, sub, region, temper,
+        confirmed,
       };
       orders.push(newOrder);
       writeData("vf_orders", orders);
-      return { ok: true, message: `Created order '${generatedOrderId}' for ${sku} on ${machine} (${start} → ${end})`, order: newOrder };
+      return { ok: true, message: `Created order '${generatedOrderId}' for ${sku} on ${machine} (${start} → ${end}, ${cat}/${sub}${temper ? `/${temper}` : ""}${region ? `/${region}` : ""})`, order: newOrder };
     }
 
     case "find_available_slots": {
@@ -909,6 +1007,58 @@ async function executeAITool(name, input) {
         if (newActual !== (order.actualQty == null ? null : Number(order.actualQty))) {
           order.actualQty = newActual;
           changes.push(`actualQty: ${before.actualQty == null ? "null" : before.actualQty} → ${newActual == null ? "null" : newActual}`);
+        }
+      }
+      // Machine reassignment — list of valid keys mirrors the modal dropdown
+      // in public/index.html. An invalid key would silently disappear in the
+      // UI on next save (the original symptom we're guarding against), so we
+      // reject it here.
+      const VALID_MACHINES = [
+        "roaster", "seed_clean", "east_mac", "west_mac", "mac_1250",
+        "mac_packout", "pouching", "grinder", "fat_melter", "refining",
+        "conching", "depositing",
+      ];
+      if (input.machine !== undefined && input.machine !== order.machine) {
+        const m = String(input.machine);
+        if (m && !VALID_MACHINES.includes(m)) {
+          return { ok: false, error: `Invalid machine '${m}'. Valid: ${VALID_MACHINES.join(", ")}` };
+        }
+        order.machine = m;
+        changes.push(`machine: '${before.machine || ""}' → '${m}'`);
+      }
+      // Re-categorize: cat / sub change in lockstep. If only one is supplied,
+      // validate the resulting (cat, sub) combo against CATEGORY_SUBS.
+      if (input.cat !== undefined || input.sub !== undefined) {
+        const newCat = input.cat !== undefined ? String(input.cat) : order.cat;
+        const newSub = input.sub !== undefined ? String(input.sub) : order.sub;
+        if (!CATEGORY_SUBS[newCat]) {
+          return { ok: false, error: `Invalid cat '${newCat}'. Valid: ${Object.keys(CATEGORY_SUBS).join(", ")}` };
+        }
+        if (!CATEGORY_SUBS[newCat].includes(newSub)) {
+          return { ok: false, error: `sub '${newSub}' is not valid for cat '${newCat}'. Valid subs: ${CATEGORY_SUBS[newCat].join(", ")}` };
+        }
+        if (newCat !== order.cat) { order.cat = newCat; changes.push(`cat: '${before.cat || ""}' → '${newCat}'`); }
+        if (newSub !== order.sub) { order.sub = newSub; changes.push(`sub: '${before.sub || ""}' → '${newSub}'`); }
+      }
+      if (input.region !== undefined && String(input.region) !== (order.region || "")) {
+        const r = String(input.region);
+        if (r && !VALID_REGIONS.includes(r)) return { ok: false, error: `Invalid region '${r}'. Valid: ${VALID_REGIONS.join(", ")}` };
+        order.region = r;
+        changes.push(`region: '${before.region || ""}' → '${r}'`);
+      }
+      if (input.temper !== undefined && String(input.temper) !== (order.temper || "")) {
+        const t = String(input.temper);
+        if (t && !VALID_TEMPERS.includes(t)) return { ok: false, error: `Invalid temper '${t}'. Valid: ${VALID_TEMPERS.join(", ")}` };
+        order.temper = t;
+        changes.push(`temper: '${before.temper || ""}' → '${t}'`);
+      }
+      if (input.batches !== undefined) {
+        const b = Number(input.batches);
+        if (!isFinite(b) || b < 1) return { ok: false, error: "batches must be a positive number" };
+        if (b !== (order.batches || 1)) {
+          order.batches = b;
+          order.total = (order.qty || 0) * b;
+          changes.push(`batches: ${before.batches || 1} → ${b} (total now ${order.total})`);
         }
       }
       if (changes.length === 0) {
