@@ -617,6 +617,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
 .admin-table tr:hover td { background: var(--vf-surface-hover); }
 .role-admin    { background: var(--vf-danger-soft);   color: var(--vf-danger-text);   border-radius: var(--vf-radius-pill); padding: 2px 10px; font-size: var(--vf-text-xs); font-weight: var(--vf-weight-medium); letter-spacing: var(--vf-tracking-wide); }
 .role-operator { background: var(--vf-info-soft);     color: var(--vf-info-text);     border-radius: var(--vf-radius-pill); padding: 2px 10px; font-size: var(--vf-text-xs); font-weight: var(--vf-weight-medium); letter-spacing: var(--vf-tracking-wide); }
+.role-planner  { background: var(--vf-cat-purple-soft); color: var(--vf-cat-purple-strong); border-radius: var(--vf-radius-pill); padding: 2px 10px; font-size: var(--vf-text-xs); font-weight: var(--vf-weight-medium); letter-spacing: var(--vf-tracking-wide); }
 .role-viewer   { background: var(--vf-cat-gray-soft); color: var(--vf-cat-gray-strong); border-radius: var(--vf-radius-pill); padding: 2px 10px; font-size: var(--vf-text-xs); font-weight: var(--vf-weight-medium); letter-spacing: var(--vf-tracking-wide); }
 
 /* ── MO Status page ──────────────────────────────────────────────────────── */
@@ -1291,6 +1292,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       <strong style="color:var(--vf-text-primary);">Roles:</strong>
       <span class="role-admin" style="margin-left:6px;">Admin</span> Full access + user management
       <span class="role-operator" style="margin-left:10px;">Operator</span> Create & edit orders
+      <span class="role-planner" style="margin-left:10px;">Planner</span> View + MRP (no order edits, no chat bot)
       <span class="role-viewer" style="margin-left:10px;">Viewer</span> Read-only access
     </div>
     <table class="admin-table" id="admin-user-table">
@@ -1353,6 +1355,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
   <div class="field"><label>Role</label>
     <select id="um-role">
       <option value="viewer">Viewer — Read-only</option>
+      <option value="planner">Planner — View + MRP (no edits)</option>
       <option value="operator">Operator — Create & edit orders</option>
       <option value="admin">Admin — Full access</option>
     </select>
@@ -1650,16 +1653,22 @@ function showApp(){
   const isAdmin=currentUser.role==='admin';
   document.getElementById('tab-admin-btn').style.display=isAdmin?'':'none';
   document.getElementById('tab-mrp-setup-btn').style.display=isAdmin?'':'none';
-  // MRP tab visible to admin + operator (anyone who can act on PO suggestions)
-  const canSeeMrp = currentUser.role === 'admin' || currentUser.role === 'operator';
+  // MRP tab visible to admin + operator + planner. Planner is a read-only
+  // role designed for procurement / finance users who need to act on PO
+  // suggestions but should not edit the production schedule.
+  const canSeeMrp = currentUser.role === 'admin' || currentUser.role === 'operator' || currentUser.role === 'planner';
   document.getElementById('tab-mrp-btn').style.display = canSeeMrp ? '' : 'none';
   document.getElementById('user-badge').innerHTML=
     `<span>${currentUser.username}</span>`+
-    `<span class="role-tag">${currentUser.role}</span>`+
+    `<span class="role-tag role-${esc(currentUser.role)}">${currentUser.role}</span>`+
     `<button class="logout-btn" onclick="doLogout()">Sign out</button>`;
   applyPermissions();
   renderCal();
-  showAIWidget();
+  // AI chat bot can mutate orders (add_order, update_order_*, delete_order
+  // etc.) so it's gated to roles that have edit rights. Planner + viewer
+  // get a quieter UI without the chat widget; the server also rejects
+  // /api/chat for non-edit roles as a defence-in-depth.
+  if (canEditOrders()) showAIWidget();
 }
 
 function applyPermissions(){

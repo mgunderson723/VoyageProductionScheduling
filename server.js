@@ -1136,7 +1136,7 @@ async function executeAITool(name, input) {
   }
 }
 
-app.post("/api/chat", async (req, res) => {
+app.post("/api/chat", requireOrderEdit, async (req, res) => {
   if (!process.env.ANTHROPIC_API_KEY) {
     return res.status(503).json({ ok: false, error: "AI assistant is not configured (missing ANTHROPIC_API_KEY)" });
   }
@@ -1579,6 +1579,20 @@ function requireAdmin(req, res, next) {
   const u = users.find(x => x && x.id === req.userId);
   if (!u || u.role !== "admin") {
     return res.status(403).json({ ok: false, error: "Admin role required" });
+  }
+  next();
+}
+
+// Order-edit middleware — admin or operator only. Used to gate /api/chat
+// (the AI bot has mutating tools like add_order/delete_order/etc.) so the
+// new 'planner' and existing 'viewer' roles can't bypass canEditOrders()
+// by chatting at the bot. Front-end also hides the chat widget for these
+// roles; this is the defence-in-depth layer.
+function requireOrderEdit(req, res, next) {
+  const users = readData("vf_users") || [];
+  const u = users.find(x => x && x.id === req.userId);
+  if (!u || (u.role !== "admin" && u.role !== "operator")) {
+    return res.status(403).json({ ok: false, error: "Order-edit role required (admin or operator). The chat assistant is disabled for read-only roles." });
   }
   next();
 }
