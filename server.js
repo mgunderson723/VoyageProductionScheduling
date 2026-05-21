@@ -1746,6 +1746,7 @@ function parseInventoryRows(rows) {
     else if (h === "quantity out" || h === "outbound") colMap.qtyOut = i;
     else if (h === "batch #" || h === "batch_count") colMap.batch = i;
     else if (h === "reference") colMap.reference = i;
+    else if (h === "type" || h === "movement type") colMap.type = i;
   });
   if (colMap.sku === undefined) throw new Error("Missing required column: SKU");
   if (colMap.qtyIn === undefined) throw new Error("Missing required column: Quantity in");
@@ -1757,6 +1758,10 @@ function parseInventoryRows(rows) {
   const rtAgg = {};
   const moMap = new Map();
   const monthSet = new Set();
+  // Raw per-row lines, retained so downstream views (e.g. Error Reporting's
+  // trailing-7-day zero-utilization detector) can flag individual operator
+  // mistakes that aggregate totals would hide.
+  const lines = [];
   const parseNum = s => { if (s == null || s === "") return 0; return parseFloat(String(s).replace(/,/g, "")) || 0; };
   const dateToMonth = d => {
     if (!d) return null;
@@ -1766,6 +1771,17 @@ function parseInventoryRows(rows) {
     if (m) { const mo = mMap[m[2].toLowerCase()]; return mo ? m[3]+"-"+mo : null; }
     m = s.match(/^(\d{4})-(\d{2})/);
     if (m) return m[1]+"-"+m[2];
+    return null;
+  };
+  const dateToISO = d => {
+    if (!d) return null;
+    if (d instanceof Date) return d.toISOString().slice(0, 10);
+    const s = String(d);
+    const mMap = { jan:"01",feb:"02",mar:"03",apr:"04",may:"05",jun:"06",jul:"07",aug:"08",sep:"09",oct:"10",nov:"11",dec:"12" };
+    let m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/);
+    if (m) { const mo = mMap[m[2].toLowerCase()]; return mo ? `${m[3]}-${mo}-${m[1].padStart(2,"0")}` : null; }
+    m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (m) return `${m[1]}-${m[2]}-${m[3]}`;
     return null;
   };
 
@@ -1814,6 +1830,25 @@ function parseInventoryRows(rows) {
       me.totalIn += inb;
       me.totalOut += outb;
     }
+
+    // Raw line — `ref` keeps the full Cin7 reference including the /N batch
+    // suffix (e.g. "MO-00774/3") even though moMap above strips it.
+    const typeStr = colMap.type !== undefined ? String(f[colMap.type] || "").trim() : "";
+    const isoDate = colMap.date !== undefined ? dateToISO(f[colMap.date]) : null;
+    lines.push({
+      date: isoDate || "",
+      month,
+      sku,
+      product: prod,
+      category: cat,
+      unit,
+      batch,
+      ref,
+      refType: rt,
+      type: typeStr,
+      qtyIn: inb,
+      qtyOut: outb,
+    });
   }
   for (const [sku, entry] of skuMap) entry.bc = batchSets.get(sku).size;
   const months = [...monthSet].sort();
@@ -1826,6 +1861,7 @@ function parseInventoryRows(rows) {
     months,
     rowCount,
     moMovements: Object.fromEntries(moMap),
+    lines,
   };
 }
 
@@ -1968,6 +2004,34 @@ app.post("/api/cin7/inventory-movements", async (req, res) => {
     };
     writeData("inventory", finalData);
 
+    // ── Trailing 7-day raw-line snapshot ────────────────────────────────────
+    // Persist the most recent 7 days of raw movement lines so the Error
+    // Reporting tab can flag per-batch anomalies (e.g. operator-entered
+    // qtyOut=0 on a BOM input line) that aggregate totals would hide.
+    // Window is computed from max(date) in the file rather than wall clock
+    // so the result is deterministic when files arrive late.
+    try {
+      const allLines = parsed.lines || [];
+      const dates = allLines.map(l => l.date).filter(Boolean).sort();
+      if (dates.length > 0) {
+        const windowEnd = dates[dates.length - 1];
+        const endD = new Date(windowEnd + "T00:00:00Z");
+        endD.setUTCDate(endD.getUTCDate() - 6); // inclusive 7-day window: [end-6 .. end]
+        const windowStart = endD.toISOString().slice(0, 10);
+        const t7dLines = allLines.filter(l => l.date && l.date >= windowStart);
+        writeData("movements_t7d", {
+          lastSync: finalData.lastSync,
+          sourceFile: filename || null,
+          windowStart,
+          windowEnd,
+          lineCount: t7dLines.length,
+          lines: t7dLines,
+        });
+      }
+    } catch (e) {
+      console.error("[gdrive-sync] movements_t7d write failed:", e.message);
+    }
+
     console.log(`[gdrive-sync] Ingested ${filename || "(unnamed)"} — ${parsed.rowCount} rows · ${parsed.invSku.length} new-window SKUs · ${Object.keys(parsed.moMovements).length} new-window MOs · merged total: ${finalData.invSku.length} SKUs · ${Object.keys(finalData.moMovements).length} MOs`);
     res.json({
       ok: true,
@@ -1985,6 +2049,75 @@ app.post("/api/cin7/inventory-movements", async (req, res) => {
     console.error("[gdrive-sync] Ingest error:", e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
+});
+
+// ── Error Reporting: trailing-7-day MO BOM-input zero-utilization detector ──
+//
+// Flags any raw movement line where:
+//   - Reference matches /MO-/
+//   - Type === "Out"        (i.e. should consume a component)
+//   - Quantity out === 0    (operator logged zero — breaks traceability & costing)
+//
+// Grouped by the FULL Cin7 reference (e.g. "MO-00774/3") to keep per-batch
+// granularity. Sibling lines on the same MO reference are returned alongside
+// so the operator-facing view can show the context (what *did* post on that MO).
+app.get("/api/error-reporting/zero-out-mo-bom", (req, res) => {
+  const blob = readData("movements_t7d");
+  if (!blob || !Array.isArray(blob.lines)) {
+    return res.json({
+      ok: true,
+      lastSync: null,
+      windowStart: null,
+      windowEnd: null,
+      sourceFile: null,
+      totalLines: 0,
+      flaggedMoCount: 0,
+      flaggedLineCount: 0,
+      flagged: [],
+    });
+  }
+
+  const moRegex = /MO-\d+/;
+  const isOut = t => String(t || "").trim().toLowerCase() === "out";
+
+  // Pass 1: identify which MO references have at least one zero-out flag
+  const flaggedMoSet = new Set();
+  for (const l of blob.lines) {
+    if (l.ref && moRegex.test(l.ref) && isOut(l.type) && Number(l.qtyOut) === 0) {
+      flaggedMoSet.add(l.ref);
+    }
+  }
+
+  // Pass 2: group all lines on those references into flagged vs siblings
+  const groups = new Map();
+  for (const mo of flaggedMoSet) {
+    groups.set(mo, { ref: mo, date: null, flagged: [], siblings: [] });
+  }
+  let flaggedLineCount = 0;
+  for (const l of blob.lines) {
+    if (!l.ref || !flaggedMoSet.has(l.ref)) continue;
+    const g = groups.get(l.ref);
+    const isFlagged = isOut(l.type) && Number(l.qtyOut) === 0;
+    if (isFlagged) { g.flagged.push(l); flaggedLineCount++; }
+    else g.siblings.push(l);
+    if (l.date && (!g.date || l.date < g.date)) g.date = l.date;
+  }
+
+  // Sort flagged MOs newest first
+  const flagged = Array.from(groups.values())
+    .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+
+  res.json({
+    ok: true,
+    lastSync: blob.lastSync || null,
+    windowStart: blob.windowStart || null,
+    windowEnd: blob.windowEnd || null,
+    sourceFile: blob.sourceFile || null,
+    totalLines: blob.lines.length,
+    flaggedMoCount: flagged.length,
+    flaggedLineCount,
+    flagged,
+  });
 });
 
 // ── MRP Phase 2: BOM + supply settings (lead times, safety stock) ────────────

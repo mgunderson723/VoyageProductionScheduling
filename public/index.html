@@ -843,6 +843,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
     <button class="tab" onclick="switchTab('traceability')">Traceability</button>
     <button class="tab" onclick="switchTab('mo-status')">MO Status</button>
     <button class="tab" onclick="switchTab('live-inv')">Live Inventory</button>
+    <button class="tab" onclick="switchTab('error-reporting')">Error reporting</button>
     <button class="tab" onclick="switchTab('mrp')" id="tab-mrp-btn" style="display:none;">MRP</button>
     <button class="tab" onclick="switchTab('mrp-setup')" id="tab-mrp-setup-btn" style="display:none;">MRP Setup</button>
     <button class="tab" onclick="switchTab('admin')" id="tab-admin-btn" style="display:none;">Admin console</button>
@@ -1021,6 +1022,27 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
         <tbody id="live-inv-tbody"></tbody>
       </table>
     </div>
+  </div>
+
+  <!-- ERROR REPORTING — trailing-7-day anomaly detector -->
+  <div id="tab-error-reporting" style="display:none;">
+    <div class="header">
+      <div style="display:flex;align-items:center;gap:var(--vf-space-3);flex-wrap:wrap;">
+        <h2>Error reporting</h2>
+        <span id="err-rep-meta" style="font-size:var(--vf-text-sm);color:var(--vf-text-tertiary);"></span>
+      </div>
+      <div style="display:flex;gap:var(--vf-space-2);align-items:center;">
+        <button class="btn btn-sm" onclick="loadErrorReporting()">⟳ Refresh</button>
+      </div>
+    </div>
+
+    <div style="font-size:var(--vf-text-sm);color:var(--vf-text-secondary);margin:var(--vf-space-2) 0 var(--vf-space-3);max-width:780px;">
+      <strong>Zero-utilization BOM inputs.</strong> Lines from the trailing 7 days where a Manufacturing Order had an
+      <em>Out</em>-type movement with Quantity out = 0 — typically meaning the operator didn't log component consumption,
+      which breaks traceability for QA and unit costing.
+    </div>
+
+    <div id="err-rep-content"></div>
   </div>
 
   <!-- MRP — operator+ — production-plan-driven material requirements -->
@@ -2081,10 +2103,10 @@ function switchTab(t){
   if(t==='admin'&&(!currentUser||currentUser.role!=='admin'))return;
   if(t==='mrp-setup'&&(!currentUser||currentUser.role!=='admin'))return;
   if(t==='mrp'&&(!currentUser||currentUser.role==='viewer'))return;
-  ['calendar','orders','capacity','traceability','mo-status','live-inv','mrp','mrp-setup','admin'].forEach(k=>{document.getElementById('tab-'+k).style.display=k===t?'':'none';});
+  ['calendar','orders','capacity','traceability','mo-status','live-inv','error-reporting','mrp','mrp-setup','admin'].forEach(k=>{document.getElementById('tab-'+k).style.display=k===t?'':'none';});
   document.querySelectorAll('.tab').forEach(el=>{
     const tabName=el.textContent.trim().toLowerCase();
-    const map={'calendar':'calendar','work orders':'orders','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','mo status':'mo-status','live inventory':'live-inv','mrp':'mrp','mrp setup':'mrp-setup','admin console':'admin'};
+    const map={'calendar':'calendar','work orders':'orders','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','mo status':'mo-status','live inventory':'live-inv','error reporting':'error-reporting','mrp':'mrp','mrp setup':'mrp-setup','admin console':'admin'};
     el.classList.toggle('active',map[tabName]===t);
   });
   if(t==='calendar')renderCal();
@@ -2093,6 +2115,7 @@ function switchTab(t){
   if(t==='traceability'&&!window._traceabilityMounted){window._traceabilityMounted=true;if(window.App){ReactDOM.createRoot(document.getElementById('traceability-root')).render(React.createElement(window.App));}}
   if(t==='mo-status'){populateMOStatusMachineFilter();renderMOStatus();loadSyncStatus();}
   if(t==='live-inv')loadLiveInventory();
+  if(t==='error-reporting')loadErrorReporting();
   if(t==='mrp-setup')loadMrpSetup();
   if(t==='mrp')loadMrp();
 }
@@ -3367,6 +3390,95 @@ function renderLiveInventory() {
           <td style="text-align:right;font-variant-numeric:tabular-nums;">${(r.OnOrder||0).toLocaleString(undefined,{maximumFractionDigits:2})}</td>
         </tr>`).join('') + (filtered.length > 1000 ? `<tr><td colspan="9" style="text-align:center;color:var(--vf-text-tertiary);font-size:11px;">…and ${filtered.length - 1000} more rows. Refine search to narrow.</td></tr>` : '');
   }
+}
+
+// ── Error Reporting Tab ──────────────────────────────────────────────────────
+//
+// Reads /api/error-reporting/zero-out-mo-bom and renders one card per MO
+// (full reference, including /N batch suffix) that has a BOM-input line with
+// Quantity out = 0 in the trailing-7-day raw-line window. Siblings on the
+// same MO render alongside for operator context.
+
+async function loadErrorReporting() {
+  const meta = document.getElementById('err-rep-meta');
+  const content = document.getElementById('err-rep-content');
+  content.innerHTML = '<div style="padding:20px;color:var(--vf-text-tertiary);font-size:13px;">Loading…</div>';
+  let d;
+  try {
+    const r = await fetch('/api/error-reporting/zero-out-mo-bom');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    d = await r.json();
+    if (!d.ok) throw new Error(d.error || 'unknown');
+  } catch (e) {
+    content.innerHTML = `<div style="padding:20px;color:var(--vf-danger-text);background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:13px;">Failed to load: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+
+  // Header meta
+  if (d.lastSync) {
+    const age = Math.round((Date.now() - new Date(d.lastSync).getTime()) / 60000);
+    const ageStr = age < 60 ? `${age}m ago` : age < 1440 ? `${Math.round(age/60)}h ago` : `${Math.round(age/1440)}d ago`;
+    meta.textContent = `Window ${d.windowStart} → ${d.windowEnd} · synced ${ageStr} · ${d.totalLines.toLocaleString()} movements scanned`;
+  } else {
+    meta.textContent = 'No movement data yet — waiting on first daily ingest';
+  }
+
+  if (!d.flagged || d.flagged.length === 0) {
+    content.innerHTML = `<div style="padding:16px;background:var(--vf-success-soft);border:1px solid var(--vf-success-base);border-radius:var(--vf-radius-sm);color:var(--vf-success-text);font-size:13px;">✓ No zero-utilization BOM inputs detected in the trailing 7 days.</div>`;
+    return;
+  }
+
+  // Summary strip
+  const summary = `
+    <div style="display:flex;gap:var(--vf-space-3);margin-bottom:var(--vf-space-3);flex-wrap:wrap;">
+      <div style="padding:8px 12px;background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:12px;color:var(--vf-danger-text);">
+        <strong>${d.flaggedMoCount}</strong> MO batch${d.flaggedMoCount === 1 ? '' : 'es'} flagged
+      </div>
+      <div style="padding:8px 12px;background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:12px;color:var(--vf-danger-text);">
+        <strong>${d.flaggedLineCount}</strong> zero-quantity BOM line${d.flaggedLineCount === 1 ? '' : 's'}
+      </div>
+    </div>`;
+
+  const fmtQty = q => (q == null || q === '') ? '—' : Number(q).toLocaleString(undefined, { maximumFractionDigits: 4 });
+
+  const cards = d.flagged.map(g => {
+    const renderRow = (l, flagged) => `
+      <tr${flagged ? ' style="background:var(--vf-danger-soft);"' : ''}>
+        <td><span class="mo-id">${escapeHtml(l.sku || '')}</span></td>
+        <td style="font-size:12px;color:var(--vf-text-secondary);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(l.product || '')}">${escapeHtml(l.product || '—')}</td>
+        <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(l.batch || '—')}</td>
+        <td style="font-size:11px;">${escapeHtml(l.type || '—')}</td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;${flagged ? 'color:var(--vf-danger-text);font-weight:600;' : ''}">${fmtQty(l.qtyOut)}</td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;">${fmtQty(l.qtyIn)}</td>
+      </tr>`;
+    const flaggedRows = g.flagged.map(l => renderRow(l, true)).join('');
+    const siblingRows = g.siblings.map(l => renderRow(l, false)).join('');
+    return `
+      <div style="margin-bottom:var(--vf-space-3);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);overflow:hidden;">
+        <div style="padding:10px 14px;background:var(--vf-surface-raised);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+          <div style="display:flex;align-items:center;gap:10px;">
+            <strong style="font-size:14px;color:var(--vf-text-primary);">${escapeHtml(g.ref)}</strong>
+            <span style="font-size:11px;padding:2px 8px;background:var(--vf-danger-soft);color:var(--vf-danger-text);border-radius:10px;">${g.flagged.length} flagged</span>
+          </div>
+          <span style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(g.date || '—')}</span>
+        </div>
+        <table class="status-table" style="margin:0;">
+          <thead>
+            <tr>
+              <th>SKU</th>
+              <th>Product</th>
+              <th>Batch #</th>
+              <th>Type</th>
+              <th style="text-align:right;">Qty out</th>
+              <th style="text-align:right;">Qty in</th>
+            </tr>
+          </thead>
+          <tbody>${flaggedRows}${siblingRows}</tbody>
+        </table>
+      </div>`;
+  }).join('');
+
+  content.innerHTML = summary + cards;
 }
 
 // ── MO Status Tab ────────────────────────────────────────────────────────────
