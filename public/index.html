@@ -811,6 +811,16 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
 </head>
 <body>
 
+<!-- SAVE-BLOCKED BANNER — shown when init() couldn't reach the server.
+     Stays sticky at top so user can't miss it. persist() is no-op'd while
+     __vfLoadFailed is true, so without this banner edits silently fail to
+     save (root cause of the May 21 2026 shiaocatjam incident). -->
+<div id="save-blocked-banner" style="display:none;position:fixed;top:0;left:0;right:0;z-index:9999;background:var(--vf-danger-base);color:#fff;padding:12px 20px;font-size:14px;font-weight:500;text-align:center;box-shadow:0 2px 12px rgba(0,0,0,0.3);font-family:var(--vf-font-body);">
+  <span id="save-blocked-text">⚠ Lost connection to server — your edits are NOT being saved.</span>
+  <button id="save-blocked-retry-btn" type="button" onclick="retryInit()" style="margin-left:12px;padding:4px 12px;background:#fff;color:#7A1F1F;border:none;border-radius:4px;font-weight:600;cursor:pointer;font-size:13px;">Retry now</button>
+  <button id="save-blocked-reload-btn" type="button" onclick="location.reload()" style="display:none;margin-left:8px;padding:4px 12px;background:#fff;color:#1B5234;border:none;border-radius:4px;font-weight:600;cursor:pointer;font-size:13px;">Reload page</button>
+</div>
+
 <!-- LOGIN SCREEN -->
 <div id="login-screen" class="login-overlay">
   <div class="login-box">
@@ -1880,6 +1890,78 @@ const SEED=[
 
 let orders=[],collapsed={},editingId=null,calOffset=0,storageOK=false;
 
+// ── Save-blocked banner ─────────────────────────────────────────────────────
+// When init() can't reach the server (transient 5xx, network glitch, etc.),
+// persist() is no-op'd to avoid the May 2026 silent-overwrite class of bugs.
+// Without UI feedback the user keeps editing as if everything's fine, then
+// loses all changes on next refresh (May 21 2026 incident). The banner makes
+// the blocked state impossible to miss, and an auto-retry loop self-heals
+// once the server is reachable again.
+
+let saveBlockedRetryTimer = null;
+
+function showSaveBlockedBanner(text, options) {
+  options = options || {};
+  const banner = document.getElementById('save-blocked-banner');
+  if (!banner) return;
+  const textEl = document.getElementById('save-blocked-text');
+  const retryBtn = document.getElementById('save-blocked-retry-btn');
+  const reloadBtn = document.getElementById('save-blocked-reload-btn');
+  if (textEl) textEl.textContent = text;
+  if (retryBtn) {
+    retryBtn.style.display = options.hideRetry ? 'none' : '';
+    retryBtn.disabled = false;
+    retryBtn.textContent = 'Retry now';
+  }
+  if (reloadBtn) reloadBtn.style.display = options.showReload ? '' : 'none';
+  banner.style.background = options.success ? 'var(--vf-success-base)' : 'var(--vf-danger-base)';
+  banner.style.display = 'block';
+  // Push body content down so the banner doesn't cover the topbar
+  document.body.style.paddingTop = banner.offsetHeight + 'px';
+}
+
+function hideSaveBlockedBanner() {
+  const banner = document.getElementById('save-blocked-banner');
+  if (banner) banner.style.display = 'none';
+  document.body.style.paddingTop = '';
+}
+
+function startSaveBlockedRetryLoop() {
+  stopSaveBlockedRetryLoop();
+  saveBlockedRetryTimer = setInterval(retryInit, 30000);
+}
+
+function stopSaveBlockedRetryLoop() {
+  if (saveBlockedRetryTimer) {
+    clearInterval(saveBlockedRetryTimer);
+    saveBlockedRetryTimer = null;
+  }
+}
+
+async function retryInit() {
+  const btn = document.getElementById('save-blocked-retry-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Retrying…'; }
+  try {
+    const fetched = await serverGetEx('vf_orders');
+    if (fetched.ok) {
+      // Connection restored. Don't auto-replace orders[] — the user may have
+      // made in-memory edits during the blocked period, and silently
+      // overwriting them is exactly the failure mode this banner exists to
+      // prevent. Prompt them to reload instead.
+      stopSaveBlockedRetryLoop();
+      showSaveBlockedBanner(
+        '✓ Connection restored. Reload the page to refresh data and resume saving. Any unsaved edits from this session will be lost.',
+        { success: true, hideRetry: true, showReload: true }
+      );
+    } else {
+      // Still failing — leave banner up, reset button so user can manually retry
+      if (btn) { btn.disabled = false; btn.textContent = 'Retry now'; }
+    }
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = 'Retry now'; }
+  }
+}
+
 async function init(){
   if(window.storage){
     try{
@@ -1916,20 +1998,28 @@ async function init(){
       // clear error and DO NOT write anything to the server. Loading SEED
       // here would nuke live data on the next persist().
       orders = [];
-      const n = document.getElementById('notice');
-      if (n) {
-        n.style.display = 'block';
-        n.textContent = '⚠ Could not load orders from server (status ' + (fetched.status||'network') + '). Refresh once the server is reachable. Local edits are disabled until then.';
-      }
       console.error('[init] vf_orders fetch failed; refusing to seed', fetched);
       // Mark a flag so persist() / saveOrder() can refuse to write
       window.__vfLoadFailed = true;
+      // Show the sticky banner + start the 30s auto-retry loop so the user
+      // can't miss the blocked state (replaces the easily-overlooked #notice
+      // element this path used to set).
+      showSaveBlockedBanner(
+        '⚠ Lost connection to server (status ' + (fetched.status||'network') + ') — your edits are NOT being saved. Auto-retrying every 30s.',
+        {}
+      );
+      startSaveBlockedRetryLoop();
     }
   }catch(e){
     // Hard parse error etc. — also treat as transient; don't seed.
     orders = [];
     window.__vfLoadFailed = true;
     console.error('[init] vf_orders load threw', e);
+    showSaveBlockedBanner(
+      '⚠ Couldn\'t load orders (' + (e.message || 'parse error') + ') — your edits are NOT being saved. Auto-retrying every 30s.',
+      {}
+    );
+    startSaveBlockedRetryLoop();
   }
   try{
     let data=await serverGet('vf_collapsed');
