@@ -1024,7 +1024,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
     </div>
   </div>
 
-  <!-- ERROR REPORTING — trailing-7-day anomaly detector -->
+  <!-- ERROR REPORTING — trailing-7-day production-run anomaly detector -->
   <div id="tab-error-reporting" style="display:none;">
     <div class="header">
       <div style="display:flex;align-items:center;gap:var(--vf-space-3);flex-wrap:wrap;">
@@ -1033,13 +1033,15 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       </div>
       <div style="display:flex;gap:var(--vf-space-2);align-items:center;">
         <button class="btn btn-sm" onclick="loadErrorReporting()">⟳ Refresh</button>
+        <button class="btn btn-sm" id="err-rep-sync-btn" onclick="syncErrorReporting()">↻ Sync now</button>
       </div>
     </div>
 
-    <div style="font-size:var(--vf-text-sm);color:var(--vf-text-secondary);margin:var(--vf-space-2) 0 var(--vf-space-3);max-width:780px;">
-      <strong>Zero-utilization BOM inputs.</strong> Lines from the trailing 7 days where a Manufacturing Order had an
-      <em>Out</em>-type movement with Quantity out = 0 — typically meaning the operator didn't log component consumption,
-      which breaks traceability for QA and unit costing.
+    <div style="font-size:var(--vf-text-sm);color:var(--vf-text-secondary);margin:var(--vf-space-2) 0 var(--vf-space-3);max-width:820px;">
+      <strong>Zero-utilization BOM inputs.</strong> Component lines from the trailing 7 days of completed production runs
+      where <em>required</em> qty was &gt; 0 but operator-entered <em>actual</em> qty is 0 — typically meaning the operator
+      didn't log component consumption, which breaks traceability for QA and unit costing. Pulled live from Cin7's Production
+      Run data, so it catches both operator-entered zeros and lines the inventory-movement report would silently drop.
     </div>
 
     <div id="err-rep-content"></div>
@@ -3394,10 +3396,14 @@ function renderLiveInventory() {
 
 // ── Error Reporting Tab ──────────────────────────────────────────────────────
 //
-// Reads /api/error-reporting/zero-out-mo-bom and renders one card per MO
-// (full reference, including /N batch suffix) that has a BOM-input line with
-// Quantity out = 0 in the trailing-7-day raw-line window. Siblings on the
-// same MO render alongside for operator context.
+// Reads /api/error-reporting/zero-out-mo-bom which surfaces the
+// production_run_errors_t7d blob populated by:
+//   - daily cron at 07:00 UTC, OR
+//   - manual POST /api/cin7/production-runs/sync (Sync now button)
+//
+// Each card = one Production Run (full MO ref incl. /N batch suffix) with at
+// least one component line where ExpectedQuantity > 0 && Quantity === 0.
+// Sibling lines on the same run render alongside for operator context.
 
 async function loadErrorReporting() {
   const meta = document.getElementById('err-rep-meta');
@@ -3418,13 +3424,14 @@ async function loadErrorReporting() {
   if (d.lastSync) {
     const age = Math.round((Date.now() - new Date(d.lastSync).getTime()) / 60000);
     const ageStr = age < 60 ? `${age}m ago` : age < 1440 ? `${Math.round(age/60)}h ago` : `${Math.round(age/1440)}d ago`;
-    meta.textContent = `Window ${d.windowStart} → ${d.windowEnd} · synced ${ageStr} · ${d.totalLines.toLocaleString()} movements scanned`;
+    const failNote = d.detailFailures > 0 ? ` · ${d.detailFailures} fetch failure${d.detailFailures === 1 ? '' : 's'}` : '';
+    meta.textContent = `Window ${d.windowStart} → ${d.windowEnd} · synced ${ageStr} · ${(d.completedRunsScanned || 0).toLocaleString()} completed runs scanned${failNote}`;
   } else {
-    meta.textContent = 'No movement data yet — waiting on first daily ingest';
+    meta.textContent = 'No production-run data yet — click Sync now or wait for the 07:00 UTC cron';
   }
 
   if (!d.flagged || d.flagged.length === 0) {
-    content.innerHTML = `<div style="padding:16px;background:var(--vf-success-soft);border:1px solid var(--vf-success-base);border-radius:var(--vf-radius-sm);color:var(--vf-success-text);font-size:13px;">✓ No zero-utilization BOM inputs detected in the trailing 7 days.</div>`;
+    content.innerHTML = `<div style="padding:16px;background:var(--vf-success-soft);border:1px solid var(--vf-success-base);border-radius:var(--vf-radius-sm);color:var(--vf-success-text);font-size:13px;">✓ No zero-utilization BOM inputs detected in the trailing 7 days of completed production runs.</div>`;
     return;
   }
 
@@ -3432,10 +3439,10 @@ async function loadErrorReporting() {
   const summary = `
     <div style="display:flex;gap:var(--vf-space-3);margin-bottom:var(--vf-space-3);flex-wrap:wrap;">
       <div style="padding:8px 12px;background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:12px;color:var(--vf-danger-text);">
-        <strong>${d.flaggedMoCount}</strong> MO batch${d.flaggedMoCount === 1 ? '' : 'es'} flagged
+        <strong>${d.flaggedRunCount}</strong> production run${d.flaggedRunCount === 1 ? '' : 's'} flagged
       </div>
       <div style="padding:8px 12px;background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:12px;color:var(--vf-danger-text);">
-        <strong>${d.flaggedLineCount}</strong> zero-quantity BOM line${d.flaggedLineCount === 1 ? '' : 's'}
+        <strong>${d.flaggedLineCount}</strong> zero-actual BOM line${d.flaggedLineCount === 1 ? '' : 's'}
       </div>
     </div>`;
 
@@ -3445,22 +3452,28 @@ async function loadErrorReporting() {
     const renderRow = (l, flagged) => `
       <tr${flagged ? ' style="background:var(--vf-danger-soft);"' : ''}>
         <td><span class="mo-id">${escapeHtml(l.sku || '')}</span></td>
-        <td style="font-size:12px;color:var(--vf-text-secondary);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(l.product || '')}">${escapeHtml(l.product || '—')}</td>
+        <td style="font-size:12px;color:var(--vf-text-secondary);max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(l.product || '')}">${escapeHtml(l.product || '—')}</td>
         <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(l.batch || '—')}</td>
-        <td style="font-size:11px;">${escapeHtml(l.type || '—')}</td>
-        <td style="text-align:right;font-variant-numeric:tabular-nums;${flagged ? 'color:var(--vf-danger-text);font-weight:600;' : ''}">${fmtQty(l.qtyOut)}</td>
-        <td style="text-align:right;font-variant-numeric:tabular-nums;">${fmtQty(l.qtyIn)}</td>
+        <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(l.workCenter || '—')}</td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;">${fmtQty(l.expected)}</td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;${flagged ? 'color:var(--vf-danger-text);font-weight:600;' : ''}">${fmtQty(l.actual)}</td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;color:var(--vf-text-tertiary);">${fmtQty(l.wastage)}</td>
+        <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(l.unit || '—')}</td>
       </tr>`;
     const flaggedRows = g.flagged.map(l => renderRow(l, true)).join('');
     const siblingRows = g.siblings.map(l => renderRow(l, false)).join('');
+    const fgLabel = (g.fgSKU || g.fgProduct)
+      ? `<span style="font-size:11px;color:var(--vf-text-secondary);">${escapeHtml(g.fgSKU || '')}${g.fgProduct ? ' · ' + escapeHtml(g.fgProduct) : ''}</span>`
+      : '';
     return `
       <div style="margin-bottom:var(--vf-space-3);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);overflow:hidden;">
         <div style="padding:10px 14px;background:var(--vf-surface-raised);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-          <div style="display:flex;align-items:center;gap:10px;">
-            <strong style="font-size:14px;color:var(--vf-text-primary);">${escapeHtml(g.ref)}</strong>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+            <strong style="font-size:14px;color:var(--vf-text-primary);">${escapeHtml(g.moRef || '')}</strong>
             <span style="font-size:11px;padding:2px 8px;background:var(--vf-danger-soft);color:var(--vf-danger-text);border-radius:10px;">${g.flagged.length} flagged</span>
+            ${fgLabel}
           </div>
-          <span style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(g.date || '—')}</span>
+          <span style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(g.completionDate || '—')}</span>
         </div>
         <table class="status-table" style="margin:0;">
           <thead>
@@ -3468,9 +3481,11 @@ async function loadErrorReporting() {
               <th>SKU</th>
               <th>Product</th>
               <th>Batch #</th>
-              <th>Type</th>
-              <th style="text-align:right;">Qty out</th>
-              <th style="text-align:right;">Qty in</th>
+              <th>Work center</th>
+              <th style="text-align:right;">Required</th>
+              <th style="text-align:right;">Actual</th>
+              <th style="text-align:right;">Wastage</th>
+              <th>Unit</th>
             </tr>
           </thead>
           <tbody>${flaggedRows}${siblingRows}</tbody>
@@ -3479,6 +3494,27 @@ async function loadErrorReporting() {
   }).join('');
 
   content.innerHTML = summary + cards;
+}
+
+// Manual sync trigger — admin and operator+ can use this; takes ~1 minute
+// for a typical week because of Cin7's 60-call-per-minute rate limit.
+async function syncErrorReporting() {
+  const btn = document.getElementById('err-rep-sync-btn');
+  const meta = document.getElementById('err-rep-meta');
+  if (btn) { btn.disabled = true; btn.textContent = 'Syncing…'; }
+  if (meta) meta.textContent = 'Pulling production runs from Cin7 — this can take up to a minute…';
+  try {
+    const r = await fetch('/api/cin7/production-runs/sync', { method: 'POST' });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    await loadErrorReporting();
+  } catch (e) {
+    if (meta) meta.textContent = '';
+    const content = document.getElementById('err-rep-content');
+    if (content) content.innerHTML = `<div style="padding:20px;color:var(--vf-danger-text);background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:13px;">Sync failed: ${escapeHtml(e.message)}</div>`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '↻ Sync now'; }
+  }
 }
 
 // ── MO Status Tab ────────────────────────────────────────────────────────────

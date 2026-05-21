@@ -1696,6 +1696,232 @@ app.get("/api/cin7/product-costs", (req, res) => {
   res.json({ ok: true, ...blob });
 });
 
+// ── Cin7 production-run sync (powers the Error Reporting tab) ───────────────
+//
+// Why: the daily Inventory Movement Details report doesn't emit a row when an
+// operator records 0 consumption on a BOM line — no movement, no record. So
+// the original movement-diff detector couldn't catch the case it was meant
+// to. Production Runs, on the other hand, ALWAYS store both ExpectedQuantity
+// (per BOM) and Quantity (operator-entered actual) on every component line.
+// Comparing those two directly is the right primitive.
+//
+// API used (Cin7 Core v2):
+//   GET /production/orderList?CompletionDateFrom=<today-7d>
+//     → mixed list of Production Orders + Runs (Type field is "O"|"R")
+//   GET /production/order/run?ProductionOrderID=<guid>
+//     → { Runs: [ { Status, Number, Operations: [ { Components: [...] } ] } ] }
+//
+// Component field mapping (counterintuitive — be careful):
+//   Quantity         = ACTUAL consumed (operator entry)
+//   ExpectedQuantity = REQUIRED per BOM
+//   WastageQty       = wastage (treated as legit consumption, not flagged)
+//
+// Flag rule: ExpectedQuantity > 0 AND Quantity === 0. Strict zero on actuals,
+// only when something was expected. Catches both operator-entered zeros and
+// the case where the line never got an actual recorded at all.
+//
+// Rate limit: Cin7 caps at 60 calls/min. We sleep 1100ms between detail
+// calls — a 7-day window with ~50 unique parent orders takes ~1 minute.
+
+const C7_PROD_BASE = "https://inventory.dearsystems.com/ExternalApi/v2";
+const PRODUCTION_RUN_WINDOW_DAYS = 7;
+const PRODUCTION_RUN_RATE_LIMIT_MS = 1100;
+
+function sleepMs(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function fetchProductionOrderList(completionDateFrom) {
+  if (!process.env.CIN7_ACCOUNT_ID || !process.env.CIN7_APPLICATION_KEY) {
+    throw new Error("CIN7_ACCOUNT_ID or CIN7_APPLICATION_KEY environment variable not set");
+  }
+  const all = [];
+  let page = 1;
+  const limit = 200;
+  while (true) {
+    const url = `${C7_PROD_BASE}/production/orderList?Page=${page}&Limit=${limit}&CompletionDateFrom=${completionDateFrom}`;
+    const resp = await fetch(url, { headers: cin7Headers(), redirect: "follow" });
+    const ct = resp.headers.get("content-type") || "";
+    const text = await resp.text().catch(() => "");
+    if (!resp.ok) {
+      throw new Error(`Cin7 productionOrderList ${resp.status} ${resp.statusText} [${ct}]: ${text.slice(0, 300)}`);
+    }
+    let data;
+    try { data = JSON.parse(text); }
+    catch (_) { throw new Error(`Cin7 productionOrderList ${resp.status} non-JSON [${ct}]: ${text.slice(0, 300)}`); }
+    const batch = data.ProductionOrderListItems || [];
+    all.push(...batch);
+    if (batch.length < limit) break;
+    page++;
+    if (page > 50) throw new Error("Cin7 productionOrderList pagination exceeded 50 pages — aborting");
+  }
+  return all;
+}
+
+async function fetchProductionRunDetail(productionOrderID) {
+  const url = `${C7_PROD_BASE}/production/order/run?ProductionOrderID=${encodeURIComponent(productionOrderID)}`;
+  const resp = await fetch(url, { headers: cin7Headers(), redirect: "follow" });
+  const ct = resp.headers.get("content-type") || "";
+  const text = await resp.text().catch(() => "");
+  if (!resp.ok) {
+    throw new Error(`Cin7 productionRun ${resp.status} ${resp.statusText} [${ct}]: ${text.slice(0, 300)}`);
+  }
+  try { return JSON.parse(text); }
+  catch (_) { throw new Error(`Cin7 productionRun ${resp.status} non-JSON [${ct}]: ${text.slice(0, 300)}`); }
+}
+
+async function performProductionRunErrorSync() {
+  const now = new Date();
+  const end = now.toISOString().slice(0, 10);
+  const startD = new Date(now);
+  startD.setUTCDate(startD.getUTCDate() - (PRODUCTION_RUN_WINDOW_DAYS - 1));
+  const start = startD.toISOString().slice(0, 10);
+
+  // 1. List recent activity. The endpoint returns both Production Orders and
+  //    Production Runs (Type=O|R). We only care about COMPLETED runs.
+  const list = await fetchProductionOrderList(start);
+  const completedRunRows = list.filter(it =>
+    it && it.Type === "R" && String(it.Status || "").toUpperCase() === "COMPLETED"
+  );
+
+  // 2. Group by parent ProductionOrderID — one detail call per unique order.
+  //    Track which RunIDs are the completed ones we care about (an order may
+  //    have other runs we should skip).
+  const completedRunsByOrder = new Map();
+  for (const row of completedRunRows) {
+    if (!row.ProductionOrderID || !row.TaskID) continue;
+    if (!completedRunsByOrder.has(row.ProductionOrderID)) {
+      completedRunsByOrder.set(row.ProductionOrderID, {
+        orderNumber: row.OrderNumber || "",
+        runs: new Map(),
+      });
+    }
+    completedRunsByOrder.get(row.ProductionOrderID).runs.set(row.TaskID, {
+      runID: row.TaskID,
+      completionDate: row.CompletionDate ? String(row.CompletionDate).slice(0, 10) : null,
+      productSKU: row.ProductSKU || "",
+      productName: row.ProductName || "",
+      locationName: row.LocationName || "",
+    });
+  }
+
+  // 3. For each unique parent order, fetch run detail. Walk operations →
+  //    components. Flag where ExpectedQuantity > 0 && Quantity === 0.
+  const flagged = [];
+  let detailCallsMade = 0;
+  let detailFailures = 0;
+  const orderIDs = Array.from(completedRunsByOrder.keys());
+
+  for (let i = 0; i < orderIDs.length; i++) {
+    const orderID = orderIDs[i];
+    const orderInfo = completedRunsByOrder.get(orderID);
+    let detail;
+    try {
+      detail = await fetchProductionRunDetail(orderID);
+      detailCallsMade++;
+    } catch (e) {
+      detailFailures++;
+      console.error(`[ProdRunSync] Detail fetch failed for ${orderID} (${orderInfo.orderNumber}):`, e.message);
+      // Throttle even on failure so we don't hammer the rate limit
+      if (i < orderIDs.length - 1) await sleepMs(PRODUCTION_RUN_RATE_LIMIT_MS);
+      continue;
+    }
+
+    const orderNumber = detail.OrderNumber || orderInfo.orderNumber || "";
+    const runs = Array.isArray(detail.Runs) ? detail.Runs : [];
+    for (const run of runs) {
+      const runMeta = orderInfo.runs.get(run.RunID);
+      if (!runMeta) continue; // not one of the completed runs from the list
+      const runNumber = run.Number != null ? String(run.Number) : "";
+      const moRef = orderNumber + (runNumber ? `/${runNumber}` : "");
+
+      // Walk components across all operations on this run
+      const allComponentsOnRun = [];
+      const flaggedOnRun = [];
+      for (const op of (run.Operations || [])) {
+        const workCenter = op.WorkCenterName || op.Name || "";
+        for (const c of (op.Components || [])) {
+          const expected = Number(c.ExpectedQuantity) || 0;
+          const actual = Number(c.Quantity) || 0;
+          const lineRow = {
+            sku: c.ProductCode || "",
+            product: c.ProductName || "",
+            batch: c.BatchSN || "",
+            location: c.LocationName || "",
+            unit: c.Unit || "",
+            expected,
+            actual,
+            wastage: Number(c.WastageQty) || 0,
+            workCenter,
+          };
+          allComponentsOnRun.push(lineRow);
+          if (expected > 0 && actual === 0) flaggedOnRun.push(lineRow);
+        }
+      }
+
+      if (flaggedOnRun.length > 0) {
+        // Sibling lines = all components on the run that aren't themselves flagged
+        const flaggedSet = new Set(flaggedOnRun);
+        const siblings = allComponentsOnRun.filter(l => !flaggedSet.has(l));
+        flagged.push({
+          moRef,
+          orderNumber,
+          runNumber,
+          completionDate: runMeta.completionDate,
+          fgSKU: runMeta.productSKU,
+          fgProduct: runMeta.productName,
+          location: runMeta.locationName,
+          flagged: flaggedOnRun,
+          siblings,
+        });
+      }
+    }
+
+    if (i < orderIDs.length - 1) await sleepMs(PRODUCTION_RUN_RATE_LIMIT_MS);
+  }
+
+  // Sort flagged newest first
+  flagged.sort((a, b) => (b.completionDate || "").localeCompare(a.completionDate || ""));
+
+  const blob = {
+    lastSync: new Date().toISOString(),
+    windowStart: start,
+    windowEnd: end,
+    completedRunsScanned: completedRunRows.length,
+    parentOrdersScanned: orderIDs.length,
+    detailCallsMade,
+    detailFailures,
+    flaggedRunCount: flagged.length,
+    flaggedLineCount: flagged.reduce((s, g) => s + g.flagged.length, 0),
+    flagged,
+  };
+  writeData("production_run_errors_t7d", blob);
+  return blob;
+}
+
+// POST /api/cin7/production-runs/sync — manual trigger (any authed user).
+// Returns the same summary the cron logs. Used by the "Sync now" button on
+// the Error Reporting tab so the user can battle-test without waiting for
+// the 07:00 UTC cron.
+app.post("/api/cin7/production-runs/sync", async (req, res) => {
+  try {
+    const blob = await performProductionRunErrorSync();
+    res.json({
+      ok: true,
+      lastSync: blob.lastSync,
+      windowStart: blob.windowStart,
+      windowEnd: blob.windowEnd,
+      completedRunsScanned: blob.completedRunsScanned,
+      parentOrdersScanned: blob.parentOrdersScanned,
+      detailCallsMade: blob.detailCallsMade,
+      detailFailures: blob.detailFailures,
+      flaggedRunCount: blob.flaggedRunCount,
+      flaggedLineCount: blob.flaggedLineCount,
+    });
+  } catch (e) {
+    console.error("[ProdRunSync] Manual sync error:", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── Cin7 Inventory Movement Details ingest (Apps Script → app webhook) ───────
 //
 // The user's Cin7 daily report drops an XLSX file into a Google Drive folder.
@@ -1746,7 +1972,6 @@ function parseInventoryRows(rows) {
     else if (h === "quantity out" || h === "outbound") colMap.qtyOut = i;
     else if (h === "batch #" || h === "batch_count") colMap.batch = i;
     else if (h === "reference") colMap.reference = i;
-    else if (h === "type" || h === "movement type") colMap.type = i;
   });
   if (colMap.sku === undefined) throw new Error("Missing required column: SKU");
   if (colMap.qtyIn === undefined) throw new Error("Missing required column: Quantity in");
@@ -1758,10 +1983,6 @@ function parseInventoryRows(rows) {
   const rtAgg = {};
   const moMap = new Map();
   const monthSet = new Set();
-  // Raw per-row lines, retained so downstream views (e.g. Error Reporting's
-  // trailing-7-day zero-utilization detector) can flag individual operator
-  // mistakes that aggregate totals would hide.
-  const lines = [];
   const parseNum = s => { if (s == null || s === "") return 0; return parseFloat(String(s).replace(/,/g, "")) || 0; };
   const dateToMonth = d => {
     if (!d) return null;
@@ -1771,17 +1992,6 @@ function parseInventoryRows(rows) {
     if (m) { const mo = mMap[m[2].toLowerCase()]; return mo ? m[3]+"-"+mo : null; }
     m = s.match(/^(\d{4})-(\d{2})/);
     if (m) return m[1]+"-"+m[2];
-    return null;
-  };
-  const dateToISO = d => {
-    if (!d) return null;
-    if (d instanceof Date) return d.toISOString().slice(0, 10);
-    const s = String(d);
-    const mMap = { jan:"01",feb:"02",mar:"03",apr:"04",may:"05",jun:"06",jul:"07",aug:"08",sep:"09",oct:"10",nov:"11",dec:"12" };
-    let m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/);
-    if (m) { const mo = mMap[m[2].toLowerCase()]; return mo ? `${m[3]}-${mo}-${m[1].padStart(2,"0")}` : null; }
-    m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
-    if (m) return `${m[1]}-${m[2]}-${m[3]}`;
     return null;
   };
 
@@ -1830,25 +2040,6 @@ function parseInventoryRows(rows) {
       me.totalIn += inb;
       me.totalOut += outb;
     }
-
-    // Raw line — `ref` keeps the full Cin7 reference including the /N batch
-    // suffix (e.g. "MO-00774/3") even though moMap above strips it.
-    const typeStr = colMap.type !== undefined ? String(f[colMap.type] || "").trim() : "";
-    const isoDate = colMap.date !== undefined ? dateToISO(f[colMap.date]) : null;
-    lines.push({
-      date: isoDate || "",
-      month,
-      sku,
-      product: prod,
-      category: cat,
-      unit,
-      batch,
-      ref,
-      refType: rt,
-      type: typeStr,
-      qtyIn: inb,
-      qtyOut: outb,
-    });
   }
   for (const [sku, entry] of skuMap) entry.bc = batchSets.get(sku).size;
   const months = [...monthSet].sort();
@@ -1861,7 +2052,6 @@ function parseInventoryRows(rows) {
     months,
     rowCount,
     moMovements: Object.fromEntries(moMap),
-    lines,
   };
 }
 
@@ -2004,34 +2194,6 @@ app.post("/api/cin7/inventory-movements", async (req, res) => {
     };
     writeData("inventory", finalData);
 
-    // ── Trailing 7-day raw-line snapshot ────────────────────────────────────
-    // Persist the most recent 7 days of raw movement lines so the Error
-    // Reporting tab can flag per-batch anomalies (e.g. operator-entered
-    // qtyOut=0 on a BOM input line) that aggregate totals would hide.
-    // Window is computed from max(date) in the file rather than wall clock
-    // so the result is deterministic when files arrive late.
-    try {
-      const allLines = parsed.lines || [];
-      const dates = allLines.map(l => l.date).filter(Boolean).sort();
-      if (dates.length > 0) {
-        const windowEnd = dates[dates.length - 1];
-        const endD = new Date(windowEnd + "T00:00:00Z");
-        endD.setUTCDate(endD.getUTCDate() - 6); // inclusive 7-day window: [end-6 .. end]
-        const windowStart = endD.toISOString().slice(0, 10);
-        const t7dLines = allLines.filter(l => l.date && l.date >= windowStart);
-        writeData("movements_t7d", {
-          lastSync: finalData.lastSync,
-          sourceFile: filename || null,
-          windowStart,
-          windowEnd,
-          lineCount: t7dLines.length,
-          lines: t7dLines,
-        });
-      }
-    } catch (e) {
-      console.error("[gdrive-sync] movements_t7d write failed:", e.message);
-    }
-
     console.log(`[gdrive-sync] Ingested ${filename || "(unnamed)"} — ${parsed.rowCount} rows · ${parsed.invSku.length} new-window SKUs · ${Object.keys(parsed.moMovements).length} new-window MOs · merged total: ${finalData.invSku.length} SKUs · ${Object.keys(finalData.moMovements).length} MOs`);
     res.json({
       ok: true,
@@ -2051,72 +2213,43 @@ app.post("/api/cin7/inventory-movements", async (req, res) => {
   }
 });
 
-// ── Error Reporting: trailing-7-day MO BOM-input zero-utilization detector ──
+// ── Error Reporting: trailing-7-day production-run zero-actual detector ─────
 //
-// Flags any raw movement line where:
-//   - Reference matches /MO-/
-//   - Type === "Out"        (i.e. should consume a component)
-//   - Quantity out === 0    (operator logged zero — breaks traceability & costing)
+// Reads the production_run_errors_t7d blob (populated by the 07:00 UTC cron
+// or the manual Sync now button). The detection is done in the sync function
+// — this endpoint just serves the precomputed result.
 //
-// Grouped by the FULL Cin7 reference (e.g. "MO-00774/3") to keep per-batch
-// granularity. Sibling lines on the same MO reference are returned alongside
-// so the operator-facing view can show the context (what *did* post on that MO).
+// Grouped by full MO reference (e.g. "MO-00774/3") to keep per-batch
+// granularity. Sibling lines (other components on the same run) are returned
+// for context.
 app.get("/api/error-reporting/zero-out-mo-bom", (req, res) => {
-  const blob = readData("movements_t7d");
-  if (!blob || !Array.isArray(blob.lines)) {
+  const blob = readData("production_run_errors_t7d");
+  if (!blob || !Array.isArray(blob.flagged)) {
     return res.json({
       ok: true,
       lastSync: null,
       windowStart: null,
       windowEnd: null,
-      sourceFile: null,
-      totalLines: 0,
-      flaggedMoCount: 0,
+      completedRunsScanned: 0,
+      parentOrdersScanned: 0,
+      detailFailures: 0,
+      flaggedRunCount: 0,
       flaggedLineCount: 0,
       flagged: [],
     });
   }
-
-  const moRegex = /MO-\d+/;
-  const isOut = t => String(t || "").trim().toLowerCase() === "out";
-
-  // Pass 1: identify which MO references have at least one zero-out flag
-  const flaggedMoSet = new Set();
-  for (const l of blob.lines) {
-    if (l.ref && moRegex.test(l.ref) && isOut(l.type) && Number(l.qtyOut) === 0) {
-      flaggedMoSet.add(l.ref);
-    }
-  }
-
-  // Pass 2: group all lines on those references into flagged vs siblings
-  const groups = new Map();
-  for (const mo of flaggedMoSet) {
-    groups.set(mo, { ref: mo, date: null, flagged: [], siblings: [] });
-  }
-  let flaggedLineCount = 0;
-  for (const l of blob.lines) {
-    if (!l.ref || !flaggedMoSet.has(l.ref)) continue;
-    const g = groups.get(l.ref);
-    const isFlagged = isOut(l.type) && Number(l.qtyOut) === 0;
-    if (isFlagged) { g.flagged.push(l); flaggedLineCount++; }
-    else g.siblings.push(l);
-    if (l.date && (!g.date || l.date < g.date)) g.date = l.date;
-  }
-
-  // Sort flagged MOs newest first
-  const flagged = Array.from(groups.values())
-    .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
 
   res.json({
     ok: true,
     lastSync: blob.lastSync || null,
     windowStart: blob.windowStart || null,
     windowEnd: blob.windowEnd || null,
-    sourceFile: blob.sourceFile || null,
-    totalLines: blob.lines.length,
-    flaggedMoCount: flagged.length,
-    flaggedLineCount,
-    flagged,
+    completedRunsScanned: blob.completedRunsScanned || 0,
+    parentOrdersScanned: blob.parentOrdersScanned || 0,
+    detailFailures: blob.detailFailures || 0,
+    flaggedRunCount: blob.flaggedRunCount || 0,
+    flaggedLineCount: blob.flaggedLineCount || 0,
+    flagged: blob.flagged,
   });
 });
 
@@ -2537,6 +2670,20 @@ if (process.env.CIN7_ACCOUNT_ID && process.env.CIN7_APPLICATION_KEY) {
     }
   });
   console.log("[Cin7 Costs] Nightly sync scheduled at 06:45 UTC");
+
+  // Production-run error sync — flags BOM input lines with actual=0 across
+  // completed runs in the trailing 7 days. Runs after on-hand + costs so we
+  // don't compete with them for the 60/min Cin7 rate budget.
+  cron.schedule("0 7 * * *", async () => {
+    console.log("[ProdRunSync] Nightly sync starting…");
+    try {
+      const s = await performProductionRunErrorSync();
+      console.log(`[ProdRunSync] Sync done — ${s.completedRunsScanned} completed runs in window, ${s.parentOrdersScanned} parent orders fetched (${s.detailFailures} failures), ${s.flaggedRunCount} runs flagged with ${s.flaggedLineCount} zero-actual lines`);
+    } catch (e) {
+      console.error("[ProdRunSync] Nightly sync failed:", e.message);
+    }
+  });
+  console.log("[ProdRunSync] Nightly sync scheduled at 07:00 UTC");
 }
 
 // ── MRP Phase 3: requirements engine ─────────────────────────────────────────
