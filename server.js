@@ -1777,10 +1777,36 @@ async function performProductionRunSync() {
 
   // 1. List recent activity. The endpoint returns both Production Orders and
   //    Production Runs (Type=O|R). We only care about COMPLETED runs.
+  //
+  // Status-field gotcha: the spec's example shows both `Status` (DRAFT,
+  // AUTHORIZED, RELEASED, VOIDED) and `OrderStatus` (DRAFT, PLANNED,
+  // RELEASED, IN PROGRESS, COMPLETED, VOIDED) on each list row. For Runs,
+  // the field semantics aren't explicitly documented — checking BOTH for
+  // "COMPLETED" is the safe move.
   const list = await fetchProductionOrderList(start);
-  const completedRunRows = list.filter(it =>
-    it && it.Type === "R" && String(it.Status || "").toUpperCase() === "COMPLETED"
-  );
+
+  // Diagnostic counts — show up in Railway logs so we can see what the
+  // tenant's data actually looks like if filtering misses things.
+  const typeCounts = {};
+  const statusCounts = {};
+  const orderStatusCounts = {};
+  for (const it of list) {
+    if (!it) continue;
+    const t = it.Type || "?";
+    typeCounts[t] = (typeCounts[t] || 0) + 1;
+    const s = (it.Status || "(blank)");
+    statusCounts[s] = (statusCounts[s] || 0) + 1;
+    const os = (it.OrderStatus || "(blank)");
+    orderStatusCounts[os] = (orderStatusCounts[os] || 0) + 1;
+  }
+  console.log(`[ProdRunSync] List response: ${list.length} rows · Types ${JSON.stringify(typeCounts)} · Status ${JSON.stringify(statusCounts)} · OrderStatus ${JSON.stringify(orderStatusCounts)}`);
+
+  const isCompletedRow = it => {
+    const s = String(it.Status || "").toUpperCase();
+    const os = String(it.OrderStatus || "").toUpperCase();
+    return s === "COMPLETED" || os === "COMPLETED";
+  };
+  const completedRunRows = list.filter(it => it && it.Type === "R" && isCompletedRow(it));
 
   // 2. Group by parent ProductionOrderID — one detail call per unique order.
   //    Track which RunIDs are the completed ones we care about (an order may
@@ -1940,6 +1966,10 @@ async function performProductionRunSync() {
     lastSync: new Date().toISOString(),
     windowStart: start,
     windowEnd: end,
+    listRowCount: list.length,
+    listTypeCounts: typeCounts,
+    listStatusCounts: statusCounts,
+    listOrderStatusCounts: orderStatusCounts,
     completedRunsScanned: completedRunRows.length,
     parentOrdersScanned: orderIDs.length,
     detailCallsMade,
@@ -1969,6 +1999,10 @@ app.post("/api/cin7/production-runs/sync", async (req, res) => {
       lastSync: blob.lastSync,
       windowStart: blob.windowStart,
       windowEnd: blob.windowEnd,
+      listRowCount: blob.listRowCount,
+      listTypeCounts: blob.listTypeCounts,
+      listStatusCounts: blob.listStatusCounts,
+      listOrderStatusCounts: blob.listOrderStatusCounts,
       completedRunsScanned: blob.completedRunsScanned,
       parentOrdersScanned: blob.parentOrdersScanned,
       detailCallsMade: blob.detailCallsMade,
@@ -2439,6 +2473,14 @@ app.get("/api/production-output/last-7d", (req, res) => {
     runCount: blob.allCompletedRuns.length,
     byCategory,
     byWorkCenter,
+    // Diagnostic info so the tab can surface "the sync ran but the filter
+    // dropped everything" cases without needing Railway log access.
+    listRowCount: blob.listRowCount || 0,
+    listTypeCounts: blob.listTypeCounts || {},
+    listStatusCounts: blob.listStatusCounts || {},
+    listOrderStatusCounts: blob.listOrderStatusCounts || {},
+    completedRunsScanned: blob.completedRunsScanned || 0,
+    parentOrdersScanned: blob.parentOrdersScanned || 0,
   });
 });
 

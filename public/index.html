@@ -3661,7 +3661,24 @@ async function loadProductionOutput() {
   }
 
   if (!d.byCategory || d.byCategory.length === 0) {
-    content.innerHTML = `<div style="padding:16px;background:var(--vf-surface-raised);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);color:var(--vf-text-secondary);font-size:13px;">No completed production runs in the last 7 days.</div>`;
+    // Build a diagnostic block so we can tell "no production happened" apart
+    // from "filter dropped everything" — shows what Cin7 actually returned.
+    const fmtCounts = obj => {
+      const entries = Object.entries(obj || {});
+      if (entries.length === 0) return '<em>none</em>';
+      return entries.map(([k, v]) => `<code>${escapeHtml(k)}: ${v}</code>`).join(' · ');
+    };
+    const diag = `
+      <div style="margin-top:var(--vf-space-3);padding:14px 16px;background:var(--vf-surface-sunken);border:1px dashed var(--vf-border-default);border-radius:var(--vf-radius-sm);font-size:12px;color:var(--vf-text-secondary);">
+        <strong style="color:var(--vf-text-primary);">Sync diagnostics</strong><br>
+        Cin7 list returned <strong>${(d.listRowCount || 0).toLocaleString()}</strong> rows for window
+        <code>${escapeHtml(d.windowStart || '—')}</code> → <code>${escapeHtml(d.windowEnd || '—')}</code>.<br>
+        <span style="display:inline-block;margin-top:6px;">Type counts: ${fmtCounts(d.listTypeCounts)}</span><br>
+        <span>Status counts: ${fmtCounts(d.listStatusCounts)}</span><br>
+        <span>OrderStatus counts: ${fmtCounts(d.listOrderStatusCounts)}</span><br>
+        <span style="display:inline-block;margin-top:6px;">Filter matched <strong>${d.completedRunsScanned || 0}</strong> completed runs across <strong>${d.parentOrdersScanned || 0}</strong> parent orders.</span>
+      </div>`;
+    content.innerHTML = `<div style="padding:16px;background:var(--vf-surface-raised);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);color:var(--vf-text-secondary);font-size:13px;">No completed production runs in the last 7 days.</div>${diag}`;
     return;
   }
 
