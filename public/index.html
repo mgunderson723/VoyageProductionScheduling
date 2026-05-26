@@ -854,6 +854,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
     <button class="tab" onclick="switchTab('mo-status')">MO Status</button>
     <button class="tab" onclick="switchTab('live-inv')">Live Inventory</button>
     <button class="tab" onclick="switchTab('error-reporting')">Error reporting</button>
+    <button class="tab" onclick="switchTab('production-output')">Production output</button>
     <button class="tab" onclick="switchTab('mrp')" id="tab-mrp-btn" style="display:none;">MRP</button>
     <button class="tab" onclick="switchTab('mrp-setup')" id="tab-mrp-setup-btn" style="display:none;">MRP Setup</button>
     <button class="tab" onclick="switchTab('admin')" id="tab-admin-btn" style="display:none;">Admin console</button>
@@ -1055,6 +1056,28 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
     </div>
 
     <div id="err-rep-content"></div>
+  </div>
+
+  <!-- PRODUCTION OUTPUT — trailing-7-day "what did we produce" feed -->
+  <div id="tab-production-output" style="display:none;">
+    <div class="header">
+      <div style="display:flex;align-items:center;gap:var(--vf-space-3);flex-wrap:wrap;">
+        <h2>Production output</h2>
+        <span id="prod-out-meta" style="font-size:var(--vf-text-sm);color:var(--vf-text-tertiary);"></span>
+      </div>
+      <div style="display:flex;gap:var(--vf-space-2);align-items:center;">
+        <button class="btn btn-sm" onclick="loadProductionOutput()">⟳ Refresh</button>
+        <button class="btn btn-sm" id="prod-out-sync-btn" onclick="syncProductionOutput()">↻ Sync now</button>
+      </div>
+    </div>
+
+    <div style="font-size:var(--vf-text-sm);color:var(--vf-text-secondary);margin:var(--vf-space-2) 0 var(--vf-space-3);max-width:820px;">
+      Trailing 7 days of completed production runs grouped by product category. Pulled from Cin7's
+      Production Run API so transfers and stock adjustments are excluded — only what came out of
+      manufacturing operations. Shares the same daily sync as the Error reporting tab.
+    </div>
+
+    <div id="prod-out-content"></div>
   </div>
 
   <!-- MRP — operator+ — production-plan-driven material requirements -->
@@ -2195,10 +2218,10 @@ function switchTab(t){
   if(t==='admin'&&(!currentUser||currentUser.role!=='admin'))return;
   if(t==='mrp-setup'&&(!currentUser||currentUser.role!=='admin'))return;
   if(t==='mrp'&&(!currentUser||currentUser.role==='viewer'))return;
-  ['calendar','orders','capacity','traceability','mo-status','live-inv','error-reporting','mrp','mrp-setup','admin'].forEach(k=>{document.getElementById('tab-'+k).style.display=k===t?'':'none';});
+  ['calendar','orders','capacity','traceability','mo-status','live-inv','error-reporting','production-output','mrp','mrp-setup','admin'].forEach(k=>{document.getElementById('tab-'+k).style.display=k===t?'':'none';});
   document.querySelectorAll('.tab').forEach(el=>{
     const tabName=el.textContent.trim().toLowerCase();
-    const map={'calendar':'calendar','work orders':'orders','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','mo status':'mo-status','live inventory':'live-inv','error reporting':'error-reporting','mrp':'mrp','mrp setup':'mrp-setup','admin console':'admin'};
+    const map={'calendar':'calendar','work orders':'orders','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','mo status':'mo-status','live inventory':'live-inv','error reporting':'error-reporting','production output':'production-output','mrp':'mrp','mrp setup':'mrp-setup','admin console':'admin'};
     el.classList.toggle('active',map[tabName]===t);
   });
   if(t==='calendar')renderCal();
@@ -2208,6 +2231,7 @@ function switchTab(t){
   if(t==='mo-status'){populateMOStatusMachineFilter();renderMOStatus();loadSyncStatus();}
   if(t==='live-inv')loadLiveInventory();
   if(t==='error-reporting')loadErrorReporting();
+  if(t==='production-output')loadProductionOutput();
   if(t==='mrp-setup')loadMrpSetup();
   if(t==='mrp')loadMrp();
 }
@@ -3601,6 +3625,139 @@ async function syncErrorReporting() {
   } catch (e) {
     if (meta) meta.textContent = '';
     const content = document.getElementById('err-rep-content');
+    if (content) content.innerHTML = `<div style="padding:20px;color:var(--vf-danger-text);background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:13px;">Sync failed: ${escapeHtml(e.message)}</div>`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '↻ Sync now'; }
+  }
+}
+
+// ── Production Output Tab ────────────────────────────────────────────────────
+//
+// Reads /api/production-output/last-7d (same blob as Error Reporting,
+// different slice). Renders sections grouped by product category, each
+// with a header showing the 7-day total + breakdown, then per-MO rows.
+
+async function loadProductionOutput() {
+  const meta = document.getElementById('prod-out-meta');
+  const content = document.getElementById('prod-out-content');
+  content.innerHTML = '<div style="padding:20px;color:var(--vf-text-tertiary);font-size:13px;">Loading…</div>';
+  let d;
+  try {
+    const r = await fetch('/api/production-output/last-7d');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    d = await r.json();
+    if (!d.ok) throw new Error(d.error || 'unknown');
+  } catch (e) {
+    content.innerHTML = `<div style="padding:20px;color:var(--vf-danger-text);background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:13px;">Failed to load: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+
+  if (d.lastSync) {
+    const age = Math.round((Date.now() - new Date(d.lastSync).getTime()) / 60000);
+    const ageStr = age < 60 ? `${age}m ago` : age < 1440 ? `${Math.round(age/60)}h ago` : `${Math.round(age/1440)}d ago`;
+    meta.textContent = `Window ${d.windowStart} → ${d.windowEnd} · synced ${ageStr} · ${(d.runCount || 0).toLocaleString()} completed runs`;
+  } else {
+    meta.textContent = 'No production-run data yet — click Sync now or wait for the 07:00 UTC cron';
+  }
+
+  if (!d.byCategory || d.byCategory.length === 0) {
+    content.innerHTML = `<div style="padding:16px;background:var(--vf-surface-raised);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);color:var(--vf-text-secondary);font-size:13px;">No completed production runs in the last 7 days.</div>`;
+    return;
+  }
+
+  const fmtQty = q => (q == null) ? '—' : Number(q).toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+  // Helper to format the totalsByUnit object as "5,210 kg · 14,000 Each"
+  const fmtUnits = totalsByUnit => {
+    const entries = Object.entries(totalsByUnit || {})
+      .filter(([_, v]) => v > 0)
+      .sort((a, b) => b[1] - a[1]);
+    if (entries.length === 0) return '—';
+    return entries.map(([u, v]) => `${fmtQty(v)} ${u}`).join(' · ');
+  };
+
+  // KPI strip — total produced + work-center breakdown pills
+  const kpiTotal = `
+    <div style="padding:12px 16px;background:var(--vf-surface-raised);border-radius:var(--vf-radius-sm);border-left:3px solid var(--vf-brand-orange);">
+      <div style="font-size:11px;color:var(--vf-text-tertiary);text-transform:uppercase;letter-spacing:0.4px;">Total produced (7d)</div>
+      <div style="font-size:22px;font-weight:600;color:var(--vf-text-primary);font-variant-numeric:tabular-nums;margin-top:2px;">${fmtUnits(d.totalsByUnit)}</div>
+    </div>`;
+
+  const wcPills = (d.byWorkCenter || []).slice(0, 8).map(wc => `
+    <div style="padding:10px 14px;background:var(--vf-surface-raised);border-radius:var(--vf-radius-sm);border-left:3px solid var(--vf-cat-teal-base);min-width:140px;">
+      <div style="font-size:11px;color:var(--vf-text-tertiary);text-transform:uppercase;letter-spacing:0.4px;">${escapeHtml(wc.workCenter || '—')}</div>
+      <div style="font-size:14px;font-weight:600;color:var(--vf-text-primary);font-variant-numeric:tabular-nums;margin-top:2px;">${fmtUnits(wc.totalsByUnit)}</div>
+    </div>`).join('');
+
+  const kpiStrip = `
+    <div style="display:flex;gap:var(--vf-space-3);margin-bottom:var(--vf-space-4);flex-wrap:wrap;">
+      ${kpiTotal}
+      ${wcPills}
+    </div>`;
+
+  // Per-category sections
+  const categoryColors = ['var(--vf-cat-blue-base)','var(--vf-cat-green-base)','var(--vf-cat-purple-base)','var(--vf-cat-orange-base)','var(--vf-cat-teal-base)'];
+  const sections = d.byCategory.map((cat, idx) => {
+    const color = categoryColors[idx % categoryColors.length];
+    const runRows = (cat.runs || []).map(r => {
+      // If the run had multiple outputs in this category, show them as a comma-joined list
+      const outputList = (r.outputs && r.outputs.length > 0)
+        ? r.outputs.map(o => `${escapeHtml(o.sku || '')} · ${fmtQty(o.qty)} ${escapeHtml(o.unit || '')}`).join('<br>')
+        : `<span style="color:var(--vf-text-tertiary);">No output recorded</span>`;
+      return `
+        <tr>
+          <td style="font-family:var(--vf-font-mono);font-size:12px;font-weight:500;">${escapeHtml(r.moRef || '')}</td>
+          <td style="font-size:12px;color:var(--vf-text-secondary);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(r.fgProduct || '')}">${escapeHtml(r.fgProduct || '—')}</td>
+          <td style="font-size:12px;">${outputList}</td>
+          <td style="text-align:right;font-variant-numeric:tabular-nums;font-weight:500;">${fmtQty(r.qty)} <span style="color:var(--vf-text-tertiary);font-size:11px;font-weight:400;">${escapeHtml(r.unit || '')}</span></td>
+          <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(r.workCenter || '—')}</td>
+          <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(r.completionDate || '—')}</td>
+        </tr>`;
+    }).join('');
+
+    return `
+      <div style="margin-bottom:var(--vf-space-4);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);overflow:hidden;">
+        <div style="padding:12px 16px;background:var(--vf-surface-raised);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;border-left:4px solid ${color};">
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+            <strong style="font-size:16px;color:var(--vf-text-primary);">${escapeHtml(cat.category || 'Other')}</strong>
+            <span style="font-size:11px;padding:2px 8px;background:var(--vf-surface-sunken);color:var(--vf-text-secondary);border-radius:10px;">${cat.runs.length} run${cat.runs.length === 1 ? '' : 's'}</span>
+          </div>
+          <div style="font-size:14px;font-weight:600;color:var(--vf-text-primary);font-variant-numeric:tabular-nums;">${fmtUnits(cat.totalsByUnit)}</div>
+        </div>
+        <table class="status-table" style="margin:0;">
+          <thead>
+            <tr>
+              <th>MO #</th>
+              <th>Finished good</th>
+              <th>Output detail</th>
+              <th style="text-align:right;">Qty</th>
+              <th>Work center</th>
+              <th>Completed</th>
+            </tr>
+          </thead>
+          <tbody>${runRows}</tbody>
+        </table>
+      </div>`;
+  }).join('');
+
+  content.innerHTML = kpiStrip + sections;
+}
+
+async function syncProductionOutput() {
+  // Production output reads from the same blob the Error Reporting sync
+  // populates — so we hit the same endpoint and then re-render both views.
+  const btn = document.getElementById('prod-out-sync-btn');
+  const meta = document.getElementById('prod-out-meta');
+  if (btn) { btn.disabled = true; btn.textContent = 'Syncing…'; }
+  if (meta) meta.textContent = 'Pulling production runs from Cin7 — this can take up to a minute…';
+  try {
+    const r = await fetch('/api/cin7/production-runs/sync', { method: 'POST' });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    await loadProductionOutput();
+  } catch (e) {
+    if (meta) meta.textContent = '';
+    const content = document.getElementById('prod-out-content');
     if (content) content.innerHTML = `<div style="padding:20px;color:var(--vf-danger-text);background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:13px;">Sync failed: ${escapeHtml(e.message)}</div>`;
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '↻ Sync now'; }

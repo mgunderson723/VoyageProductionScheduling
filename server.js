@@ -1768,7 +1768,7 @@ async function fetchProductionRunDetail(productionOrderID) {
   catch (_) { throw new Error(`Cin7 productionRun ${resp.status} non-JSON [${ct}]: ${text.slice(0, 300)}`); }
 }
 
-async function performProductionRunErrorSync() {
+async function performProductionRunSync() {
   const now = new Date();
   const end = now.toISOString().slice(0, 10);
   const startD = new Date(now);
@@ -1803,9 +1803,21 @@ async function performProductionRunErrorSync() {
     });
   }
 
+  // Product-category lookup so the Production Output tab can group by
+  // Voyage's product families (Chocolate / Coffee / Spreads / ...). The
+  // product_costs cache mirrors Cin7's per-product Category string. Runs
+  // whose FG SKU isn't in the cache fall through to "Other".
+  const costsBlob = readData("product_costs") || { bySku: {} };
+  const categoryOf = sku => {
+    const c = costsBlob.bySku && costsBlob.bySku[sku];
+    return (c && c.category) ? c.category : "Other";
+  };
+
   // 3. For each unique parent order, fetch run detail. Walk operations →
-  //    components. Flag where ExpectedQuantity > 0 && Quantity === 0.
+  //    components (for the Error Reporting flagged-line detector) AND the
+  //    Run.Output[] array (for the Production Output tab's actuals view).
   const flagged = [];
+  const allCompletedRuns = [];
   let detailCallsMade = 0;
   let detailFailures = 0;
   const orderIDs = Array.from(completedRunsByOrder.keys());
@@ -1833,11 +1845,13 @@ async function performProductionRunErrorSync() {
       const runNumber = run.Number != null ? String(run.Number) : "";
       const moRef = orderNumber + (runNumber ? `/${runNumber}` : "");
 
-      // Walk components across all operations on this run
+      // Walk components across all operations on this run (Error Reporting path)
       const allComponentsOnRun = [];
       const flaggedOnRun = [];
+      const workCentersSeen = [];
       for (const op of (run.Operations || [])) {
         const workCenter = op.WorkCenterName || op.Name || "";
+        if (workCenter && !workCentersSeen.includes(workCenter)) workCentersSeen.push(workCenter);
         for (const c of (op.Components || [])) {
           const expected = Number(c.ExpectedQuantity) || 0;
           const actual = Number(c.Quantity) || 0;
@@ -1873,13 +1887,54 @@ async function performProductionRunErrorSync() {
           siblings,
         });
       }
+
+      // Production Output path — collect what was actually finished on this run.
+      // Run.Output[] is the canonical "finished products that landed in stock"
+      // list (vs Operations[].OutputProducts which can double-count intermediate
+      // products). Multiple outputs per run are possible for multi-output BOMs;
+      // we keep them as separate rows. Work-center attribution is the LAST
+      // operation in the sequence, since that's where the FG is realized.
+      const outputs = Array.isArray(run.Output) ? run.Output : [];
+      const lastWorkCenter = workCentersSeen.length ? workCentersSeen[workCentersSeen.length - 1] : "";
+      const outputRows = outputs.map(o => {
+        const sku = o.ProductCode || "";
+        return {
+          sku,
+          product: o.ProductName || "",
+          category: categoryOf(sku),
+          qty: Number(o.Quantity) || 0,
+          wastage: Number(o.WastageQuantity) || 0,
+          unit: o.Unit || "",
+          batch: o.BatchSN || "",
+          location: o.LocationName || runMeta.locationName || "",
+        };
+      });
+      const runOutputQty = outputRows.reduce((s, r) => s + r.qty, 0);
+
+      // Include the run even if Output[] is empty so a row exists in the feed;
+      // the FG-from-list metadata gives us at least the planned SKU/name.
+      allCompletedRuns.push({
+        moRef,
+        orderNumber,
+        runNumber,
+        completionDate: runMeta.completionDate,
+        fgSKU: runMeta.productSKU,
+        fgProduct: runMeta.productName,
+        fgCategory: categoryOf(runMeta.productSKU),
+        location: runMeta.locationName,
+        workCenter: lastWorkCenter,
+        workCenters: workCentersSeen,
+        outputs: outputRows,
+        outputQty: runOutputQty,
+      });
     }
 
     if (i < orderIDs.length - 1) await sleepMs(PRODUCTION_RUN_RATE_LIMIT_MS);
   }
 
-  // Sort flagged newest first
+  // Sort both feeds newest first
   flagged.sort((a, b) => (b.completionDate || "").localeCompare(a.completionDate || ""));
+  allCompletedRuns.sort((a, b) => (b.completionDate || "").localeCompare(a.completionDate || ""));
 
   const blob = {
     lastSync: new Date().toISOString(),
@@ -1892,10 +1947,15 @@ async function performProductionRunErrorSync() {
     flaggedRunCount: flagged.length,
     flaggedLineCount: flagged.reduce((s, g) => s + g.flagged.length, 0),
     flagged,
+    allCompletedRuns,
   };
   writeData("production_run_errors_t7d", blob);
   return blob;
 }
+
+// Back-compat alias — old name still used by the cron + manual-sync endpoint
+// callers. The function body now also populates the Production Output feed.
+const performProductionRunErrorSync = performProductionRunSync;
 
 // POST /api/cin7/production-runs/sync — manual trigger (any authed user).
 // Returns the same summary the cron logs. Used by the "Sync now" button on
@@ -2250,6 +2310,135 @@ app.get("/api/error-reporting/zero-out-mo-bom", (req, res) => {
     flaggedRunCount: blob.flaggedRunCount || 0,
     flaggedLineCount: blob.flaggedLineCount || 0,
     flagged: blob.flagged,
+  });
+});
+
+// ── Production Output: trailing-7-day "what did we produce" feed ────────────
+//
+// Same source blob as the Error Reporting endpoint above — populated by the
+// shared 07:00 UTC cron / Sync now button. This endpoint serves the
+// allCompletedRuns[] slice, rolled up by product category for the
+// Production output tab.
+//
+// Response shape:
+//   {
+//     ok, lastSync, windowStart, windowEnd,
+//     totalQty:        sum across all outputs (treat units as 'kg' for headline KPI),
+//     totalsByUnit:    { kg: 5210, Each: 14000, ... } — for the truthful breakdown
+//     runCount:        number of completed runs in the window
+//     byCategory:      [ { category, totalQty, unit, runs: [{moRef, fgSKU, fgProduct, qty, completionDate, workCenter, outputs:[...]}] } ]
+//     byWorkCenter:    [ { workCenter, totalQty, unit } ]
+//   }
+app.get("/api/production-output/last-7d", (req, res) => {
+  const blob = readData("production_run_errors_t7d");
+  if (!blob || !Array.isArray(blob.allCompletedRuns)) {
+    return res.json({
+      ok: true,
+      lastSync: null,
+      windowStart: null,
+      windowEnd: null,
+      totalQty: 0,
+      totalsByUnit: {},
+      runCount: 0,
+      byCategory: [],
+      byWorkCenter: [],
+    });
+  }
+
+  // Category rollup. Each run contributes its outputs to a category bucket.
+  // Multiple FG SKUs in one run can land in different categories — we honor
+  // each output's individual category (vs the run-level fgCategory which is
+  // just the headline product).
+  const catMap = new Map();   // category → { category, totalQty, totalsByUnit, runs: [] }
+  const wcMap = new Map();    // workCenter → { workCenter, totalQty, totalsByUnit }
+  const totalsByUnit = {};
+  let totalQty = 0;
+
+  const ensureCat = name => {
+    if (!catMap.has(name)) catMap.set(name, { category: name, totalQty: 0, totalsByUnit: {}, runs: [] });
+    return catMap.get(name);
+  };
+  const ensureWc = name => {
+    if (!wcMap.has(name)) wcMap.set(name, { workCenter: name, totalQty: 0, totalsByUnit: {} });
+    return wcMap.get(name);
+  };
+
+  for (const run of blob.allCompletedRuns) {
+    const outputs = Array.isArray(run.outputs) ? run.outputs : [];
+    // If a run has multiple outputs, they may be in different categories.
+    // Group them by category for the per-run rendering.
+    const outputsByCat = new Map();
+    for (const o of outputs) {
+      const cat = o.category || run.fgCategory || "Other";
+      if (!outputsByCat.has(cat)) outputsByCat.set(cat, []);
+      outputsByCat.get(cat).push(o);
+      // Accumulate cross-totals
+      totalQty += o.qty;
+      totalsByUnit[o.unit || "(no unit)"] = (totalsByUnit[o.unit || "(no unit)"] || 0) + o.qty;
+      const cBucket = ensureCat(cat);
+      cBucket.totalQty += o.qty;
+      cBucket.totalsByUnit[o.unit || "(no unit)"] = (cBucket.totalsByUnit[o.unit || "(no unit)"] || 0) + o.qty;
+    }
+    // Work-center attribution: run-level (last operation), as built in sync.
+    const wcName = run.workCenter || "(unattributed)";
+    const wcBucket = ensureWc(wcName);
+    const runQty = outputs.reduce((s, o) => s + o.qty, 0);
+    wcBucket.totalQty += runQty;
+    // Attribute units proportionally to the dominant unit on the run
+    for (const o of outputs) {
+      wcBucket.totalsByUnit[o.unit || "(no unit)"] = (wcBucket.totalsByUnit[o.unit || "(no unit)"] || 0) + o.qty;
+    }
+
+    // Emit per-category run rows. If a run had no outputs at all, still emit
+    // a single row under its FG's category so the feed isn't lossy.
+    if (outputs.length === 0) {
+      const cat = run.fgCategory || "Other";
+      ensureCat(cat).runs.push({
+        moRef: run.moRef,
+        completionDate: run.completionDate,
+        fgSKU: run.fgSKU,
+        fgProduct: run.fgProduct,
+        workCenter: run.workCenter,
+        location: run.location,
+        qty: 0,
+        unit: "",
+        outputs: [],
+      });
+    } else {
+      for (const [cat, catOutputs] of outputsByCat) {
+        const catQty = catOutputs.reduce((s, o) => s + o.qty, 0);
+        const dominantUnit = catOutputs.length === 1 ? catOutputs[0].unit
+          : (catOutputs.reduce((a, b) => a.qty >= b.qty ? a : b)).unit || "";
+        ensureCat(cat).runs.push({
+          moRef: run.moRef,
+          completionDate: run.completionDate,
+          fgSKU: run.fgSKU,
+          fgProduct: run.fgProduct,
+          workCenter: run.workCenter,
+          location: run.location,
+          qty: catQty,
+          unit: dominantUnit,
+          outputs: catOutputs,
+        });
+      }
+    }
+  }
+
+  // Sort categories by total qty desc, runs within each category by date desc
+  const byCategory = Array.from(catMap.values()).sort((a, b) => b.totalQty - a.totalQty);
+  for (const c of byCategory) c.runs.sort((a, b) => (b.completionDate || "").localeCompare(a.completionDate || ""));
+  const byWorkCenter = Array.from(wcMap.values()).sort((a, b) => b.totalQty - a.totalQty);
+
+  res.json({
+    ok: true,
+    lastSync: blob.lastSync || null,
+    windowStart: blob.windowStart || null,
+    windowEnd: blob.windowEnd || null,
+    totalQty,
+    totalsByUnit,
+    runCount: blob.allCompletedRuns.length,
+    byCategory,
+    byWorkCenter,
   });
 });
 
