@@ -1729,15 +1729,23 @@ const PRODUCTION_RUN_RATE_LIMIT_MS = 1100;
 
 function sleepMs(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function fetchProductionOrderList(completionDateFrom) {
+async function fetchProductionOrderList(opts) {
   if (!process.env.CIN7_ACCOUNT_ID || !process.env.CIN7_APPLICATION_KEY) {
     throw new Error("CIN7_ACCOUNT_ID or CIN7_APPLICATION_KEY environment variable not set");
   }
+  opts = opts || {};
+  const params = new URLSearchParams();
+  params.set("Limit", "200");
+  if (opts.status)              params.set("Status",              opts.status);
+  if (opts.requiredByDateFrom)  params.set("RequiredByDateFrom",  opts.requiredByDateFrom);
+  if (opts.requiredByDateTo)    params.set("RequiredByDateTo",    opts.requiredByDateTo);
+  if (opts.completionDateFrom)  params.set("CompletionDateFrom",  opts.completionDateFrom);
+  if (opts.completionDateTo)    params.set("CompletionDateTo",    opts.completionDateTo);
   const all = [];
   let page = 1;
-  const limit = 200;
   while (true) {
-    const url = `${C7_PROD_BASE}/production/orderList?Page=${page}&Limit=${limit}&CompletionDateFrom=${completionDateFrom}`;
+    params.set("Page", String(page));
+    const url = `${C7_PROD_BASE}/production/orderList?${params.toString()}`;
     const resp = await fetch(url, { headers: cin7Headers(), redirect: "follow" });
     const ct = resp.headers.get("content-type") || "";
     const text = await resp.text().catch(() => "");
@@ -1749,7 +1757,7 @@ async function fetchProductionOrderList(completionDateFrom) {
     catch (_) { throw new Error(`Cin7 productionOrderList ${resp.status} non-JSON [${ct}]: ${text.slice(0, 300)}`); }
     const batch = data.ProductionOrderListItems || [];
     all.push(...batch);
-    if (batch.length < limit) break;
+    if (batch.length < 200) break;
     page++;
     if (page > 50) throw new Error("Cin7 productionOrderList pagination exceeded 50 pages — aborting");
   }
@@ -1775,18 +1783,26 @@ async function performProductionRunSync() {
   startD.setUTCDate(startD.getUTCDate() - (PRODUCTION_RUN_WINDOW_DAYS - 1));
   const start = startD.toISOString().slice(0, 10);
 
-  // 1. List recent activity. The endpoint returns both Production Orders and
-  //    Production Runs (Type=O|R). We only care about COMPLETED runs.
+  // 1. List recent ACTIVE orders. Earlier attempt used CompletionDateFrom
+  //    which filters by the parent ORDER's completion date — but at Voyage,
+  //    individual runs frequently complete while the parent order stays In
+  //    Progress (multi-batch MOs). That made the filter return 0 rows.
   //
-  // Status-field gotcha: the spec's example shows both `Status` (DRAFT,
-  // AUTHORIZED, RELEASED, VOIDED) and `OrderStatus` (DRAFT, PLANNED,
-  // RELEASED, IN PROGRESS, COMPLETED, VOIDED) on each list row. For Runs,
-  // the field semantics aren't explicitly documented — checking BOTH for
-  // "COMPLETED" is the safe move.
-  const list = await fetchProductionOrderList(start);
+  //    New strategy: pull all non-voided orders due in the last 30 days,
+  //    then in each order's detail walk Runs[] and find ones whose
+  //    individual Status === "COMPLETED" with a ReceivedDate (or EndDate
+  //    fallback) inside our 7-day window.
+  const lookbackDays = 30;
+  const lookbackD = new Date(now);
+  lookbackD.setUTCDate(lookbackD.getUTCDate() - lookbackDays);
+  const requiredByDateFrom = lookbackD.toISOString().slice(0, 10);
+  const list = await fetchProductionOrderList({
+    status: "AllButVoided",
+    requiredByDateFrom,
+  });
 
-  // Diagnostic counts — show up in Railway logs so we can see what the
-  // tenant's data actually looks like if filtering misses things.
+  // Diagnostic counts — show in Railway logs and in the endpoint response
+  // so we can see what the tenant's data actually looks like.
   const typeCounts = {};
   const statusCounts = {};
   const orderStatusCounts = {};
@@ -1794,40 +1810,37 @@ async function performProductionRunSync() {
     if (!it) continue;
     const t = it.Type || "?";
     typeCounts[t] = (typeCounts[t] || 0) + 1;
-    const s = (it.Status || "(blank)");
-    statusCounts[s] = (statusCounts[s] || 0) + 1;
-    const os = (it.OrderStatus || "(blank)");
-    orderStatusCounts[os] = (orderStatusCounts[os] || 0) + 1;
+    statusCounts[(it.Status || "(blank)")] = (statusCounts[(it.Status || "(blank)")] || 0) + 1;
+    orderStatusCounts[(it.OrderStatus || "(blank)")] = (orderStatusCounts[(it.OrderStatus || "(blank)")] || 0) + 1;
   }
   console.log(`[ProdRunSync] List response: ${list.length} rows · Types ${JSON.stringify(typeCounts)} · Status ${JSON.stringify(statusCounts)} · OrderStatus ${JSON.stringify(orderStatusCounts)}`);
 
-  const isCompletedRow = it => {
-    const s = String(it.Status || "").toUpperCase();
-    const os = String(it.OrderStatus || "").toUpperCase();
-    return s === "COMPLETED" || os === "COMPLETED";
-  };
-  const completedRunRows = list.filter(it => it && it.Type === "R" && isCompletedRow(it));
-
-  // 2. Group by parent ProductionOrderID — one detail call per unique order.
-  //    Track which RunIDs are the completed ones we care about (an order may
-  //    have other runs we should skip).
-  const completedRunsByOrder = new Map();
-  for (const row of completedRunRows) {
-    if (!row.ProductionOrderID || !row.TaskID) continue;
-    if (!completedRunsByOrder.has(row.ProductionOrderID)) {
-      completedRunsByOrder.set(row.ProductionOrderID, {
-        orderNumber: row.OrderNumber || "",
-        runs: new Map(),
-      });
-    }
-    completedRunsByOrder.get(row.ProductionOrderID).runs.set(row.TaskID, {
-      runID: row.TaskID,
-      completionDate: row.CompletionDate ? String(row.CompletionDate).slice(0, 10) : null,
+  // 2. Build the per-order map — every Order row gets a detail fetch.
+  //    Voided orders are already excluded by the Status=AllButVoided filter.
+  //    Run rows (Type=R) are ignored at this stage; we'll find run-level
+  //    completion in the detail walk below.
+  const ordersToFetch = new Map();   // ProductionOrderID → { orderNumber, productSKU, productName, locationName }
+  for (const row of list) {
+    if (!row || row.Type !== "O") continue;
+    if (!row.ProductionOrderID) continue;
+    if (ordersToFetch.has(row.ProductionOrderID)) continue;
+    ordersToFetch.set(row.ProductionOrderID, {
+      orderNumber: row.OrderNumber || "",
       productSKU: row.ProductSKU || "",
       productName: row.ProductName || "",
       locationName: row.LocationName || "",
     });
   }
+
+  // Helper: did this run complete inside our 7-day window? Prefer
+  // ReceivedDate (when output landed in stock), fall back to EndDate.
+  const isRunInWindow = run => {
+    const raw = run.ReceivedDate || run.EndDate || null;
+    if (!raw) return false;
+    const iso = String(raw).slice(0, 10);
+    return iso >= start && iso <= end;
+  };
+  const isRunCompleted = run => String(run.Status || "").toUpperCase() === "COMPLETED";
 
   // Product-category lookup so the Production Output tab can group by
   // Voyage's product families (Chocolate / Coffee / Spreads / ...). The
@@ -1839,18 +1852,22 @@ async function performProductionRunSync() {
     return (c && c.category) ? c.category : "Other";
   };
 
-  // 3. For each unique parent order, fetch run detail. Walk operations →
-  //    components (for the Error Reporting flagged-line detector) AND the
-  //    Run.Output[] array (for the Production Output tab's actuals view).
+  // 3. For each active order, fetch run detail. Walk Runs[] and keep only
+  //    runs whose Status === "COMPLETED" AND whose ReceivedDate/EndDate
+  //    lands in the 7-day window. Then walk operations → components (Error
+  //    Reporting) and Run.Output[] (Production Output).
   const flagged = [];
   const allCompletedRuns = [];
   let detailCallsMade = 0;
   let detailFailures = 0;
-  const orderIDs = Array.from(completedRunsByOrder.keys());
+  let runsConsideredTotal = 0;
+  let runsCompletedTotal = 0;
+  let runsInWindowTotal = 0;
+  const orderIDs = Array.from(ordersToFetch.keys());
 
   for (let i = 0; i < orderIDs.length; i++) {
     const orderID = orderIDs[i];
-    const orderInfo = completedRunsByOrder.get(orderID);
+    const orderInfo = ordersToFetch.get(orderID);
     let detail;
     try {
       detail = await fetchProductionRunDetail(orderID);
@@ -1866,8 +1883,20 @@ async function performProductionRunSync() {
     const orderNumber = detail.OrderNumber || orderInfo.orderNumber || "";
     const runs = Array.isArray(detail.Runs) ? detail.Runs : [];
     for (const run of runs) {
-      const runMeta = orderInfo.runs.get(run.RunID);
-      if (!runMeta) continue; // not one of the completed runs from the list
+      runsConsideredTotal++;
+      if (!isRunCompleted(run)) continue;
+      runsCompletedTotal++;
+      if (!isRunInWindow(run)) continue;
+      runsInWindowTotal++;
+
+      const completionDate = String(run.ReceivedDate || run.EndDate || "").slice(0, 10) || null;
+      const runMeta = {
+        runID: run.RunID,
+        completionDate,
+        productSKU: orderInfo.productSKU,
+        productName: orderInfo.productName,
+        locationName: orderInfo.locationName,
+      };
       const runNumber = run.Number != null ? String(run.Number) : "";
       const moRef = orderNumber + (runNumber ? `/${runNumber}` : "");
 
@@ -1966,12 +1995,16 @@ async function performProductionRunSync() {
     lastSync: new Date().toISOString(),
     windowStart: start,
     windowEnd: end,
+    lookbackDays,
     listRowCount: list.length,
     listTypeCounts: typeCounts,
     listStatusCounts: statusCounts,
     listOrderStatusCounts: orderStatusCounts,
-    completedRunsScanned: completedRunRows.length,
     parentOrdersScanned: orderIDs.length,
+    runsConsideredTotal,
+    runsCompletedTotal,
+    runsInWindowTotal,
+    completedRunsScanned: runsInWindowTotal,
     detailCallsMade,
     detailFailures,
     flaggedRunCount: flagged.length,
@@ -1999,12 +2032,16 @@ app.post("/api/cin7/production-runs/sync", async (req, res) => {
       lastSync: blob.lastSync,
       windowStart: blob.windowStart,
       windowEnd: blob.windowEnd,
+      lookbackDays: blob.lookbackDays,
       listRowCount: blob.listRowCount,
       listTypeCounts: blob.listTypeCounts,
       listStatusCounts: blob.listStatusCounts,
       listOrderStatusCounts: blob.listOrderStatusCounts,
-      completedRunsScanned: blob.completedRunsScanned,
       parentOrdersScanned: blob.parentOrdersScanned,
+      runsConsideredTotal: blob.runsConsideredTotal,
+      runsCompletedTotal: blob.runsCompletedTotal,
+      runsInWindowTotal: blob.runsInWindowTotal,
+      completedRunsScanned: blob.completedRunsScanned,
       detailCallsMade: blob.detailCallsMade,
       detailFailures: blob.detailFailures,
       flaggedRunCount: blob.flaggedRunCount,
@@ -2475,12 +2512,16 @@ app.get("/api/production-output/last-7d", (req, res) => {
     byWorkCenter,
     // Diagnostic info so the tab can surface "the sync ran but the filter
     // dropped everything" cases without needing Railway log access.
+    lookbackDays: blob.lookbackDays || null,
     listRowCount: blob.listRowCount || 0,
     listTypeCounts: blob.listTypeCounts || {},
     listStatusCounts: blob.listStatusCounts || {},
     listOrderStatusCounts: blob.listOrderStatusCounts || {},
-    completedRunsScanned: blob.completedRunsScanned || 0,
     parentOrdersScanned: blob.parentOrdersScanned || 0,
+    runsConsideredTotal: blob.runsConsideredTotal || 0,
+    runsCompletedTotal: blob.runsCompletedTotal || 0,
+    runsInWindowTotal: blob.runsInWindowTotal || 0,
+    completedRunsScanned: blob.completedRunsScanned || 0,
   });
 });
 
