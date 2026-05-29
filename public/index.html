@@ -855,8 +855,10 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
     <button class="tab" onclick="switchTab('live-inv')">Live Inventory</button>
     <button class="tab" onclick="switchTab('error-reporting')">Error reporting</button>
     <button class="tab" onclick="switchTab('production-output')">Production output</button>
+    <button class="tab" onclick="switchTab('yield')">Yield</button>
     <button class="tab" onclick="switchTab('mrp')" id="tab-mrp-btn" style="display:none;">MRP</button>
     <button class="tab" onclick="switchTab('mrp-setup')" id="tab-mrp-setup-btn" style="display:none;">MRP Setup</button>
+    <button class="tab" onclick="switchTab('yield-setup')" id="tab-yield-setup-btn" style="display:none;">Yield Setup</button>
     <button class="tab" onclick="switchTab('admin')" id="tab-admin-btn" style="display:none;">Admin console</button>
   </div>
 
@@ -1078,6 +1080,28 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
     </div>
 
     <div id="prod-out-content"></div>
+  </div>
+
+  <!-- YIELD — trended manufacturing yield by unit-op bucket -->
+  <div id="tab-yield" style="display:none;">
+    <div class="header">
+      <div style="display:flex;align-items:center;gap:var(--vf-space-3);flex-wrap:wrap;">
+        <h2>Manufacturing yield</h2>
+        <span id="yield-meta" style="font-size:var(--vf-text-sm);color:var(--vf-text-tertiary);"></span>
+      </div>
+      <div style="display:flex;gap:var(--vf-space-2);align-items:center;">
+        <button class="btn btn-sm" onclick="loadYield()">⟳ Refresh</button>
+        <button class="btn btn-sm" id="yield-sync-btn" onclick="syncYield()">↻ Sync now</button>
+      </div>
+    </div>
+
+    <div style="font-size:var(--vf-text-sm);color:var(--vf-text-secondary);margin:var(--vf-space-2) 0 var(--vf-space-3);max-width:820px;">
+      60-day trended yield per unit-op stage. Yield% = kg out / kg in, computed per completed Production Run and
+      aggregated weekly. Stage assignment is driven by output SKU — admins can edit the SKU lists on the
+      <strong>Yield Setup</strong> tab.
+    </div>
+
+    <div id="yield-content"></div>
   </div>
 
   <!-- MRP — operator+ — production-plan-driven material requirements -->
@@ -1337,6 +1361,25 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       </div>
       <div id="mrp-expand-result"></div>
     </div>
+  </div>
+
+  <!-- YIELD SETUP — admin-only: edit bucket SKU lists -->
+  <div id="tab-yield-setup" style="display:none;">
+    <div class="header">
+      <div style="display:flex;align-items:center;gap:var(--vf-space-3);flex-wrap:wrap;">
+        <h2>Yield Setup</h2>
+        <span id="yield-setup-meta" style="font-size:var(--vf-text-sm);color:var(--vf-text-tertiary);"></span>
+      </div>
+      <button class="btn btn-sm" onclick="loadYieldSetup()">⟳ Refresh</button>
+    </div>
+
+    <div style="font-size:var(--vf-text-sm);color:var(--vf-text-secondary);margin:var(--vf-space-2) 0 var(--vf-space-3);max-width:820px;">
+      Each unit-op stage on the Yield tab pulls in runs whose output SKU is listed below.
+      One SKU per line. Hit <strong>Save</strong> on a bucket to persist changes; the next sync will rebucket
+      using the new list. Unmapped output SKUs from recent runs show up at the top so you can move them into the right list.
+    </div>
+
+    <div id="yield-setup-content"></div>
   </div>
 
   <!-- ADMIN CONSOLE -->
@@ -1710,6 +1753,7 @@ function showApp(){
   const isAdmin=currentUser.role==='admin';
   document.getElementById('tab-admin-btn').style.display=isAdmin?'':'none';
   document.getElementById('tab-mrp-setup-btn').style.display=isAdmin?'':'none';
+  document.getElementById('tab-yield-setup-btn').style.display=isAdmin?'':'none';
   // MRP tab visible to admin + operator + planner. Planner is a read-only
   // role designed for procurement / finance users who need to act on PO
   // suggestions but should not edit the production schedule.
@@ -2217,11 +2261,12 @@ function shortSku(s){
 function switchTab(t){
   if(t==='admin'&&(!currentUser||currentUser.role!=='admin'))return;
   if(t==='mrp-setup'&&(!currentUser||currentUser.role!=='admin'))return;
+  if(t==='yield-setup'&&(!currentUser||currentUser.role!=='admin'))return;
   if(t==='mrp'&&(!currentUser||currentUser.role==='viewer'))return;
-  ['calendar','orders','capacity','traceability','mo-status','live-inv','error-reporting','production-output','mrp','mrp-setup','admin'].forEach(k=>{document.getElementById('tab-'+k).style.display=k===t?'':'none';});
+  ['calendar','orders','capacity','traceability','mo-status','live-inv','error-reporting','production-output','yield','mrp','mrp-setup','yield-setup','admin'].forEach(k=>{document.getElementById('tab-'+k).style.display=k===t?'':'none';});
   document.querySelectorAll('.tab').forEach(el=>{
     const tabName=el.textContent.trim().toLowerCase();
-    const map={'calendar':'calendar','work orders':'orders','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','mo status':'mo-status','live inventory':'live-inv','error reporting':'error-reporting','production output':'production-output','mrp':'mrp','mrp setup':'mrp-setup','admin console':'admin'};
+    const map={'calendar':'calendar','work orders':'orders','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','mo status':'mo-status','live inventory':'live-inv','error reporting':'error-reporting','production output':'production-output','yield':'yield','mrp':'mrp','mrp setup':'mrp-setup','yield setup':'yield-setup','admin console':'admin'};
     el.classList.toggle('active',map[tabName]===t);
   });
   if(t==='calendar')renderCal();
@@ -2232,6 +2277,8 @@ function switchTab(t){
   if(t==='live-inv')loadLiveInventory();
   if(t==='error-reporting')loadErrorReporting();
   if(t==='production-output')loadProductionOutput();
+  if(t==='yield')loadYield();
+  if(t==='yield-setup')loadYieldSetup();
   if(t==='mrp-setup')loadMrpSetup();
   if(t==='mrp')loadMrp();
 }
@@ -3782,6 +3829,258 @@ async function syncProductionOutput() {
     if (content) content.innerHTML = `<div style="padding:20px;color:var(--vf-danger-text);background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:13px;">Sync failed: ${escapeHtml(e.message)}</div>`;
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '↻ Sync now'; }
+  }
+}
+
+// ── Yield Tab ────────────────────────────────────────────────────────────────
+//
+// Reads /api/yield/trended (60-day production-run aggregate). Renders a card
+// per unit-op bucket showing the overall yield %, a weekly sparkline, and a
+// link to Yield Setup if there are unmapped runs.
+
+function yieldPctColor(pct) {
+  if (pct == null) return 'var(--vf-text-tertiary)';
+  if (pct >= 95) return 'var(--vf-success-text)';
+  if (pct >= 85) return 'var(--vf-warning-text)';
+  return 'var(--vf-danger-text)';
+}
+
+// Inline SVG sparkline of weekly yield %. Returns an SVG string.
+// weekly: [{ weekStart, yieldPct, runs }]
+function renderSparkline(weekly, width, height) {
+  width = width || 220; height = height || 44;
+  const points = (weekly || []).filter(w => w.yieldPct != null);
+  if (points.length === 0) {
+    return `<svg width="${width}" height="${height}" style="display:block;"><text x="${width/2}" y="${height/2 + 4}" text-anchor="middle" font-size="11" fill="var(--vf-text-tertiary)">No weekly data yet</text></svg>`;
+  }
+  // Y axis: clamp to a sensible yield range — most yields cluster 80-100%.
+  // Use a fixed 70-100 range so cards are visually comparable.
+  const yMin = 70, yMax = 100;
+  const xStep = points.length > 1 ? width / (points.length - 1) : 0;
+  const yFor = p => height - ((Math.min(yMax, Math.max(yMin, p)) - yMin) / (yMax - yMin)) * (height - 6) - 3;
+  const path = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${i * xStep} ${yFor(p.yieldPct)}`).join(' ');
+  const lastY = yFor(points[points.length - 1].yieldPct);
+  const lastX = (points.length - 1) * xStep;
+  const dots = points.map((p, i) => {
+    const cx = i * xStep, cy = yFor(p.yieldPct);
+    return `<circle cx="${cx}" cy="${cy}" r="2.5" fill="var(--vf-brand-orange)"><title>${p.weekStart}: ${p.yieldPct}% (${p.runs} run${p.runs === 1 ? '' : 's'})</title></circle>`;
+  }).join('');
+  return `
+    <svg width="${width}" height="${height}" style="display:block;overflow:visible;">
+      <line x1="0" y1="${yFor(95)}" x2="${width}" y2="${yFor(95)}" stroke="var(--vf-border-subtle)" stroke-dasharray="3,3"/>
+      <path d="${path}" fill="none" stroke="var(--vf-brand-orange)" stroke-width="1.75"/>
+      ${dots}
+      <text x="${lastX + 6}" y="${lastY + 3}" font-size="10" fill="var(--vf-text-tertiary)">${points[points.length - 1].yieldPct.toFixed(1)}%</text>
+    </svg>`;
+}
+
+async function loadYield() {
+  const meta = document.getElementById('yield-meta');
+  const content = document.getElementById('yield-content');
+  content.innerHTML = '<div style="padding:20px;color:var(--vf-text-tertiary);font-size:13px;">Loading…</div>';
+  let d;
+  try {
+    const r = await fetch('/api/yield/trended');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    d = await r.json();
+    if (!d.ok) throw new Error(d.error || 'unknown');
+  } catch (e) {
+    content.innerHTML = `<div style="padding:20px;color:var(--vf-danger-text);background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:13px;">Failed to load: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+
+  if (d.lastSync) {
+    const age = Math.round((Date.now() - new Date(d.lastSync).getTime()) / 60000);
+    const ageStr = age < 60 ? `${age}m ago` : age < 1440 ? `${Math.round(age/60)}h ago` : `${Math.round(age/1440)}d ago`;
+    meta.textContent = `Window ${d.windowStart} → ${d.windowEnd} · synced ${ageStr} · ${(d.runCount || 0).toLocaleString()} runs`;
+  } else {
+    meta.textContent = 'No production-run data yet — click Sync now or wait for the 07:00 UTC cron';
+  }
+
+  // Group buckets by line
+  const byLine = {};
+  for (const b of (d.buckets || [])) {
+    if (!byLine[b.line]) byLine[b.line] = [];
+    byLine[b.line].push(b);
+  }
+  for (const line of Object.keys(byLine)) byLine[line].sort((a, b) => (a.order || 0) - (b.order || 0));
+
+  const lineOrder = ['Chocolate', 'Coffee']; // configured priority; anything else sorts after
+  const linesSorted = [
+    ...lineOrder.filter(l => byLine[l]),
+    ...Object.keys(byLine).filter(l => !lineOrder.includes(l)),
+  ];
+
+  if (linesSorted.length === 0) {
+    content.innerHTML = `<div style="padding:16px;background:var(--vf-surface-raised);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);color:var(--vf-text-secondary);font-size:13px;">No yield buckets configured. Go to <strong>Yield Setup</strong> to define them.</div>`;
+    return;
+  }
+
+  const fmtKg = q => (q == null) ? '—' : Number(q).toLocaleString(undefined, { maximumFractionDigits: 1 });
+
+  const renderBucketCard = b => {
+    const pct = b.overallYieldPct;
+    const pctColor = yieldPctColor(pct);
+    return `
+      <div style="padding:14px 16px;background:var(--vf-surface-raised);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:6px;">
+          <strong style="font-size:14px;color:var(--vf-text-primary);">${escapeHtml(b.name)}</strong>
+          <span style="font-size:11px;color:var(--vf-text-tertiary);">${b.totalRuns} run${b.totalRuns === 1 ? '' : 's'}</span>
+        </div>
+        <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:8px;">
+          <span style="font-size:26px;font-weight:600;color:${pctColor};font-variant-numeric:tabular-nums;">
+            ${pct != null ? pct.toFixed(1) + '%' : '—'}
+          </span>
+          <span style="font-size:11px;color:var(--vf-text-tertiary);">60-day yield</span>
+        </div>
+        ${renderSparkline(b.weekly)}
+        <div style="font-size:11px;color:var(--vf-text-tertiary);margin-top:6px;">
+          ${fmtKg(b.totalInputKg)} kg in · ${fmtKg(b.totalOutputKg)} kg out
+        </div>
+      </div>`;
+  };
+
+  const columns = linesSorted.map(line => {
+    const cards = byLine[line].map(renderBucketCard).join('');
+    return `
+      <div style="flex:1;min-width:300px;">
+        <div style="font-size:11px;color:var(--vf-text-tertiary);text-transform:uppercase;letter-spacing:0.4px;margin-bottom:var(--vf-space-2);padding-left:4px;">${escapeHtml(line)} line</div>
+        <div style="display:flex;flex-direction:column;gap:var(--vf-space-3);">
+          ${cards}
+        </div>
+      </div>`;
+  }).join('');
+
+  // Unmapped runs callout
+  const unmapped = d.unmapped || { runCount: 0, topSkus: [] };
+  const unmappedBlock = unmapped.runCount > 0 ? `
+    <div style="margin-top:var(--vf-space-4);padding:14px 16px;background:var(--vf-warning-soft);border:1px solid var(--vf-warning-base);border-radius:var(--vf-radius-sm);">
+      <strong style="color:var(--vf-warning-text);font-size:13px;">${unmapped.runCount} run${unmapped.runCount === 1 ? '' : 's'} not bucketed</strong>
+      <div style="font-size:12px;color:var(--vf-warning-text);margin-top:4px;">
+        Output SKUs we don't recognize yet:
+        ${unmapped.topSkus.slice(0, 8).map(s => `<code style="background:rgba(255,255,255,0.5);padding:1px 4px;border-radius:3px;margin-right:4px;">${escapeHtml(s.sku)} ×${s.count}</code>`).join(' ')}
+        ${currentUser && currentUser.role === 'admin' ? `<br><a href="#" onclick="switchTab('yield-setup');return false;" style="color:var(--vf-warning-text);font-weight:500;">Open Yield Setup →</a>` : ''}
+      </div>
+    </div>` : '';
+
+  content.innerHTML = `<div style="display:flex;gap:var(--vf-space-4);flex-wrap:wrap;">${columns}</div>${unmappedBlock}`;
+}
+
+async function syncYield() {
+  // Same upstream sync as Error Reporting + Production Output. Just reuse
+  // the production-runs/sync endpoint and re-render this tab.
+  const btn = document.getElementById('yield-sync-btn');
+  const meta = document.getElementById('yield-meta');
+  if (btn) { btn.disabled = true; btn.textContent = 'Syncing…'; }
+  if (meta) meta.textContent = 'Pulling production runs from Cin7 — this can take 3-5 minutes…';
+  try {
+    const r = await fetch('/api/cin7/production-runs/sync', { method: 'POST' });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    await loadYield();
+  } catch (e) {
+    if (meta) meta.textContent = '';
+    const content = document.getElementById('yield-content');
+    if (content) content.innerHTML = `<div style="padding:20px;color:var(--vf-danger-text);background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:13px;">Sync failed: ${escapeHtml(e.message)}</div>`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '↻ Sync now'; }
+  }
+}
+
+// ── Yield Setup Tab ──────────────────────────────────────────────────────────
+//
+// Admin-only editor for the bucket SKU lists. One card per bucket with a
+// textarea. Shows unmapped run SKUs at the top as easy copy-targets.
+
+let yieldSetupData = null;   // { lastUpdated, buckets: [...] }
+let yieldSetupUnmapped = []; // [{ sku, count, sampleProduct }]
+
+async function loadYieldSetup() {
+  const meta = document.getElementById('yield-setup-meta');
+  const content = document.getElementById('yield-setup-content');
+  content.innerHTML = '<div style="padding:20px;color:var(--vf-text-tertiary);font-size:13px;">Loading…</div>';
+  try {
+    const [bucketsRes, trendedRes] = await Promise.all([
+      fetch('/api/yield/buckets').then(r => r.json()),
+      fetch('/api/yield/trended').then(r => r.json()).catch(() => ({ unmapped: { topSkus: [] } })),
+    ]);
+    if (!bucketsRes.ok) throw new Error(bucketsRes.error || 'failed to load buckets');
+    yieldSetupData = bucketsRes;
+    yieldSetupUnmapped = (trendedRes.unmapped && trendedRes.unmapped.topSkus) || [];
+  } catch (e) {
+    content.innerHTML = `<div style="padding:20px;color:var(--vf-danger-text);background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:13px;">Failed to load: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+
+  if (yieldSetupData.lastUpdated) {
+    const d = new Date(yieldSetupData.lastUpdated);
+    meta.textContent = `Last updated ${d.toLocaleString()}${yieldSetupData.seeded ? ' · seeded from defaults' : ''}`;
+  }
+
+  renderYieldSetup();
+}
+
+function renderYieldSetup() {
+  const content = document.getElementById('yield-setup-content');
+  if (!yieldSetupData) { content.innerHTML = ''; return; }
+
+  const unmappedPanel = yieldSetupUnmapped.length > 0 ? `
+    <div style="margin-bottom:var(--vf-space-4);padding:14px 16px;background:var(--vf-warning-soft);border:1px solid var(--vf-warning-base);border-radius:var(--vf-radius-sm);">
+      <strong style="color:var(--vf-warning-text);font-size:13px;">Unmapped output SKUs from recent runs (${yieldSetupUnmapped.length})</strong>
+      <div style="font-size:12px;color:var(--vf-warning-text);margin-top:6px;">
+        Copy these into the right bucket below, then click Save:
+      </div>
+      <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;">
+        ${yieldSetupUnmapped.map(s => `
+          <code style="background:#fff;padding:3px 8px;border-radius:3px;font-size:11px;cursor:pointer;" onclick="navigator.clipboard.writeText('${escapeHtml(s.sku)}')" title="Click to copy">
+            ${escapeHtml(s.sku)} <span style="color:var(--vf-text-tertiary);">×${s.count}</span>
+          </code>
+        `).join('')}
+      </div>
+    </div>` : '';
+
+  const cards = (yieldSetupData.buckets || []).map((b, idx) => {
+    const lineColor = b.line === 'Chocolate' ? 'var(--vf-cat-purple-base)' : (b.line === 'Coffee' ? 'var(--vf-cat-orange-base)' : 'var(--vf-cat-teal-base)');
+    return `
+      <div style="margin-bottom:var(--vf-space-3);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);overflow:hidden;">
+        <div style="padding:10px 14px;background:var(--vf-surface-raised);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;border-left:4px solid ${lineColor};">
+          <div>
+            <strong style="font-size:14px;color:var(--vf-text-primary);">${escapeHtml(b.name)}</strong>
+            <span style="font-size:11px;color:var(--vf-text-tertiary);margin-left:8px;">${escapeHtml(b.line)} · ${(b.skus || []).length} SKU${(b.skus || []).length === 1 ? '' : 's'}</span>
+          </div>
+          <button class="btn btn-sm btn-primary" onclick="saveYieldBucket(${idx})">Save</button>
+        </div>
+        <div style="padding:12px 14px;">
+          <textarea id="yield-bucket-skus-${idx}" rows="8" style="width:100%;font-family:var(--vf-font-mono);font-size:12px;padding:8px 10px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-default);resize:vertical;">${(b.skus || []).join('\n')}</textarea>
+        </div>
+      </div>`;
+  }).join('');
+
+  content.innerHTML = unmappedPanel + cards;
+}
+
+async function saveYieldBucket(idx) {
+  if (!yieldSetupData || !yieldSetupData.buckets || !yieldSetupData.buckets[idx]) return;
+  const ta = document.getElementById('yield-bucket-skus-' + idx);
+  if (!ta) return;
+  const skus = ta.value.split('\n').map(s => s.trim()).filter(Boolean);
+  // Mutate the local copy of the bucket, then PUT the full collection
+  yieldSetupData.buckets[idx] = { ...yieldSetupData.buckets[idx], skus };
+  try {
+    const r = await fetch('/api/yield/buckets', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ buckets: yieldSetupData.buckets }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    yieldSetupData = j;
+    renderYieldSetup();
+    // Tiny inline confirmation
+    const meta = document.getElementById('yield-setup-meta');
+    if (meta) meta.textContent = `Saved ${new Date().toLocaleTimeString()} — next sync will rebucket runs.`;
+  } catch (e) {
+    alert('Save failed: ' + e.message);
   }
 }
 

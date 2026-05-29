@@ -1696,6 +1696,192 @@ app.get("/api/cin7/product-costs", (req, res) => {
   res.json({ ok: true, ...blob });
 });
 
+// ── Yield bucket config (powers the Yield + Yield Setup tabs) ───────────────
+//
+// Each completed Production Run is bucketed by its first Output SKU. The
+// yield_buckets blob maps SKUs → buckets (e.g., "Seed cleaning", "FG Packout").
+// Defaults are seeded from the SKU list Matt shared on 2026-05-29; admins can
+// add/remove SKUs via the Yield Setup tab as new products get introduced.
+//
+// Shape:
+//   {
+//     lastUpdated: ISO timestamp,
+//     buckets: [
+//       { id, line, name, order, skus: [...] },
+//       ...
+//     ]
+//   }
+//
+// WIP1 + WIP2 SKUs are intentionally combined under one bucket ("Liquor → FG
+// ready") per Matt's note — they're systemically separate but conceptually
+// one unit op for yield purposes.
+
+const DEFAULT_YIELD_BUCKETS = [
+  {
+    id: "choc-seed-cleaning",
+    line: "Chocolate",
+    name: "Seed cleaning",
+    order: 1,
+    skus: ["WIP-5100008"],
+  },
+  {
+    id: "choc-roasted-seeds",
+    line: "Chocolate",
+    name: "Roasted seeds",
+    order: 2,
+    skus: ["WIP-5100007"],
+  },
+  {
+    id: "choc-making-liquor",
+    line: "Chocolate",
+    name: "Making liquor",
+    order: 3,
+    skus: [
+      "WIP-5100011-US", "WIP-5100012-US", "WIP-5100013",
+      "WIP-5100042-EU", "WIP-5100043-EU",
+      "WIP-5100046", "WIP-5100047", "WIP-5100048", "WIP-5100049", "WIP-5100050",
+    ],
+  },
+  {
+    id: "choc-liquor-to-fg-ready",
+    line: "Chocolate",
+    name: "Liquor → FG ready",
+    order: 4,
+    skus: [
+      // WIP1 (Filling stage)
+      "WIP1-5100062-EU", "WIP1-5100068-EU", "WIP1-5100810-US", "WIP1-5100815-US",
+      "WIP1-5100820-EU", "WIP1-5100858-US", "WIP1-5100859-US", "WIP1-5100860-US",
+      "WIP1-5100862-EU", "WIP1-5100865-US", "WIP1-5100880-EU", "WIP1-5100885-EU",
+      // WIP2 (Conching stage) — combined with WIP1 per Matt's note
+      "WIP2-5100062-EU", "WIP2-5100068-EU", "WIP2-5100810-US", "WIP2-5100815-US",
+      "WIP2-5100820-EU", "WIP2-5100858-US", "WIP2-5100859-US", "WIP2-5100860-US",
+      "WIP2-5100862-EU", "WIP2-5100865-US", "WIP2-5100880-EU", "WIP2-5100885-EU",
+      // Plain WIP variants (mid-WIP1/WIP2 outputs that exist as single SKUs)
+      "WIP-5100811-EU", "WIP-5100813-US", "WIP-5100814-EU", "WIP-5100820-US",
+      "WIP-5100861-EU", "WIP-5100863-US", "WIP-5100864-EU", "WIP-5100866-EU",
+      "WIP-5100868-US", "WIP-5100869-EU", "WIP-5100880-US", "WIP-5100885-US",
+    ],
+  },
+  {
+    id: "choc-fg-packout",
+    line: "Chocolate",
+    name: "FG Packout",
+    order: 5,
+    skus: [
+      // 800/850/870 inclusion families
+      "FG-800-001-00", "FG-800-002-00",
+      "FG-850-051-00", "FG-850-053-00", "FG-850-056-00", "FG-850-057-00",
+      "FG-870-070-00", "FG-870-071-00",
+      // 860 liquor packout
+      "FG-860-005-01-EU", "FG-860-005-01-EU (copy of 25kg)", "FG-860-005-01-EU-kg",
+      "FG-860-005-02-EU-kg",
+      "FG-860-006-00", "FG-860-006-01-EU", "FG-860-006-01-EU-kg", "FG-860-006-02",
+      // 860/880 powder packout
+      "FG-860-008-00-EU", "FG-860-008-00-EU-kg", "FG-880-000-00",
+      // 888-* coating/inclusion FG
+      "FG-888-810-00-US", "FG-888-810-00-US/EU-kg",
+      "FG-888-811-00-EU", "FG-888-811-00-EU-kg",
+      "FG-888-812-00-EU", "FG-888-812-00-EU-kg",
+      "FG-888-813-00-US", "FG-888-813-00-US-kg",
+      "FG-888-814-00-EU", "FG-888-814-00-EU-kg",
+      "FG-888-815-00-US", "FG-888-815-00-US-kg",
+      "FG-888-820-00-EU", "FG-888-820-00-US", "FG-888-820-00-US-kg",
+      "FG-888-858-00-US", "FG-888-858-00-US-kg",
+      "FG-888-859-00-US", "FG-888-859-00-US-kg",
+      "FG-888-860-00-US", "FG-888-860-00-US/EU-kg",
+      "FG-888-861-00-EU", "FG-888-861-00-EU-kg",
+      "FG-888-862-00-EU", "FG-888-862-00-EU-kg",
+      "FG-888-863-00-US", "FG-888-863-00-US-kg",
+      "FG-888-864-00-EU", "FG-888-864-00-EU-kg",
+      "FG-888-865-00-US", "FG-888-865-00-US/EU-kg",
+      "FG-888-866-00-EU", "FG-888-866-00-EU-kg",
+      "FG-888-867-00-EU", "FG-888-867-00-kg",
+      "FG-888-868-00-US", "FG-888-868-00-US-kg",
+      "FG-888-869-00-EU", "FG-888-869-00-EU-kg",
+      "FG-888-880-00-EU", "FG-888-880-00-US", "FG-888-880-00-US-kg",
+      "FG-888-885-00-EU", "FG-888-885-00-US", "FG-888-885-00-US-kg",
+    ],
+  },
+  // Coffee — split per Matt's pick: WIP-5100002 → Roasting, FG-999-* → Packout
+  {
+    id: "coffee-roasting",
+    line: "Coffee",
+    name: "Roasting",
+    order: 1,
+    skus: ["WIP-5100002", "WIP-5100002-TRIAL"],
+  },
+  {
+    id: "coffee-packout",
+    line: "Coffee",
+    name: "Packout",
+    order: 2,
+    skus: [
+      "FG-999-002-00", "FG-999-002-00-Kg",
+      "FG-999-003-00", "FG-999-003-00-Kg",
+      "FG-999-010-00", "FG-999-100-00",
+    ],
+  },
+];
+
+function seedYieldBucketsIfMissing() {
+  const existing = readData("vf_yield_buckets");
+  if (existing && Array.isArray(existing.buckets)) return existing;
+  const blob = {
+    lastUpdated: new Date().toISOString(),
+    seeded: true,
+    buckets: DEFAULT_YIELD_BUCKETS,
+  };
+  writeData("vf_yield_buckets", blob);
+  return blob;
+}
+seedYieldBucketsIfMissing();
+
+// Build a SKU → bucket lookup. Last-writer-wins on duplicates so admins
+// can copy/paste the same SKU between buckets while iterating without
+// silent splits in the data.
+function buildSkuBucketMap(buckets) {
+  const map = new Map();
+  for (const b of buckets) {
+    for (const sku of (b.skus || [])) {
+      if (!sku) continue;
+      map.set(String(sku).trim(), b);
+    }
+  }
+  return map;
+}
+
+// GET /api/yield/buckets — current bucket config (any authed user)
+app.get("/api/yield/buckets", (req, res) => {
+  const blob = readData("vf_yield_buckets") || seedYieldBucketsIfMissing();
+  res.json({ ok: true, ...blob });
+});
+
+// PUT /api/yield/buckets — admin only. Body: { buckets: [...] }
+// Validates shape and dedupes SKUs within each bucket before persisting.
+app.put("/api/yield/buckets", requireAdmin, (req, res) => {
+  try {
+    const incoming = (req.body && Array.isArray(req.body.buckets)) ? req.body.buckets : null;
+    if (!incoming) return res.status(400).json({ ok: false, error: "Body must include `buckets` array" });
+    const cleaned = incoming.map(b => ({
+      id: String(b.id || "").trim(),
+      line: String(b.line || "").trim(),
+      name: String(b.name || "").trim(),
+      order: Number.isFinite(b.order) ? b.order : 0,
+      skus: Array.isArray(b.skus)
+        ? [...new Set(b.skus.map(s => String(s || "").trim()).filter(Boolean))]
+        : [],
+    })).filter(b => b.id && b.line && b.name);
+    const blob = {
+      lastUpdated: new Date().toISOString(),
+      buckets: cleaned,
+    };
+    writeData("vf_yield_buckets", blob);
+    res.json({ ok: true, ...blob });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── Cin7 production-run sync (powers the Error Reporting tab) ───────────────
 //
 // Why: the daily Inventory Movement Details report doesn't emit a row when an
@@ -1724,7 +1910,10 @@ app.get("/api/cin7/product-costs", (req, res) => {
 // calls — a 7-day window with ~50 unique parent orders takes ~1 minute.
 
 const C7_PROD_BASE = "https://inventory.dearsystems.com/ExternalApi/v2";
-const PRODUCTION_RUN_WINDOW_DAYS = 7;
+// 60-day window — wide enough to support trended-yield charts on the Yield
+// tab without making the sync take forever. Daily cron at 07:00 UTC handles
+// the long fetch fine; manual "Sync now" buttons take ~3-5 min.
+const PRODUCTION_RUN_WINDOW_DAYS = 60;
 const PRODUCTION_RUN_RATE_LIMIT_MS = 1100;
 
 function sleepMs(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -1792,7 +1981,10 @@ async function performProductionRunSync() {
   //    then in each order's detail walk Runs[] and find ones whose
   //    individual Status === "COMPLETED" with a ReceivedDate (or EndDate
   //    fallback) inside our 7-day window.
-  const lookbackDays = 30;
+  // Wider lookback than the run window — we need to fetch orders whose
+  // RequiredByDate could plausibly contain a run that completed inside our
+  // 60-day window. Some orders complete weeks past their RequiredBy date.
+  const lookbackDays = 90;
   const lookbackD = new Date(now);
   lookbackD.setUTCDate(lookbackD.getUTCDate() - lookbackDays);
   const requiredByDateFrom = lookbackD.toISOString().slice(0, 10);
@@ -1850,6 +2042,17 @@ async function performProductionRunSync() {
   const categoryOf = sku => {
     const c = costsBlob.bySku && costsBlob.bySku[sku];
     return (c && c.category) ? c.category : "Other";
+  };
+
+  // Yield-bucket lookup so the Yield tab can group runs by unit-op stage.
+  // The vf_yield_buckets blob is seeded on startup and editable via the
+  // Yield Setup tab. We match by the run's first Output[].ProductCode.
+  const yieldBlob = readData("vf_yield_buckets") || { buckets: [] };
+  const skuToBucket = buildSkuBucketMap(yieldBlob.buckets || []);
+  const bucketLookup = sku => {
+    if (!sku) return null;
+    const b = skuToBucket.get(String(sku).trim());
+    return b ? { id: b.id, line: b.line, name: b.name } : null;
   };
 
   // 3. For each active order, fetch run detail. Walk Runs[] and keep only
@@ -1966,6 +2169,26 @@ async function performProductionRunSync() {
       });
       const runOutputQty = outputRows.reduce((s, r) => s + r.qty, 0);
 
+      // Yield path — total kg in vs total kg out for the run.
+      // Inputs: sum every Components[].Quantity across all operations where
+      // Unit==="kg" (per Matt's pick: include processing aids, exclude packaging
+      // which is typically counted in "Each").
+      // Outputs: sum Output[].Quantity where Unit==="kg".
+      // Bucket: looked up from the first kg-output SKU; falls back to first
+      // output if no kg outputs exist.
+      const inputMassKg = allComponentsOnRun.reduce(
+        (s, c) => s + (String(c.unit).toLowerCase() === "kg" ? c.actual : 0),
+        0,
+      );
+      const outputMassKg = outputRows.reduce(
+        (s, o) => s + (String(o.unit).toLowerCase() === "kg" ? o.qty : 0),
+        0,
+      );
+      const yieldPct = inputMassKg > 0 ? (outputMassKg / inputMassKg) * 100 : null;
+      const bucketSourceSku =
+        (outputRows.find(o => String(o.unit).toLowerCase() === "kg") || outputRows[0] || {}).sku || runMeta.productSKU;
+      const yieldBucket = bucketLookup(bucketSourceSku);
+
       // Include the run even if Output[] is empty so a row exists in the feed;
       // the FG-from-list metadata gives us at least the planned SKU/name.
       allCompletedRuns.push({
@@ -1981,6 +2204,14 @@ async function performProductionRunSync() {
         workCenters: workCentersSeen,
         outputs: outputRows,
         outputQty: runOutputQty,
+        // Yield-tab fields
+        inputMassKg: Math.round(inputMassKg * 1000) / 1000,
+        outputMassKg: Math.round(outputMassKg * 1000) / 1000,
+        yieldPct: yieldPct != null ? Math.round(yieldPct * 100) / 100 : null,
+        bucketSourceSku,
+        yieldBucketId: yieldBucket ? yieldBucket.id : null,
+        yieldBucketLine: yieldBucket ? yieldBucket.line : null,
+        yieldBucketName: yieldBucket ? yieldBucket.name : null,
       });
     }
 
@@ -2522,6 +2753,115 @@ app.get("/api/production-output/last-7d", (req, res) => {
     runsCompletedTotal: blob.runsCompletedTotal || 0,
     runsInWindowTotal: blob.runsInWindowTotal || 0,
     completedRunsScanned: blob.completedRunsScanned || 0,
+  });
+});
+
+// ── Yield trended endpoint — powers the Yield tab's sparkline cards ─────────
+//
+// Reads the production-run blob (same source as Error Reporting + Production
+// Output) and rolls per-run yield up to weekly buckets per unit-op stage.
+// Runs whose output SKU isn't in any yield bucket are surfaced separately as
+// `unmapped` so the user can add them to the right list in Yield Setup.
+app.get("/api/yield/trended", (req, res) => {
+  const blob = readData("production_run_errors_t7d");
+  const bucketsBlob = readData("vf_yield_buckets") || { buckets: [] };
+  const allBuckets = bucketsBlob.buckets || [];
+
+  if (!blob || !Array.isArray(blob.allCompletedRuns)) {
+    return res.json({
+      ok: true,
+      lastSync: null,
+      windowStart: null,
+      windowEnd: null,
+      runCount: 0,
+      buckets: allBuckets.map(b => ({
+        id: b.id, line: b.line, name: b.name, order: b.order,
+        totalRuns: 0, totalInputKg: 0, totalOutputKg: 0, overallYieldPct: null, weekly: [],
+      })),
+      unmapped: { runCount: 0, topSkus: [] },
+    });
+  }
+
+  // Helper: Monday of the ISO week containing `dateStr` (YYYY-MM-DD).
+  const mondayOf = dateStr => {
+    if (!dateStr) return null;
+    const d = new Date(dateStr + "T00:00:00Z");
+    if (isNaN(d.getTime())) return null;
+    const dow = d.getUTCDay() || 7; // 1..7 with Monday=1
+    d.setUTCDate(d.getUTCDate() - (dow - 1));
+    return d.toISOString().slice(0, 10);
+  };
+
+  // Group runs by bucket id (null for unmapped)
+  const runsByBucket = new Map();
+  const unmappedBySku = new Map();
+  for (const run of blob.allCompletedRuns) {
+    const bucketId = run.yieldBucketId || null;
+    if (bucketId === null) {
+      const sku = run.bucketSourceSku || run.fgSKU || "(no sku)";
+      if (!unmappedBySku.has(sku)) {
+        unmappedBySku.set(sku, { sku, count: 0, sampleProduct: run.fgProduct || "", sampleMoRef: run.moRef || "" });
+      }
+      unmappedBySku.get(sku).count += 1;
+      continue;
+    }
+    if (!runsByBucket.has(bucketId)) runsByBucket.set(bucketId, []);
+    runsByBucket.get(bucketId).push(run);
+  }
+
+  // Build the response: every configured bucket gets a slot (even with 0
+  // runs) so the UI can render the full lineup consistently.
+  const bucketsOut = allBuckets.map(b => {
+    const runs = runsByBucket.get(b.id) || [];
+    const weeklyMap = new Map();   // weekStart → { runs, inputKg, outputKg }
+    let totalInput = 0, totalOutput = 0, totalRuns = runs.length;
+    for (const r of runs) {
+      const week = mondayOf(r.completionDate);
+      if (!week) continue;
+      if (!weeklyMap.has(week)) weeklyMap.set(week, { weekStart: week, runs: 0, inputKg: 0, outputKg: 0 });
+      const w = weeklyMap.get(week);
+      w.runs += 1;
+      w.inputKg += r.inputMassKg || 0;
+      w.outputKg += r.outputMassKg || 0;
+      totalInput += r.inputMassKg || 0;
+      totalOutput += r.outputMassKg || 0;
+    }
+    const weekly = Array.from(weeklyMap.values())
+      .sort((a, b) => a.weekStart.localeCompare(b.weekStart))
+      .map(w => ({
+        weekStart: w.weekStart,
+        runs: w.runs,
+        inputKg: Math.round(w.inputKg * 100) / 100,
+        outputKg: Math.round(w.outputKg * 100) / 100,
+        yieldPct: w.inputKg > 0 ? Math.round((w.outputKg / w.inputKg) * 10000) / 100 : null,
+      }));
+    return {
+      id: b.id,
+      line: b.line,
+      name: b.name,
+      order: b.order,
+      totalRuns,
+      totalInputKg: Math.round(totalInput * 100) / 100,
+      totalOutputKg: Math.round(totalOutput * 100) / 100,
+      overallYieldPct: totalInput > 0 ? Math.round((totalOutput / totalInput) * 10000) / 100 : null,
+      weekly,
+    };
+  });
+
+  const unmappedSkus = Array.from(unmappedBySku.values()).sort((a, b) => b.count - a.count);
+  const unmappedRunCount = unmappedSkus.reduce((s, x) => s + x.count, 0);
+
+  res.json({
+    ok: true,
+    lastSync: blob.lastSync || null,
+    windowStart: blob.windowStart || null,
+    windowEnd: blob.windowEnd || null,
+    runCount: blob.allCompletedRuns.length,
+    buckets: bucketsOut,
+    unmapped: {
+      runCount: unmappedRunCount,
+      topSkus: unmappedSkus.slice(0, 20),
+    },
   });
 });
 
