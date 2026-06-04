@@ -841,7 +841,38 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
     </div>
     <div class="vf-topbar__spacer"></div>
     <span class="save-indicator" id="save-ind"></span>
+    <button class="btn btn-sm" id="bug-report-btn" onclick="openBugReportModal()" style="margin-right:8px;" title="Report a bug or unexpected behavior">🐛 Report bug</button>
     <div class="user-badge" id="user-badge"></div>
+  </div>
+
+  <!-- BUG REPORT MODAL -->
+  <div id="bug-modal" style="display:none;">
+    <div class="modal-overlay" onclick="closeBugReportModal(event)">
+      <div class="modal">
+        <h2>Report a bug</h2>
+        <div style="font-size:12px;color:var(--vf-text-secondary);margin-bottom:var(--vf-space-3);">
+          We'll automatically attach the current tab, URL, and any recent errors so you don't have to describe technical details.
+        </div>
+        <div class="field">
+          <label>Short summary <span style="color:var(--vf-danger-text);">*</span></label>
+          <input id="bug-summary" maxlength="200" placeholder="e.g. Calendar won't load after click" />
+        </div>
+        <div class="field">
+          <label>What happened? <span style="color:var(--vf-danger-text);">*</span></label>
+          <textarea id="bug-description" rows="4" maxlength="5000" placeholder="Describe what went wrong, and steps to reproduce if you can…"></textarea>
+        </div>
+        <div class="field">
+          <label>What did you expect to happen? <span style="color:var(--vf-text-tertiary);font-weight:normal;">(optional)</span></label>
+          <textarea id="bug-expected" rows="3" maxlength="5000" placeholder="What should the app have done instead?"></textarea>
+        </div>
+        <div id="bug-context-preview" style="font-size:11px;color:var(--vf-text-tertiary);margin-top:var(--vf-space-2);padding:8px 10px;background:var(--vf-surface-sunken);border-radius:var(--vf-radius-sm);"></div>
+        <div id="bug-submit-error" style="display:none;color:var(--vf-danger-text);font-size:13px;margin-top:var(--vf-space-2);"></div>
+        <div style="display:flex;gap:var(--vf-space-2);margin-top:var(--vf-space-3);justify-content:flex-end;">
+          <button class="btn btn-sm" onclick="closeBugReportModal()">Cancel</button>
+          <button class="btn btn-sm btn-primary" id="bug-submit-btn" onclick="submitBugReport()">Submit report</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <div id="notice" class="notice" style="display:none;margin-top:var(--vf-space-4);"></div>
@@ -1400,6 +1431,27 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       <tbody id="admin-user-body"></tbody>
     </table>
 
+    <h2 style="margin-top:32px;">Bug Reports</h2>
+    <div style="display:flex;gap:var(--vf-space-2);align-items:center;margin:var(--vf-space-3) 0;flex-wrap:wrap;">
+      <select id="bug-status-filter" onchange="renderBugReports()" style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;height:32px;">
+        <option value="open">Open (new + acknowledged)</option>
+        <option value="">All</option>
+        <option value="new">New only</option>
+        <option value="acknowledged">Acknowledged only</option>
+        <option value="resolved">Resolved only</option>
+      </select>
+      <span id="bug-counts" style="font-size:11px;color:var(--vf-text-tertiary);"></span>
+      <button class="btn btn-sm" style="margin-left:auto;" onclick="loadBugReports()">↺ Refresh</button>
+    </div>
+    <div style="overflow-x:auto;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);max-height:600px;overflow-y:auto;">
+      <table class="admin-table" id="bug-reports-table" style="margin-top:0;">
+        <thead style="position:sticky;top:0;background:var(--vf-surface-sunken);z-index:1;">
+          <tr><th>When</th><th>User</th><th>Tab</th><th>Summary</th><th>Status</th><th></th></tr>
+        </thead>
+        <tbody id="bug-reports-body"></tbody>
+      </table>
+    </div>
+
     <h2 style="margin-top:32px;">Audit Log — Order Changes</h2>
     <div style="display:flex;gap:var(--vf-space-2);align-items:center;margin:var(--vf-space-3) 0;flex-wrap:wrap;">
       <input id="audit-search" placeholder="Filter by MO, user, or field…" oninput="renderAuditLog()" style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;width:280px;height:32px;">
@@ -1883,6 +1935,115 @@ async function loadAuditLog(){
   } catch (e) { auditEntries = []; }
   renderAuditLog();
 }
+
+// ── Bug Reports (admin) ─────────────────────────────────────────────────────
+let bugReports = [];
+let bugReportCounts = { new: 0, acknowledged: 0, resolved: 0 };
+let bugReportExpanded = new Set();
+async function loadBugReports(){
+  try {
+    const r = await fetch('/api/bug-reports');
+    if (!r.ok) { bugReports = []; renderBugReports(); return; }
+    const j = await r.json();
+    bugReports = j.reports || [];
+    bugReportCounts = j.counts || { new:0, acknowledged:0, resolved:0 };
+  } catch (e) { bugReports = []; }
+  renderBugReports();
+}
+function renderBugReports(){
+  const filter = document.getElementById('bug-status-filter').value || '';
+  const countsEl = document.getElementById('bug-counts');
+  if (countsEl) {
+    countsEl.textContent = `${bugReportCounts.new || 0} new · ${bugReportCounts.acknowledged || 0} acknowledged · ${bugReportCounts.resolved || 0} resolved`;
+  }
+  const filtered = bugReports.filter(r => {
+    if (!filter) return true;
+    if (filter === 'open') return r.status === 'new' || r.status === 'acknowledged';
+    return r.status === filter;
+  });
+  const body = document.getElementById('bug-reports-body');
+  if (!body) return;
+  if (filtered.length === 0) {
+    body.innerHTML = `<tr><td colspan="6" style="text-align:center;color:var(--vf-text-tertiary);font-size:12px;padding:18px;">No bug reports match the current filter.</td></tr>`;
+    return;
+  }
+  body.innerHTML = filtered.map(r => {
+    const expanded = bugReportExpanded.has(r.id);
+    const when = new Date(r.ts);
+    const whenStr = when.toLocaleString();
+    const statusClass = r.status === 'new' ? 'var(--vf-danger-text)'
+      : r.status === 'acknowledged' ? 'var(--vf-warning-text)'
+      : 'var(--vf-success-text)';
+    const detail = expanded ? `
+      <tr>
+        <td colspan="6" style="background:var(--vf-surface-sunken);padding:14px 18px;">
+          <div style="font-size:12px;color:var(--vf-text-secondary);margin-bottom:8px;">
+            <strong>URL:</strong> <code style="font-size:11px;">${escapeHtml(r.url || '')}</code><br>
+            <strong>User-agent:</strong> <span style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(r.userAgent || '')}</span>
+          </div>
+          <div style="margin-bottom:10px;">
+            <div style="font-size:11px;color:var(--vf-text-tertiary);text-transform:uppercase;letter-spacing:0.4px;margin-bottom:4px;">What happened</div>
+            <div style="font-size:13px;color:var(--vf-text-primary);white-space:pre-wrap;">${escapeHtml(r.description || '')}</div>
+          </div>
+          ${r.expected ? `
+          <div style="margin-bottom:10px;">
+            <div style="font-size:11px;color:var(--vf-text-tertiary);text-transform:uppercase;letter-spacing:0.4px;margin-bottom:4px;">Expected behavior</div>
+            <div style="font-size:13px;color:var(--vf-text-primary);white-space:pre-wrap;">${escapeHtml(r.expected)}</div>
+          </div>` : ''}
+          ${(r.contextErrors && r.contextErrors.length) ? `
+          <div style="margin-bottom:10px;">
+            <div style="font-size:11px;color:var(--vf-text-tertiary);text-transform:uppercase;letter-spacing:0.4px;margin-bottom:4px;">Recent errors (auto-captured)</div>
+            <div style="font-family:var(--vf-font-mono);font-size:11px;color:var(--vf-danger-text);background:var(--vf-surface-default);padding:8px 10px;border-radius:var(--vf-radius-sm);max-height:160px;overflow:auto;">
+              ${r.contextErrors.map(e => `[${escapeHtml(e.kind || '')}] ${escapeHtml(e.message || '')}${e.url ? ' — ' + escapeHtml(e.url) : ''}${e.status ? ' (' + e.status + ')' : ''}`).join('<br>')}
+            </div>
+          </div>` : ''}
+          <div style="display:flex;gap:8px;margin-top:12px;align-items:center;">
+            <span style="font-size:11px;color:var(--vf-text-tertiary);">Status:</span>
+            <button class="btn btn-sm" onclick="updateBugStatus('${r.id}','new')" ${r.status === 'new' ? 'disabled' : ''}>New</button>
+            <button class="btn btn-sm" onclick="updateBugStatus('${r.id}','acknowledged')" ${r.status === 'acknowledged' ? 'disabled' : ''}>Acknowledge</button>
+            <button class="btn btn-sm" onclick="updateBugStatus('${r.id}','resolved')" ${r.status === 'resolved' ? 'disabled' : ''}>Resolve</button>
+            ${r.resolvedBy ? `<span style="font-size:11px;color:var(--vf-text-tertiary);margin-left:8px;">Resolved by ${escapeHtml(r.resolvedBy)}${r.resolvedTs ? ' on ' + new Date(r.resolvedTs).toLocaleString() : ''}</span>` : ''}
+          </div>
+        </td>
+      </tr>` : '';
+    return `
+      <tr style="cursor:pointer;" onclick="toggleBugReportExpand('${r.id}')">
+        <td style="font-size:11px;color:var(--vf-text-tertiary);white-space:nowrap;">${whenStr}</td>
+        <td style="font-size:12px;"><strong>${escapeHtml(r.userName || '?')}</strong><div style="font-size:10px;color:var(--vf-text-tertiary);">${escapeHtml(r.role || '')}</div></td>
+        <td style="font-size:11px;color:var(--vf-text-tertiary);"><code>${escapeHtml(r.tab || '')}</code></td>
+        <td style="font-size:12px;">${escapeHtml(r.summary || '')}</td>
+        <td style="font-size:11px;color:${statusClass};font-weight:500;">${escapeHtml(r.status)}</td>
+        <td style="font-size:11px;color:var(--vf-text-tertiary);">${expanded ? '▾' : '▸'}</td>
+      </tr>${detail}`;
+  }).join('');
+}
+function toggleBugReportExpand(id) {
+  if (bugReportExpanded.has(id)) bugReportExpanded.delete(id);
+  else bugReportExpanded.add(id);
+  renderBugReports();
+}
+async function updateBugStatus(id, status) {
+  try {
+    const r = await fetch('/api/bug-reports/' + encodeURIComponent(id), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    // Update local copy + counts
+    const idx = bugReports.findIndex(x => x.id === id);
+    if (idx >= 0) {
+      const prevStatus = bugReports[idx].status;
+      bugReports[idx] = j.report;
+      bugReportCounts[prevStatus] = Math.max(0, (bugReportCounts[prevStatus] || 0) - 1);
+      bugReportCounts[status] = (bugReportCounts[status] || 0) + 1;
+    }
+    renderBugReports();
+  } catch (e) {
+    alert('Failed to update status: ' + e.message);
+  }
+}
 function renderAuditLog(){
   const search = (document.getElementById('audit-search').value || '').toLowerCase();
   const sourceFilter = document.getElementById('audit-source-filter').value;
@@ -1956,6 +2117,61 @@ const SEED=[
 ];
 
 let orders=[],collapsed={},editingId=null,calOffset=0,storageOK=false;
+
+// ── Error capture for bug reports ───────────────────────────────────────────
+// Rolling buffer of the last 10 errors (JS exceptions, unhandled promise
+// rejections, and HTTP non-2xx responses). Attached to bug-report submissions
+// so admins can see what was actually breaking when the user clicked Report.
+const BUG_ERROR_BUFFER_MAX = 10;
+window._vfRecentErrors = [];
+function pushBugError(e) {
+  try {
+    window._vfRecentErrors.push({ ts: new Date().toISOString(), ...e });
+    if (window._vfRecentErrors.length > BUG_ERROR_BUFFER_MAX) {
+      window._vfRecentErrors = window._vfRecentErrors.slice(-BUG_ERROR_BUFFER_MAX);
+    }
+  } catch (_) { /* never let error capture itself throw */ }
+}
+window.addEventListener('error', e => {
+  pushBugError({
+    kind: 'js-error',
+    message: (e.error && e.error.message) || e.message || 'unknown',
+    source: e.filename || '',
+    lineno: e.lineno || null,
+  });
+});
+window.addEventListener('unhandledrejection', e => {
+  const r = e.reason;
+  pushBugError({
+    kind: 'unhandled-rejection',
+    message: (r && r.message) || String(r || 'unknown'),
+    source: (r && r.stack) ? String(r.stack).split('\n')[0] : '',
+    lineno: null,
+  });
+});
+// Wrap fetch to capture HTTP non-2xx — the most common "something failed" the
+// user actually sees. Doesn't modify the response, just observes it.
+(function wrapFetchForBugReports() {
+  const orig = window.fetch;
+  if (!orig || orig._vfWrapped) return;
+  const wrapped = async function (...args) {
+    const resp = await orig.apply(this, args);
+    try {
+      if (resp && !resp.ok) {
+        const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
+        pushBugError({
+          kind: 'fetch-error',
+          message: `HTTP ${resp.status} ${resp.statusText || ''}`.trim(),
+          url: String(url).slice(0, 300),
+          status: resp.status,
+        });
+      }
+    } catch (_) { /* swallow */ }
+    return resp;
+  };
+  wrapped._vfWrapped = true;
+  window.fetch = wrapped;
+})();
 
 // ── Save-blocked banner ─────────────────────────────────────────────────────
 // When init() can't reach the server (transient 5xx, network glitch, etc.),
@@ -2271,7 +2487,7 @@ function switchTab(t){
   });
   if(t==='calendar')renderCal();
   if(t==='orders')render();
-  if(t==='admin'){renderUsers();loadAuditLog();}
+  if(t==='admin'){renderUsers();loadAuditLog();loadBugReports();}
   if(t==='traceability'&&!window._traceabilityMounted){window._traceabilityMounted=true;if(window.App){ReactDOM.createRoot(document.getElementById('traceability-root')).render(React.createElement(window.App));}}
   if(t==='mo-status'){populateMOStatusMachineFilter();renderMOStatus();loadSyncStatus();}
   if(t==='live-inv')loadLiveInventory();
@@ -2529,6 +2745,80 @@ function deleteCurrent(){
 }
 function closeModal(){document.getElementById('modal').style.display='none';}
 function closeOut(e){if(e.target===e.currentTarget)closeModal();}
+
+// ── Bug report modal ────────────────────────────────────────────────────────
+function currentTabName() {
+  const tabs = ['calendar','orders','capacity','traceability','mo-status','live-inv','error-reporting','production-output','yield','mrp','mrp-setup','yield-setup','admin'];
+  for (const t of tabs) {
+    const el = document.getElementById('tab-' + t);
+    if (el && el.style.display !== 'none') return t;
+  }
+  return 'unknown';
+}
+function openBugReportModal() {
+  document.getElementById('bug-summary').value = '';
+  document.getElementById('bug-description').value = '';
+  document.getElementById('bug-expected').value = '';
+  document.getElementById('bug-submit-error').style.display = 'none';
+  const btn = document.getElementById('bug-submit-btn');
+  if (btn) { btn.disabled = false; btn.textContent = 'Submit report'; }
+  // Preview the auto-captured context so the user knows what's being shared
+  const errors = window._vfRecentErrors || [];
+  const preview = document.getElementById('bug-context-preview');
+  preview.innerHTML = `
+    <strong>Auto-attached:</strong> tab <code>${escapeHtml(currentTabName())}</code> ·
+    user <code>${escapeHtml((window.currentUser && window.currentUser.username) || '?')}</code> ·
+    ${errors.length} recent error${errors.length === 1 ? '' : 's'} captured
+  `;
+  document.getElementById('bug-modal').style.display = '';
+  // Focus the summary field after the modal renders
+  setTimeout(() => { const f = document.getElementById('bug-summary'); if (f) f.focus(); }, 50);
+}
+function closeBugReportModal(e) {
+  // Only close on backdrop click, not click inside the modal box
+  if (e && e.target !== e.currentTarget) return;
+  document.getElementById('bug-modal').style.display = 'none';
+}
+async function submitBugReport() {
+  const summary = document.getElementById('bug-summary').value.trim();
+  const description = document.getElementById('bug-description').value.trim();
+  const expected = document.getElementById('bug-expected').value.trim();
+  const errEl = document.getElementById('bug-submit-error');
+  errEl.style.display = 'none';
+  if (!summary) { errEl.textContent = 'Please enter a short summary.'; errEl.style.display = ''; return; }
+  if (!description) { errEl.textContent = 'Please describe what happened.'; errEl.style.display = ''; return; }
+  const btn = document.getElementById('bug-submit-btn');
+  btn.disabled = true; btn.textContent = 'Sending…';
+  const payload = {
+    summary, description, expected,
+    tab: currentTabName(),
+    url: location.href,
+    userAgent: navigator.userAgent || '',
+    contextErrors: (window._vfRecentErrors || []).slice(-10),
+  };
+  try {
+    const r = await fetch('/api/bug-reports', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    // Success — flash an inline confirmation in the save-indicator and close
+    closeBugReportModal();
+    const ind = document.getElementById('save-ind');
+    if (ind) {
+      ind.textContent = '✓ Bug report sent — thanks!';
+      ind.style.opacity = '1';
+      setTimeout(() => { ind.style.opacity = '0'; }, 4000);
+    }
+  } catch (e) {
+    errEl.textContent = 'Failed to submit: ' + e.message;
+    errEl.style.display = '';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Submit report';
+  }
+}
 
 function saveOrder(){
   const cat=document.getElementById('f-cat').value,sub=document.getElementById('f-sub').value;

@@ -399,6 +399,110 @@ app.get("/api/audit-log", (req, res, next) => requireAdmin(req, res, next), (req
   res.json({ ok: true, total: log.length, entries: log.slice(-limit).reverse() });
 });
 
+// ── Bug reports ─────────────────────────────────────────────────────────────
+//
+// User-submitted bug reports captured from the in-app 🐛 button. Auto-
+// attached context (tab, URL, user-agent, recent console errors) lets us
+// debug without needing to ping the user for repro steps.
+//
+// Storage: vf_bug_reports = { reports: [...] }, capped at BUG_REPORT_MAX
+// entries (oldest evicted) so the file stays bounded even if a flood
+// happens.
+const BUG_REPORT_MAX = 500;
+const BUG_REPORT_STATUSES = new Set(["new", "acknowledged", "resolved"]);
+
+function readBugReports() {
+  const blob = readData("vf_bug_reports");
+  if (!blob || !Array.isArray(blob.reports)) return { reports: [] };
+  return blob;
+}
+
+// POST /api/bug-reports — any authed user. Body:
+//   { summary, description, expected?, tab?, url?, userAgent?, contextErrors? }
+app.post("/api/bug-reports", (req, res) => {
+  try {
+    const body = req.body || {};
+    const summary = String(body.summary || "").trim();
+    const description = String(body.description || "").trim();
+    if (!summary) return res.status(400).json({ ok: false, error: "summary is required" });
+    if (!description) return res.status(400).json({ ok: false, error: "description is required" });
+    // Cap text lengths to keep the blob bounded
+    const clip = (s, n) => String(s || "").slice(0, n);
+    const users = readData("vf_users") || [];
+    const u = users.find(x => x && x.id === req.userId);
+    const entry = {
+      id: "bug_" + crypto.randomBytes(8).toString("hex"),
+      ts: new Date().toISOString(),
+      userId: req.userId || null,
+      userName: u ? u.username : "(unknown)",
+      role: u ? u.role : null,
+      summary: clip(summary, 200),
+      description: clip(description, 5000),
+      expected: clip(body.expected, 5000),
+      tab: clip(body.tab, 80),
+      url: clip(body.url, 500),
+      userAgent: clip(body.userAgent, 500),
+      contextErrors: Array.isArray(body.contextErrors)
+        ? body.contextErrors.slice(0, 10).map(e => ({
+            ts: clip(e && e.ts, 40),
+            kind: clip(e && e.kind, 40),
+            message: clip(e && e.message, 500),
+            source: clip(e && e.source, 200),
+            lineno: typeof (e && e.lineno) === "number" ? e.lineno : null,
+            url: clip(e && e.url, 500),
+            status: typeof (e && e.status) === "number" ? e.status : null,
+          }))
+        : [],
+      status: "new",
+    };
+    const blob = readBugReports();
+    blob.reports.push(entry);
+    if (blob.reports.length > BUG_REPORT_MAX) {
+      blob.reports = blob.reports.slice(blob.reports.length - BUG_REPORT_MAX);
+    }
+    writeData("vf_bug_reports", blob);
+    res.json({ ok: true, id: entry.id });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/bug-reports — admin only. Returns newest first.
+app.get("/api/bug-reports", (req, res, next) => requireAdmin(req, res, next), (req, res) => {
+  const blob = readBugReports();
+  const reports = blob.reports.slice().reverse();
+  const counts = { new: 0, acknowledged: 0, resolved: 0 };
+  for (const r of blob.reports) counts[r.status] = (counts[r.status] || 0) + 1;
+  res.json({ ok: true, total: blob.reports.length, counts, reports });
+});
+
+// PATCH /api/bug-reports/:id — admin only. Body: { status }.
+app.patch("/api/bug-reports/:id", (req, res, next) => requireAdmin(req, res, next), (req, res) => {
+  try {
+    const status = String((req.body || {}).status || "").trim().toLowerCase();
+    if (!BUG_REPORT_STATUSES.has(status)) {
+      return res.status(400).json({ ok: false, error: "status must be one of: new, acknowledged, resolved" });
+    }
+    const blob = readBugReports();
+    const r = blob.reports.find(x => x && x.id === req.params.id);
+    if (!r) return res.status(404).json({ ok: false, error: "not found" });
+    const users = readData("vf_users") || [];
+    const actor = users.find(x => x && x.id === req.userId);
+    r.status = status;
+    if (status === "resolved") {
+      r.resolvedTs = new Date().toISOString();
+      r.resolvedBy = actor ? actor.username : "(unknown)";
+    } else {
+      delete r.resolvedTs;
+      delete r.resolvedBy;
+    }
+    writeData("vf_bug_reports", blob);
+    res.json({ ok: true, report: r });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // POST /api/import-excel/parse — parse an uploaded .xlsx production schedule
 app.post("/api/import-excel/parse", upload.single("file"), (req, res) => {
   if (!req.file) return res.status(400).json({ ok: false, error: "No file uploaded" });
