@@ -645,6 +645,23 @@ IMPORTANT: Before calling any write tools (add_order, shift_machine_orders, upda
 
 For delete_order specifically: always name the order ID and SKU in your confirmation request, as deletion is permanent and cannot be undone.
 
+DUPLICATE PREVENTION (very important — recent operator complaints stem from this):
+- Before calling add_order, ALWAYS scan get_orders results for any existing order with the SAME SKU and SAME machine whose date range overlaps your proposed start..end window.
+- If a match exists, DO NOT add a new order silently. Surface it: "I found an existing order for {SKU} on {machine} from {start} to {end} with {qty} kg. Did you mean to UPDATE this one (use update_order_quantity / update_order_dates) instead of creating a new one?"
+- Only proceed with add_order after the user explicitly confirms they want a separate additional order. In that case, pass allow_duplicate=true so the server-side guard doesn't reject it.
+- The server-side add_order tool ALSO enforces this — if you skip the check, it will refuse and return a duplicate error. Treat that error as a hint to re-read get_orders and reconcile.
+
+AMBIGUITY HANDLING:
+- If a user request could mean two different things (e.g. "add 100kg of X" could mean "create a new order" or "update the existing one to 100kg"), ASK before acting. Do not guess.
+- If a quantity, date, machine, or SKU isn't clearly specified, ASK rather than infer.
+- Never create multiple orders for the same SKU on the same date unless the user explicitly says they want multiple batches.
+
+QUEUED FOR APPROVAL (how write tools work now):
+- Every call to a mutating tool (add_order, shift_machine_orders, update_order_dates, update_order_status, update_order_quantity, update_order_metadata, delete_order) is QUEUED, not executed immediately. The user sees a preview card in the UI and must click "Apply" before the action takes effect.
+- The tool result you receive will say "status: queued_for_approval" — that means the change is staged, not committed. The schedule will NOT update for your next get_orders call until the user applies.
+- In your reply, narrate what you queued in plain language ("I've queued an add_order for {SKU} on {machine}, qty {qty}, {start}..{end}. Click Apply to commit.") so the preview card has clear context.
+- Multiple queued actions accumulate. If you queue several in one turn, list them all in your reply.
+
 Dates are always in YYYY-MM-DD format.`;
 
 // Tools that mutate vf_orders. Used by /api/chat to set a dataChanged flag
@@ -771,6 +788,7 @@ const AI_TOOLS = [
         region:   { type: "string", enum: ["eu", "us"], description: "Region — only meaningful for liquor (EU vs US recipes). Omit for non-liquor." },
         temper:   { type: "string", enum: ["cbe", "cbs"], description: "Temper type — CBE or CBS. Auto-set for east_mac (cbs) / west_mac (cbe); supply explicitly for other machines if known." },
         confirmed:{ type: "boolean", description: "Confirmed-for-production flag. New orders default to false (tentative) so the user can review before committing." },
+        allow_duplicate: { type: "boolean", description: "Bypass the same-SKU/same-machine/overlapping-date-range duplicate guard. Only set to true after the USER has explicitly confirmed they want a separate parallel order on top of an existing one. Defaults to false." },
       },
       required: ["sku", "machine", "start", "end"],
     },
@@ -867,6 +885,28 @@ function addDays(dateStr, days) {
   const d = new Date(dateStr + "T00:00:00Z");
   d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().slice(0, 10);
+}
+
+// Shared duplicate detector — used by both the add_order tool handler (to
+// REFUSE) and the chat preview path (to WARN). Returns the conflicting
+// order or null. Ignores completed orders since those are historical and
+// shouldn't block new scheduling.
+function findAddOrderConflict(allOrders, input) {
+  const norm = s => String(s || "").trim().toLowerCase();
+  const newStart = input.start || "";
+  const newEnd   = input.end || newStart;
+  if (!newStart || !input.sku || !input.machine) return null;
+  const rangesOverlap = (aStart, aEnd, bStart, bEnd) => {
+    if (!aStart || !bStart) return false;
+    const aE = aEnd || aStart, bE = bEnd || bStart;
+    return aStart <= bE && bStart <= aE;
+  };
+  return (allOrders || []).find(o =>
+    o && o.status !== "complete"
+    && norm(o.sku) === norm(input.sku)
+    && o.machine === input.machine
+    && rangesOverlap(o.start, o.end, newStart, newEnd)
+  ) || null;
 }
 
 function daysBetween(a, b) {
@@ -969,6 +1009,31 @@ async function executeAITool(name, input) {
       let temper = input.temper != null ? String(input.temper) : inferTemperFromMachine(machine);
       if (temper && !VALID_TEMPERS.includes(temper)) {
         return { ok: false, error: `Invalid temper '${temper}'. Valid: ${VALID_TEMPERS.join(", ")}` };
+      }
+      // Duplicate guard — belt-and-suspenders for the prompt-level rule.
+      // Same SKU + same machine + overlapping date range = refusal unless
+      // the caller explicitly passed allow_duplicate=true. Drives operators
+      // toward update_order_* tools instead of stacking parallel orders.
+      if (!input.allow_duplicate) {
+        const conflict = findAddOrderConflict(orders, { sku, machine, start, end });
+        if (conflict) {
+          return {
+            ok: false,
+            duplicate: true,
+            error: `Duplicate detected: order '${conflict.orderId}' for SKU '${conflict.sku}' on ${conflict.machine} already covers ${conflict.start}..${conflict.end || conflict.start} (qty ${conflict.qty}, status ${conflict.status}). Use update_order_quantity or update_order_dates on the existing order, OR retry add_order with allow_duplicate=true if the user has confirmed they want a separate parallel order.`,
+            existing: {
+              orderId: conflict.orderId,
+              entityId: conflict.id,
+              sku: conflict.sku,
+              machine: conflict.machine,
+              start: conflict.start,
+              end: conflict.end,
+              qty: conflict.qty,
+              batches: conflict.batches,
+              status: conflict.status,
+            },
+          };
+        }
       }
       const confirmed = input.confirmed === undefined ? false : !!input.confirmed;
       const id = `ai-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -1240,6 +1305,116 @@ async function executeAITool(name, input) {
   }
 }
 
+// Human-readable preview for a mutating tool call. Used by /api/chat to
+// describe staged actions to both (a) the AI in its synthetic tool_result
+// so it can narrate accurately, and (b) the user via the pending-actions
+// UI card. Pulls fresh order state for context-sensitive previews like
+// the duplicate detection on add_order.
+function previewForTool(name, input) {
+  const orders = readData("vf_orders") || [];
+  const warnings = [];
+  const findOrder = id =>
+    orders.find(o => o && (o.orderId === id || o.id === id)) || null;
+  const fmt = v => (v == null || v === "") ? "—" : String(v);
+  switch (name) {
+    case "add_order": {
+      const sku = fmt(input.sku);
+      const machine = fmt(input.machine);
+      const start = fmt(input.start);
+      const end = fmt(input.end);
+      const qty = input.qty || 0, batches = input.batches || 1;
+      const orderId = input.orderId || `TBD-${input.machine || "?"}-${(input.start || "").replace(/-/g, "")}`;
+      if (!input.allow_duplicate) {
+        const conflict = findAddOrderConflict(orders, input);
+        if (conflict) {
+          warnings.push(`Potential duplicate: existing order '${conflict.orderId}' (${conflict.sku}, ${conflict.machine}, ${conflict.start}..${conflict.end || conflict.start}, qty ${conflict.qty}) overlaps. The user must confirm a parallel order before this commits.`);
+        }
+      }
+      return {
+        label: "Create order",
+        summary: `${orderId} · ${sku} · ${machine} · ${start} → ${end} · ${qty} kg × ${batches} batch${batches === 1 ? "" : "es"}`,
+        warnings,
+      };
+    }
+    case "update_order_dates": {
+      const o = findOrder(input.order_id);
+      return {
+        label: "Reschedule order",
+        summary: o
+          ? `${o.orderId} (${o.sku || ""} · ${o.machine || ""}) · ${o.start || "?"} → ${fmt(input.start) || o.start || "?"} … ${o.end || "?"} → ${fmt(input.end) || o.end || "?"}`
+          : `Order '${input.order_id}' not found — apply will fail`,
+        warnings: o ? [] : [`Order '${input.order_id}' not found in current schedule`],
+      };
+    }
+    case "update_order_quantity": {
+      const o = findOrder(input.order_id);
+      return {
+        label: "Change quantity",
+        summary: o
+          ? `${o.orderId} (${o.sku || ""}) · qty ${o.qty} → ${fmt(input.qty) || o.qty} · batches ${o.batches} → ${fmt(input.batches) || o.batches}`
+          : `Order '${input.order_id}' not found — apply will fail`,
+        warnings: o ? [] : [`Order '${input.order_id}' not found`],
+      };
+    }
+    case "update_order_status": {
+      const o = findOrder(input.order_id);
+      return {
+        label: "Change status",
+        summary: o
+          ? `${o.orderId} · status ${o.status || "?"} → ${fmt(input.status)}`
+          : `Order '${input.order_id}' not found — apply will fail`,
+        warnings: o ? [] : [`Order '${input.order_id}' not found`],
+      };
+    }
+    case "update_order_metadata": {
+      const o = findOrder(input.order_id);
+      const changes = Object.entries(input)
+        .filter(([k, v]) => k !== "order_id" && v !== undefined && v !== "")
+        .map(([k, v]) => `${k}=${fmt(v)}`)
+        .join(", ");
+      return {
+        label: "Edit metadata",
+        summary: o
+          ? `${o.orderId} (${o.sku || ""}) · ${changes || "(no changes specified)"}`
+          : `Order '${input.order_id}' not found — apply will fail`,
+        warnings: o ? [] : [`Order '${input.order_id}' not found`],
+      };
+    }
+    case "delete_order": {
+      const o = findOrder(input.order_id);
+      const w = ["DELETE is permanent — cannot be undone after Apply."];
+      if (!o) w.push(`Order '${input.order_id}' not found in current schedule`);
+      return {
+        label: "Delete order",
+        summary: o
+          ? `${o.orderId} · ${o.sku || ""} · ${o.machine || ""} · ${o.start || "?"}..${o.end || o.start || "?"}`
+          : `Order '${input.order_id}'`,
+        warnings: w,
+      };
+    }
+    case "shift_machine_orders": {
+      const machine = fmt(input.machine);
+      const days = input.days || 0;
+      const from = fmt(input.from_date);
+      const affected = orders.filter(o =>
+        o && o.machine === input.machine && o.status !== "complete"
+        && o.start && (!input.from_date || o.start >= input.from_date)
+      );
+      return {
+        label: "Shift machine orders",
+        summary: `${machine} · ${affected.length} order${affected.length === 1 ? "" : "s"} from ${from} shifted by ${days >= 0 ? "+" : ""}${days} day${Math.abs(days) === 1 ? "" : "s"}`,
+        warnings: affected.length === 0 ? [`No matching orders on ${machine} from ${from} — nothing will move`] : [],
+      };
+    }
+    default:
+      return {
+        label: name,
+        summary: `Input: ${JSON.stringify(input)}`,
+        warnings: [],
+      };
+  }
+}
+
 app.post("/api/chat", requireOrderEdit, async (req, res) => {
   if (!process.env.ANTHROPIC_API_KEY) {
     return res.status(503).json({ ok: false, error: "AI assistant is not configured (missing ANTHROPIC_API_KEY)" });
@@ -1256,7 +1431,7 @@ app.post("/api/chat", requireOrderEdit, async (req, res) => {
       content: m.content,
     }));
     let response;
-    const mutatedTools = []; // names of mutating tools invoked this turn
+    const pendingActions = []; // mutating tool calls queued for user approval
 
     // Agentic loop — max 8 tool-use rounds
     for (let i = 0; i < 8; i++) {
@@ -1276,11 +1451,36 @@ app.post("/api/chat", requireOrderEdit, async (req, res) => {
 
       const toolResults = await Promise.all(
         toolUseBlocks.map(async block => {
-          // Track mutating tool invocations so the front-end knows to refresh
-          // its local data — replaces the fragile reply-text regex matching.
+          // Mutating tools are STAGED, not executed. The user reviews the
+          // pending-actions card in the chat UI and clicks Apply to commit.
+          // This is the load-bearing change behind the "preview before
+          // action" UX — and the line that prevents the bot from silently
+          // double-booking production.
           if (MUTATING_AI_TOOLS.has(block.name)) {
-            mutatedTools.push(block.name);
+            const preview = previewForTool(block.name, block.input);
+            const action = {
+              id: `pa_${pendingActions.length + 1}_${crypto.randomBytes(3).toString("hex")}`,
+              tool: block.name,
+              input: block.input,
+              label: preview.label,
+              summary: preview.summary,
+              warnings: preview.warnings,
+            };
+            pendingActions.push(action);
+            return {
+              type: "tool_result",
+              tool_use_id: block.id,
+              content: JSON.stringify({
+                status: "queued_for_approval",
+                pending_action_id: action.id,
+                label: preview.label,
+                summary: preview.summary,
+                warnings: preview.warnings,
+                message: "This action is QUEUED. It has NOT been committed to the schedule. The user sees a preview card and must click Apply to make it take effect. Subsequent get_orders calls will NOT reflect this change until the user applies. Narrate clearly in your reply what you queued and why.",
+              }),
+            };
           }
+          // Read-only tools execute normally
           return {
             type: "tool_result",
             tool_use_id: block.id,
@@ -1305,13 +1505,53 @@ app.post("/api/chat", requireOrderEdit, async (req, res) => {
       ok: true,
       reply,
       messages: currentMessages,
-      dataChanged: mutatedTools.length > 0,
-      mutatedTools,
+      // dataChanged stays false here — nothing committed yet. The frontend
+      // will refresh orders after the user clicks Apply (via the
+      // /api/chat/apply-pending response).
+      dataChanged: false,
+      mutatedTools: [],
+      pendingActions,
     });
   } catch (e) {
     console.error("AI chat error:", e);
     res.status(500).json({ ok: false, error: e.message });
   }
+});
+
+// POST /api/chat/apply-pending — execute a batch of staged mutating tool
+// calls that the user reviewed and approved. Body: { actions: [{tool, input}] }.
+// Each action runs in order via the same executeAITool the chat handler used
+// to use; per-action results come back so the frontend can show successes /
+// failures granularly (e.g. one duplicate-detected refusal among five
+// successful adds).
+app.post("/api/chat/apply-pending", requireOrderEdit, async (req, res) => {
+  const body = req.body || {};
+  const actions = Array.isArray(body.actions) ? body.actions : null;
+  if (!actions) return res.status(400).json({ ok: false, error: "actions array required" });
+  if (!actions.length) return res.json({ ok: true, results: [], appliedCount: 0, failedCount: 0 });
+
+  const results = [];
+  let appliedCount = 0;
+  let failedCount = 0;
+  for (const action of actions) {
+    const tool = action && action.tool;
+    const input = (action && action.input) || {};
+    if (!tool || !MUTATING_AI_TOOLS.has(tool)) {
+      results.push({ id: action && action.id, tool, ok: false, error: "tool must be in the mutating-tools whitelist" });
+      failedCount++;
+      continue;
+    }
+    try {
+      const result = await executeAITool(tool, input);
+      const ok = !!(result && result.ok !== false && !result.error);
+      results.push({ id: action.id, tool, ok, result });
+      if (ok) appliedCount++; else failedCount++;
+    } catch (e) {
+      results.push({ id: action.id, tool, ok: false, error: e.message });
+      failedCount++;
+    }
+  }
+  res.json({ ok: true, results, appliedCount, failedCount });
 });
 
 // ── Cin7 Core sync ────────────────────────────────────────────────────────────

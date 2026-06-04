@@ -4698,6 +4698,9 @@ async function confirmImport(){
       </div>
       <button class="ai-close-btn" onclick="toggleAIPanel()">✕</button>
     </div>
+    <div style="padding:6px 12px;font-size:11px;color:var(--vf-text-tertiary);background:var(--vf-surface-sunken);border-bottom:1px solid var(--vf-border-subtle);">
+      ℹ I can draft and queue schedule changes — please review what I do before clicking Apply. I can make mistakes.
+    </div>
     <div id="ai-messages">
       <div class="ai-empty">Ask me to update the schedule.<br>e.g. "West Mac went down — shift all orders 3 days forward"</div>
     </div>
@@ -4758,9 +4761,86 @@ function renderAIMessages(displayHistory) {
     if (m.jumpToDate) {
       body += `<div style="margin-top:6px;"><button class="btn btn-sm btn-primary" onclick="aiJumpToDate('${m.jumpToDate}')" style="font-size:11px;padding:4px 10px;">Jump to ${m.jumpToDate}</button></div>`;
     }
-    return `<div class="ai-msg ${cls}">${body}</div>`;
+    // Pending-actions card (preview-before-action). The bot's mutating tool
+    // calls don't commit until the user clicks Apply on this card.
+    let pendingCard = '';
+    if (m.pendingActions && m.pendingActions.length && !m.applied && !m.cancelled) {
+      const rows = m.pendingActions.map(pa => {
+        const warningsHtml = (pa.warnings && pa.warnings.length)
+          ? `<div style="margin-top:4px;font-size:11px;color:var(--vf-warning-text);">${pa.warnings.map(w => '⚠ ' + escapeHtml(w)).join('<br>')}</div>`
+          : '';
+        return `
+          <div style="padding:8px 10px;border-top:1px solid var(--vf-border-subtle);">
+            <div style="font-size:11px;color:var(--vf-text-tertiary);text-transform:uppercase;letter-spacing:0.4px;">${escapeHtml(pa.label || pa.tool)}</div>
+            <div style="font-size:12px;color:var(--vf-text-primary);margin-top:2px;">${escapeHtml(pa.summary || '')}</div>
+            ${warningsHtml}
+          </div>`;
+      }).join('');
+      const hasWarnings = m.pendingActions.some(pa => pa.warnings && pa.warnings.length);
+      pendingCard = `
+        <div class="ai-pending-card" style="margin-top:8px;border:1px solid ${hasWarnings ? 'var(--vf-warning-base)' : 'var(--vf-brand-orange)'};border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);">
+          <div style="padding:8px 10px;display:flex;justify-content:space-between;align-items:center;background:${hasWarnings ? 'var(--vf-warning-soft)' : 'var(--vf-surface-sunken)'};">
+            <strong style="font-size:12px;color:var(--vf-text-primary);">⏳ ${m.pendingActions.length} action${m.pendingActions.length === 1 ? '' : 's'} pending approval</strong>
+            <div style="display:flex;gap:6px;">
+              <button class="btn btn-sm" onclick="cancelPendingActions(${i})" style="font-size:11px;padding:3px 8px;">Cancel</button>
+              <button class="btn btn-sm btn-primary" onclick="applyPendingActions(${i})" style="font-size:11px;padding:3px 8px;">Apply</button>
+            </div>
+          </div>
+          ${rows}
+        </div>`;
+    }
+    // Result strip after Apply/Cancel ran
+    let resultStrip = '';
+    if (m.applied) {
+      const ok = m.applyResult && m.applyResult.appliedCount;
+      const fail = m.applyResult && m.applyResult.failedCount;
+      resultStrip = `<div style="margin-top:6px;font-size:11px;color:${fail ? 'var(--vf-warning-text)' : 'var(--vf-success-text)'};">✓ Applied ${ok || 0} change${ok === 1 ? '' : 's'}${fail ? ` · ${fail} failed` : ''}</div>`;
+      if (fail && m.applyResult && m.applyResult.results) {
+        const failRows = m.applyResult.results.filter(r => !r.ok).map(r =>
+          `<div style="font-size:11px;color:var(--vf-danger-text);">✗ ${escapeHtml(r.tool || '')}: ${escapeHtml((r.result && r.result.error) || r.error || 'unknown')}</div>`
+        ).join('');
+        resultStrip += failRows;
+      }
+    } else if (m.cancelled) {
+      resultStrip = `<div style="margin-top:6px;font-size:11px;color:var(--vf-text-tertiary);">✗ Cancelled — nothing was committed</div>`;
+    }
+    return `<div class="ai-msg ${cls}">${body}${pendingCard}${resultStrip}</div>`;
   }).join('');
   container.scrollTop = container.scrollHeight;
+}
+
+async function applyPendingActions(displayIdx) {
+  const m = aiDisplayHistory[displayIdx];
+  if (!m || !m.pendingActions || m.applied || m.cancelled) return;
+  try {
+    const r = await fetch('/api/chat/apply-pending', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ actions: m.pendingActions }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    m.applied = true;
+    m.applyResult = j;
+    // Refresh local orders from server since mutations just committed.
+    const fresh = await serverGet('vf_orders');
+    if (Array.isArray(fresh)) orders = fresh;
+    await loadInventoryCompletion();
+    render();
+    renderCal();
+    renderAIMessages(aiDisplayHistory);
+  } catch (e) {
+    m.applied = true;
+    m.applyResult = { appliedCount: 0, failedCount: (m.pendingActions || []).length, results: [{ ok: false, error: e.message }] };
+    renderAIMessages(aiDisplayHistory);
+  }
+}
+
+function cancelPendingActions(displayIdx) {
+  const m = aiDisplayHistory[displayIdx];
+  if (!m || m.applied || m.cancelled) return;
+  m.cancelled = true;
+  renderAIMessages(aiDisplayHistory);
 }
 
 // Helper for the AI hint that surfaces when a created order falls outside
@@ -4864,7 +4944,11 @@ async function sendAIMessage() {
 
     if (data.ok) {
       aiMessages = data.messages;   // adopt server's full conversation (includes tool results)
-      aiDisplayHistory.push({ role: 'assistant', text: data.reply });
+      aiDisplayHistory.push({
+        role: 'assistant',
+        text: data.reply,
+        pendingActions: (data.pendingActions && data.pendingActions.length) ? data.pendingActions : null,
+      });
       // Server tells us explicitly whether any mutating tool ran; refresh
       // local state if so. Replaces the old fragile reply-text regex match
       // (which missed cases like "all three orders are confirmed in the
