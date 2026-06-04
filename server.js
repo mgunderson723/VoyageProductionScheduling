@@ -2799,6 +2799,19 @@ app.get("/api/production-output/last-7d", (req, res) => {
     });
   }
 
+  // The underlying blob now holds a 60-day window (so the Yield tab has
+  // enough data for weekly trending), but this endpoint promises 7 days
+  // per its name. Filter here so the Production Output tab stays focused.
+  const PRODUCTION_OUTPUT_TAB_DAYS = 7;
+  const nowD = new Date();
+  const sevenAgoD = new Date(nowD);
+  sevenAgoD.setUTCDate(sevenAgoD.getUTCDate() - (PRODUCTION_OUTPUT_TAB_DAYS - 1));
+  const tabWindowStart = sevenAgoD.toISOString().slice(0, 10);
+  const tabWindowEnd = nowD.toISOString().slice(0, 10);
+  const runsInTabWindow = blob.allCompletedRuns.filter(r =>
+    r && r.completionDate && r.completionDate >= tabWindowStart && r.completionDate <= tabWindowEnd
+  );
+
   // Category rollup. Each run contributes its outputs to a category bucket.
   // Multiple FG SKUs in one run can land in different categories — we honor
   // each output's individual category (vs the run-level fgCategory which is
@@ -2817,7 +2830,7 @@ app.get("/api/production-output/last-7d", (req, res) => {
     return wcMap.get(name);
   };
 
-  for (const run of blob.allCompletedRuns) {
+  for (const run of runsInTabWindow) {
     const outputs = Array.isArray(run.outputs) ? run.outputs : [];
     // If a run has multiple outputs, they may be in different categories.
     // Group them by category for the per-run rendering.
@@ -2886,11 +2899,13 @@ app.get("/api/production-output/last-7d", (req, res) => {
   res.json({
     ok: true,
     lastSync: blob.lastSync || null,
-    windowStart: blob.windowStart || null,
-    windowEnd: blob.windowEnd || null,
+    // Window reported = the actual 7-day filter applied here, not the
+    // 60-day blob window. Keeps the UI label honest.
+    windowStart: tabWindowStart,
+    windowEnd: tabWindowEnd,
     totalQty,
     totalsByUnit,
-    runCount: blob.allCompletedRuns.length,
+    runCount: runsInTabWindow.length,
     byCategory,
     byWorkCenter,
     // Diagnostic info so the tab can surface "the sync ran but the filter
