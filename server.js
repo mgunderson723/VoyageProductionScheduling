@@ -1918,6 +1918,32 @@ const PRODUCTION_RUN_RATE_LIMIT_MS = 1100;
 
 function sleepMs(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// Wrap a Cin7 fetch with 429-aware backoff. Cin7 caps at 60 calls/60s on
+// a rolling window; when we trip that, the call returns text/plain "You
+// have reached 60 calls per 60 seconds API limit." We back off enough to
+// fully refill the budget before retrying, up to 3 attempts. After that
+// we return the final response (still 429) and let the caller's existing
+// !resp.ok branch throw.
+async function cin7FetchWithBackoff(url, fetchOpts, label) {
+  const MAX_ATTEMPTS = 3;
+  let resp;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    resp = await fetch(url, fetchOpts);
+    if (resp.status !== 429) return resp;
+    if (attempt === MAX_ATTEMPTS) break;
+    // Honor Retry-After if Cin7 sets one; otherwise wait the full rolling
+    // window (60s) plus a small jitter so multiple callers don't all retry
+    // at the same instant.
+    const retryAfterRaw = parseInt(resp.headers.get("retry-after") || "0", 10);
+    const baseMs = retryAfterRaw > 0 ? retryAfterRaw * 1000 : 60_000;
+    const jitterMs = Math.floor(((attempt * 13) % 7) * 1000); // deterministic 0–6s jitter
+    const waitMs = baseMs + jitterMs;
+    console.warn(`[Cin7 ${label}] 429 rate limit on attempt ${attempt}/${MAX_ATTEMPTS}; backing off ${Math.round(waitMs/1000)}s before retry`);
+    await sleepMs(waitMs);
+  }
+  return resp;
+}
+
 async function fetchProductionOrderList(opts) {
   if (!process.env.CIN7_ACCOUNT_ID || !process.env.CIN7_APPLICATION_KEY) {
     throw new Error("CIN7_ACCOUNT_ID or CIN7_APPLICATION_KEY environment variable not set");
@@ -1933,9 +1959,14 @@ async function fetchProductionOrderList(opts) {
   const all = [];
   let page = 1;
   while (true) {
+    // Pace pagination calls — same 1.1s gap we already use between detail
+    // calls. Without this, a 5+ page list (typical with the 90-day lookback)
+    // burns through the 60/min budget in seconds and starves later detail
+    // calls, manifesting as 429s mid-sync.
+    if (page > 1) await sleepMs(PRODUCTION_RUN_RATE_LIMIT_MS);
     params.set("Page", String(page));
     const url = `${C7_PROD_BASE}/production/orderList?${params.toString()}`;
-    const resp = await fetch(url, { headers: cin7Headers(), redirect: "follow" });
+    const resp = await cin7FetchWithBackoff(url, { headers: cin7Headers(), redirect: "follow" }, "productionOrderList");
     const ct = resp.headers.get("content-type") || "";
     const text = await resp.text().catch(() => "");
     if (!resp.ok) {
@@ -1955,7 +1986,7 @@ async function fetchProductionOrderList(opts) {
 
 async function fetchProductionRunDetail(productionOrderID) {
   const url = `${C7_PROD_BASE}/production/order/run?ProductionOrderID=${encodeURIComponent(productionOrderID)}`;
-  const resp = await fetch(url, { headers: cin7Headers(), redirect: "follow" });
+  const resp = await cin7FetchWithBackoff(url, { headers: cin7Headers(), redirect: "follow" }, "productionRun");
   const ct = resp.headers.get("content-type") || "";
   const text = await resp.text().catch(() => "");
   if (!resp.ok) {
@@ -1965,7 +1996,24 @@ async function fetchProductionRunDetail(productionOrderID) {
   catch (_) { throw new Error(`Cin7 productionRun ${resp.status} non-JSON [${ct}]: ${text.slice(0, 300)}`); }
 }
 
+// Module-level concurrency lock. Prevents a second sync from kicking off
+// while the first is still running — a double-click on "Sync now" used to
+// fire two parallel runs that combined to blow past the 60/min rate limit.
+let _prodRunSyncInFlight = false;
+
 async function performProductionRunSync() {
+  if (_prodRunSyncInFlight) {
+    throw new Error("A production-run sync is already running. Wait for it to finish before triggering another.");
+  }
+  _prodRunSyncInFlight = true;
+  try {
+    return await _performProductionRunSyncInner();
+  } finally {
+    _prodRunSyncInFlight = false;
+  }
+}
+
+async function _performProductionRunSyncInner() {
   const now = new Date();
   const end = now.toISOString().slice(0, 10);
   const startD = new Date(now);
