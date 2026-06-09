@@ -3803,14 +3803,19 @@ function extractBomSku(orderSku, bomParents) {
 function buildRequirements(orders, bomParents, opts) {
   const horizonEnd = mrpAddDays(opts.today, opts.horizonDays);
   const requirements = [];
-  const skipped = { unconfirmed: 0, complete: 0, noStart: 0, outsideHorizon: 0, noBom: 0 };
+  const skipped = { unconfirmed: 0, complete: 0, noStart: 0, outsideHorizon: 0, noBom: 0, excludedByDate: 0 };
   const noBomExamples = [];
+  // "Exclude before" filter — solves the lingering-TBD problem where
+  // uncleared old orders inflate MRP demand for material that's actually
+  // already been produced. opts.excludeBeforeDate is a YYYY-MM-DD string.
+  const excludeBeforeDate = opts.excludeBeforeDate || null;
 
   for (const o of orders) {
     if (!opts.includeUnconfirmed && o.confirmed === false) { skipped.unconfirmed++; continue; }
     if (o.status === "complete") { skipped.complete++; continue; }
     if (!o.start) { skipped.noStart++; continue; }
     if (o.start > horizonEnd) { skipped.outsideHorizon++; continue; }
+    if (excludeBeforeDate && o.start < excludeBeforeDate) { skipped.excludedByDate++; continue; }
 
     const plannedQty = o.total || (o.qty || 0) * (o.batches || 1);
     if (!o.sku || plannedQty <= 0) { skipped.noBom++; continue; }
@@ -3980,11 +3985,15 @@ app.get("/api/mrp/run", (req, res) => {
     const includeUnconfirmed = req.query.includeUnconfirmed === "1" || req.query.includeUnconfirmed === "true";
     const applyWastage = req.query.applyWastage !== "0" && req.query.applyWastage !== "false";
     const horizonDays = Math.max(1, Math.min(365, parseInt(req.query.horizonDays, 10) || 120));
+    // Optional "exclude orders with start < this date" filter — accepts
+    // YYYY-MM-DD. Empty/invalid → filter disabled.
+    const excludeBeforeRaw = String(req.query.excludeBefore || "").trim();
+    const excludeBeforeDate = /^\d{4}-\d{2}-\d{2}$/.test(excludeBeforeRaw) ? excludeBeforeRaw : null;
     const today = new Date().toISOString().slice(0, 10);
 
     const { orders, bomParents, supply, onHandBySku, costsBySku, costsLastSync } = getMrpInputs();
     const { requirements, skipped, noBomExamples } = buildRequirements(orders, bomParents, {
-      today, horizonDays, includeUnconfirmed, applyWastage,
+      today, horizonDays, includeUnconfirmed, applyWastage, excludeBeforeDate,
     });
     const { skuResults, suggestedPOs, atRiskOrders } = allocateAndPlan(requirements, onHandBySku, supply, today);
 
@@ -4022,9 +4031,9 @@ app.get("/api/mrp/run", (req, res) => {
       ok: true,
       runAt: new Date().toISOString(),
       today,
-      settings: { includeUnconfirmed, applyWastage, horizonDays },
+      settings: { includeUnconfirmed, applyWastage, horizonDays, excludeBeforeDate },
       summary: {
-        ordersConsidered: orders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom),
+        ordersConsidered: orders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom + skipped.excludedByDate),
         ordersSkipped: skipped,
         noBomExamples,
         requirementCount: requirements.length,

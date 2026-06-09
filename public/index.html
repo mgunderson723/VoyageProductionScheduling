@@ -1163,6 +1163,11 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
           Horizon (days):
           <input type="number" id="mrp-horizon-days" min="7" max="365" value="120" style="width:70px;padding:4px 8px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;">
         </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);" title="Skips orders whose start date is before this — useful for stale TBD-* orders the team hasn't cleared yet.">
+          Exclude orders before:
+          <input type="date" id="mrp-exclude-before" style="padding:3px 6px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;">
+          <button class="btn btn-sm" type="button" onclick="document.getElementById('mrp-exclude-before').value='';" title="Clear date" style="padding:2px 6px;font-size:11px;">×</button>
+        </label>
       </div>
     </div>
 
@@ -3101,6 +3106,11 @@ async function runMrp() {
     applyWastage: document.getElementById('mrp-apply-wastage').checked ? '1' : '0',
     horizonDays: String(parseInt(document.getElementById('mrp-horizon-days').value, 10) || 120),
   });
+  // Optional "exclude orders before" filter — only included when the user
+  // has actually picked a date; empty stays absent so the server can tell
+  // disabled apart from "any date" semantics.
+  const excludeBefore = (document.getElementById('mrp-exclude-before').value || '').trim();
+  if (excludeBefore) params.set('excludeBefore', excludeBefore);
   const tsEl = document.getElementById('mrp-run-ts');
   tsEl.textContent = 'Running…';
   try {
@@ -3111,7 +3121,11 @@ async function runMrp() {
     document.getElementById('mrp-empty').style.display = 'none';
     document.getElementById('mrp-results').style.display = '';
     const d = new Date(j.runAt);
-    tsEl.textContent = `Last run ${d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} · today=${j.today}`;
+    const excludedByDate = (j.summary && j.summary.ordersSkipped && j.summary.ordersSkipped.excludedByDate) || 0;
+    const filterNote = (j.settings && j.settings.excludeBeforeDate)
+      ? ` · ${excludedByDate} order${excludedByDate === 1 ? '' : 's'} excluded before ${j.settings.excludeBeforeDate}`
+      : '';
+    tsEl.textContent = `Last run ${d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} · today=${j.today}${filterNote}`;
     renderMrp();
   } catch (e) {
     tsEl.textContent = 'Failed: ' + e.message;
