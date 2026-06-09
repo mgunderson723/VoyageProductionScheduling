@@ -880,7 +880,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
   <div class="tabs">
     <button class="tab active" onclick="switchTab('calendar')">Calendar</button>
     <button class="tab" onclick="switchTab('orders')">Work orders</button>
-    <button class="tab" onclick="switchTab('pipeline')">Pipeline</button>
+    <button class="tab" onclick="switchTab('pipeline')" id="tab-pipeline-btn" style="display:none;">Pipeline</button>
     <button class="tab" onclick="switchTab('capacity')">Capacity &amp; ops</button>
     <button class="tab" onclick="switchTab('traceability')">Traceability</button>
     <button class="tab" onclick="switchTab('mo-status')">MO Status</button>
@@ -1196,9 +1196,13 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
           <input type="checkbox" id="mrp-include-drafts" style="margin:0;"/>
           Include pipeline drafts
         </label>
-        <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
-          Horizon (days):
+        <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);" title="How far MRP looks ahead for demand — affects what at-risk MOs surface.">
+          Planning horizon (days):
           <input type="number" id="mrp-horizon-days" min="7" max="365" value="120" style="width:70px;padding:4px 8px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;">
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);" title="Suggested POs are limited to those whose must-order-by date falls within this window. Anything beyond shows as 'deferred' — visible but not in the headline KPI. Set to 0 to disable the cap.">
+          PO horizon (days):
+          <input type="number" id="mrp-po-horizon-days" min="0" max="365" value="30" style="width:60px;padding:4px 8px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;">
         </label>
         <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);" title="Skips orders whose start date is before this — useful for stale TBD-* orders the team hasn't cleared yet.">
           Exclude orders before:
@@ -1848,6 +1852,7 @@ function showApp(){
   document.getElementById('tab-admin-btn').style.display=isAdmin?'':'none';
   document.getElementById('tab-mrp-setup-btn').style.display=isAdmin?'':'none';
   document.getElementById('tab-yield-setup-btn').style.display=isAdmin?'':'none';
+  document.getElementById('tab-pipeline-btn').style.display=isAdmin?'':'none';
   // MRP tab visible to admin + operator + planner. Planner is a read-only
   // role designed for procurement / finance users who need to act on PO
   // suggestions but should not edit the production schedule.
@@ -2520,6 +2525,7 @@ function switchTab(t){
   if(t==='admin'&&(!currentUser||currentUser.role!=='admin'))return;
   if(t==='mrp-setup'&&(!currentUser||currentUser.role!=='admin'))return;
   if(t==='yield-setup'&&(!currentUser||currentUser.role!=='admin'))return;
+  if(t==='pipeline'&&(!currentUser||currentUser.role!=='admin'))return;
   if(t==='mrp'&&(!currentUser||currentUser.role==='viewer'))return;
   ['calendar','orders','pipeline','capacity','traceability','mo-status','live-inv','error-reporting','production-output','yield','mrp','mrp-setup','yield-setup','admin'].forEach(k=>{document.getElementById('tab-'+k).style.display=k===t?'':'none';});
   document.querySelectorAll('.tab').forEach(el=>{
@@ -3150,6 +3156,8 @@ async function runMrp() {
   const excludeBefore = (document.getElementById('mrp-exclude-before').value || '').trim();
   if (excludeBefore) params.set('excludeBefore', excludeBefore);
   if (document.getElementById('mrp-include-drafts').checked) params.set('includeDrafts', '1');
+  const poHorizonRaw = parseInt(document.getElementById('mrp-po-horizon-days').value, 10);
+  if (Number.isFinite(poHorizonRaw) && poHorizonRaw >= 0) params.set('poHorizonDays', String(poHorizonRaw));
   const tsEl = document.getElementById('mrp-run-ts');
   tsEl.textContent = 'Running…';
   try {
@@ -3167,7 +3175,12 @@ async function runMrp() {
     const draftsNote = (j.settings && j.settings.includeDrafts)
       ? ` · ${j.settings.draftsCount || 0} pipeline draft${(j.settings.draftsCount || 0) === 1 ? '' : 's'} included`
       : '';
-    tsEl.textContent = `Last run ${d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} · today=${j.today}${filterNote}${draftsNote}`;
+    const deferredCount = (j.summary && j.summary.deferredPoCount) || 0;
+    const poHorizon = j.settings && j.settings.poHorizonDays;
+    const poNote = (poHorizon > 0 && deferredCount > 0)
+      ? ` · ${deferredCount} PO${deferredCount === 1 ? '' : 's'} deferred beyond ${poHorizon}d horizon`
+      : '';
+    tsEl.textContent = `Last run ${d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} · today=${j.today}${filterNote}${draftsNote}${poNote}`;
     renderMrp();
   } catch (e) {
     tsEl.textContent = 'Failed: ' + e.message;
@@ -4534,8 +4547,65 @@ function renderPipeline() {
         </thead>
         <tbody>${rows}</tbody>
       </table>
-    </div>`;
+    </div>
+    ${renderPipelineSchedule()}`;
   updatePipelineSelectionUi();
+}
+
+// Calendar context for the Pipeline tab — shows currently-scheduled
+// orders alongside the drafts so users can scan both sources in one
+// view. Read-only; mirrors the start..end shape from the calendar.
+function renderPipelineSchedule() {
+  const today = new Date().toISOString().slice(0, 10);
+  const horizonD = new Date(); horizonD.setDate(horizonD.getDate() + 90);
+  const horizonStr = horizonD.toISOString().slice(0, 10);
+  const scheduled = (orders || [])
+    .filter(o => o && o.status !== 'complete' && o.start && o.start >= today && o.start <= horizonStr)
+    .sort((a, b) => (a.start || '').localeCompare(b.start || ''));
+  if (scheduled.length === 0) {
+    return `
+      <div style="margin-top:var(--vf-space-4);">
+        <h3 style="font-size:var(--vf-text-base);margin:var(--vf-space-3) 0 var(--vf-space-2);color:var(--vf-text-primary);">Currently scheduled (next 90d)</h3>
+        <div style="padding:16px;background:var(--vf-surface-raised);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);color:var(--vf-text-secondary);font-size:13px;">
+          No active orders scheduled in the next 90 days.
+        </div>
+      </div>`;
+  }
+  const fmtQty = q => (q == null) ? '—' : Number(q).toLocaleString(undefined, { maximumFractionDigits: 1 });
+  const statusColor = s => s === 'in-progress' ? 'var(--vf-info-text)' : (s === 'on-hold' ? 'var(--vf-warning-text)' : 'var(--vf-text-tertiary)');
+  const rows = scheduled.map(o => `
+    <tr>
+      <td style="font-family:var(--vf-font-mono);font-size:11px;">${escapeHtml(o.orderId || '')}</td>
+      <td style="font-size:12px;color:var(--vf-text-secondary);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(o.sku || '')}">${escapeHtml(o.sku || '—')}</td>
+      <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(o.machine || '—')}</td>
+      <td style="text-align:right;font-variant-numeric:tabular-nums;font-size:12px;">${fmtQty(o.total || (o.qty || 0) * (o.batches || 1))} <span style="color:var(--vf-text-tertiary);font-size:11px;">kg</span></td>
+      <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(o.start || '?')}</td>
+      <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(o.end || o.start || '?')}</td>
+      <td style="font-size:11px;color:${statusColor(o.status)};">${escapeHtml(o.status || 'queued')}</td>
+    </tr>`).join('');
+  return `
+    <div style="margin-top:var(--vf-space-4);">
+      <h3 style="font-size:var(--vf-text-base);margin:var(--vf-space-3) 0 var(--vf-space-2);color:var(--vf-text-primary);">
+        Currently scheduled (next 90d)
+        <span style="font-size:11px;font-weight:normal;color:var(--vf-text-tertiary);margin-left:8px;">${scheduled.length} order${scheduled.length === 1 ? '' : 's'}</span>
+      </h3>
+      <div style="overflow-x:auto;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);max-height:400px;overflow-y:auto;">
+        <table class="status-table" style="margin:0;">
+          <thead style="position:sticky;top:0;background:var(--vf-surface-sunken);z-index:1;">
+            <tr>
+              <th>MO #</th>
+              <th>SKU</th>
+              <th>Machine</th>
+              <th style="text-align:right;">Qty</th>
+              <th>Start</th>
+              <th>End</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </div>`;
 }
 
 function togglePipelineSelect(id) {

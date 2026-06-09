@@ -1733,7 +1733,10 @@ function buildPipelineDrafts(opportunities) {
 }
 
 // POST /api/pipeline/import — upload an XLSX, parse it, write drafts blob.
-app.post("/api/pipeline/import", upload.single("file"), (req, res) => {
+// Admin only — pipeline data is commercially sensitive (customer names,
+// won/lost deal sizes, confidence levels) and shouldn't be exposed to
+// operators/planners.
+app.post("/api/pipeline/import", requireAdmin, upload.single("file"), (req, res) => {
   if (!req.file) return res.status(400).json({ ok: false, error: "No file uploaded (multipart field name: 'file')" });
   let parsed;
   try { parsed = parsePipelineXlsx(req.file.buffer); }
@@ -1763,8 +1766,8 @@ app.post("/api/pipeline/import", upload.single("file"), (req, res) => {
   });
 });
 
-// GET /api/pipeline/drafts — return the current drafts blob.
-app.get("/api/pipeline/drafts", (req, res) => {
+// GET /api/pipeline/drafts — return the current drafts blob. Admin only.
+app.get("/api/pipeline/drafts", requireAdmin, (req, res) => {
   const blob = readData("vf_pipeline_drafts");
   if (!blob) return res.json({ ok: true, lastImport: null, source: null, drafts: [] });
   res.json({ ok: true, ...blob });
@@ -1775,7 +1778,7 @@ app.get("/api/pipeline/drafts", (req, res) => {
 // duplicate guard as the AI add_order tool. Returns per-draft results so
 // the UI can flag partial failures clearly. Successful promotes are
 // removed from the drafts blob.
-app.post("/api/pipeline/drafts/promote", requireOrderEdit, (req, res) => {
+app.post("/api/pipeline/drafts/promote", requireAdmin, (req, res) => {
   const body = req.body || {};
   const draftIds = Array.isArray(body.draftIds) ? body.draftIds : null;
   if (!draftIds || !draftIds.length) return res.status(400).json({ ok: false, error: "draftIds array required" });
@@ -1850,7 +1853,7 @@ app.post("/api/pipeline/drafts/promote", requireOrderEdit, (req, res) => {
 });
 
 // DELETE /api/pipeline/drafts/:id — discard one draft.
-app.delete("/api/pipeline/drafts/:id", requireOrderEdit, (req, res) => {
+app.delete("/api/pipeline/drafts/:id", requireAdmin, (req, res) => {
   const blob = readData("vf_pipeline_drafts");
   if (!blob || !Array.isArray(blob.drafts)) return res.status(404).json({ ok: false, error: "No drafts" });
   const before = blob.drafts.length;
@@ -1861,7 +1864,7 @@ app.delete("/api/pipeline/drafts/:id", requireOrderEdit, (req, res) => {
 });
 
 // DELETE /api/pipeline/drafts — clear everything.
-app.delete("/api/pipeline/drafts", requireOrderEdit, (req, res) => {
+app.delete("/api/pipeline/drafts", requireAdmin, (req, res) => {
   writeData("vf_pipeline_drafts", { lastImport: null, source: null, drafts: [] });
   res.json({ ok: true });
 });
@@ -4305,7 +4308,14 @@ app.get("/api/mrp/run", (req, res) => {
     const excludeBeforeRaw = String(req.query.excludeBefore || "").trim();
     const excludeBeforeDate = /^\d{4}-\d{2}-\d{2}$/.test(excludeBeforeRaw) ? excludeBeforeRaw : null;
     const includeDrafts = req.query.includeDrafts === "1" || req.query.includeDrafts === "true";
+    // PO horizon — how far ahead the user is willing to commit purchase
+    // orders. Suggested POs whose mustOrderByDate falls beyond this
+    // window are deferred to a separate bucket (visible in the response
+    // but excluded from headline KPIs). Default 30d; 0 or negative
+    // disables the cap (legacy behavior).
+    const poHorizonDays = Math.max(0, Math.min(365, parseInt(req.query.poHorizonDays, 10) || 30));
     const today = new Date().toISOString().slice(0, 10);
+    const poHorizonEndDate = poHorizonDays > 0 ? mrpAddDays(today, poHorizonDays) : null;
 
     const { orders, bomParents, supply, onHandBySku, costsBySku, costsLastSync } = getMrpInputs();
 
@@ -4355,27 +4365,47 @@ app.get("/api/mrp/run", (req, res) => {
     // Enrich each suggested PO with $$ — unit cost from Cin7 product cache,
     // line cost = unitCost × qtyToOrder. Mark missing-cost SKUs explicitly so
     // the UI can flag them rather than silently treating them as $0.
-    let totalDollars = 0;
-    let overdueDollars = 0;
-    let missingCostCount = 0;
+    //
+    // The PO horizon split happens here too: POs whose mustOrderByDate is
+    // beyond the cap move into deferredPOs and don't count toward the
+    // headline KPIs. dollarsByMonth still aggregates across both so the
+    // monthly cash-flow projection stays useful as a forward look.
+    let totalDollars = 0;          // in-window only
+    let overdueDollars = 0;        // in-window only
+    let missingCostCount = 0;      // in-window only (deferred tracked separately)
+    let deferredDollars = 0;
+    let deferredMissingCostCount = 0;
     const dollarsByMonth = {}; // YYYY-MM -> { total, overdue, count }
+    const inWindowPOs = [];
+    const deferredPOs = [];
     for (const po of suggestedPOs) {
       const c = costsBySku[po.sku];
       const unitCost = c && c.averageCost > 0 ? c.averageCost : null;
       po.unitCost = unitCost;
       po.lineCost = unitCost != null ? unitCost * po.qtyToOrder : null;
       po.costMissing = unitCost == null;
-      if (po.costMissing) missingCostCount++;
-      else {
-        totalDollars += po.lineCost;
-        if (po.isOverdue) overdueDollars += po.lineCost;
-        // Bucket by must-order-by month (or earliestNeedDate as fallback)
+      const deferred = poHorizonEndDate && po.mustOrderByDate && po.mustOrderByDate > poHorizonEndDate;
+      po.deferredByHorizon = !!deferred;
+      if (deferred) {
+        deferredPOs.push(po);
+        if (po.costMissing) deferredMissingCostCount++;
+        else deferredDollars += po.lineCost;
+      } else {
+        inWindowPOs.push(po);
+        if (po.costMissing) missingCostCount++;
+        else {
+          totalDollars += po.lineCost;
+          if (po.isOverdue) overdueDollars += po.lineCost;
+        }
+      }
+      // dollarsByMonth spans both — gives the user a forward cash flow view
+      if (po.lineCost != null) {
         const bucketDate = po.mustOrderByDate || po.earliestNeedDate;
         if (bucketDate) {
           const month = bucketDate.slice(0, 7);
           if (!dollarsByMonth[month]) dollarsByMonth[month] = { month, total: 0, overdue: 0, count: 0 };
           dollarsByMonth[month].total += po.lineCost;
-          if (po.isOverdue) dollarsByMonth[month].overdue += po.lineCost;
+          if (po.isOverdue && !deferred) dollarsByMonth[month].overdue += po.lineCost;
           dollarsByMonth[month].count += 1;
         }
       }
@@ -4386,7 +4416,7 @@ app.get("/api/mrp/run", (req, res) => {
       ok: true,
       runAt: new Date().toISOString(),
       today,
-      settings: { includeUnconfirmed, applyWastage, horizonDays, excludeBeforeDate, includeDrafts, draftsCount },
+      settings: { includeUnconfirmed, applyWastage, horizonDays, excludeBeforeDate, includeDrafts, draftsCount, poHorizonDays, poHorizonEndDate },
       summary: {
         ordersConsidered: mrpOrders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom + skipped.excludedByDate),
         ordersSkipped: skipped,
@@ -4394,17 +4424,22 @@ app.get("/api/mrp/run", (req, res) => {
         requirementCount: requirements.length,
         skuCount: skuResults.length,
         atRiskOrderCount: atRiskOrders.length,
-        suggestedPoCount: suggestedPOs.length,
-        overduePoCount: suggestedPOs.filter(p => p.isOverdue).length,
+        // PO counts — headline KPIs reflect in-window only
+        suggestedPoCount: inWindowPOs.length,
+        overduePoCount: inWindowPOs.filter(p => p.isOverdue).length,
+        deferredPoCount: deferredPOs.length,
         // $$ planning
         currency: "USD",
         totalDollars: Math.round(totalDollars * 100) / 100,
         overdueDollars: Math.round(overdueDollars * 100) / 100,
+        deferredDollars: Math.round(deferredDollars * 100) / 100,
         missingCostCount,
+        deferredMissingCostCount,
         costsLastSync,
         dollarsByMonth: dollarsByMonthArr,
       },
-      suggestedPOs,
+      suggestedPOs: inWindowPOs,
+      deferredPOs,
       atRiskOrders,
       skuResults,
     });
