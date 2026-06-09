@@ -656,6 +656,14 @@ AMBIGUITY HANDLING:
 - If a quantity, date, machine, or SKU isn't clearly specified, ASK rather than infer.
 - Never create multiple orders for the same SKU on the same date unless the user explicitly says they want multiple batches.
 
+MRP & MATERIAL QUESTIONS:
+- For ANY question involving materials, purchase orders, ordering, capital commitment, raw-material shortages, supplier orders, or "why is this PO/order looking off", call run_mrp FIRST to see the engine's current output.
+- run_mrp returns: summary (total $, PO counts, at-risk count), top suggested POs (in-window), deferred POs (beyond PO horizon), and at-risk MOs. Suggested POs are sorted by line cost desc — biggest commitments first.
+- If a PO looks anomalously large, trace it: (1) look at the SKU + qtyToOrder, (2) call get_orders to see what's scheduled, (3) call bom_expand on the FG/WIP orders that use that RM, (4) sum the leaf qtys for that SKU and compare to onHand. Tell the user the chain: "PO X is Y kg because orders A/B/C need Z kg each via the BOM, less onHand of W."
+- Default to poHorizonDays=30 (what we'd actually order this month). If the user asks about longer-range commitments, increase or set to 0.
+- If the user mentions the pipeline tab or a forward look, set includeDrafts=true so pipeline opportunities count as demand.
+- run_mrp is READ-ONLY — it doesn't queue anything for approval. You can call it freely.
+
 QUEUED FOR APPROVAL (how write tools work now):
 - Every call to a mutating tool (add_order, shift_machine_orders, update_order_dates, update_order_status, update_order_quantity, update_order_metadata, delete_order) is QUEUED, not executed immediately. The user sees a preview card in the UI and must click "Apply" before the action takes effect.
 - The tool result you receive will say "status: queued_for_approval" — that means the change is staged, not committed. The schedule will NOT update for your next get_orders call until the user applies.
@@ -876,6 +884,21 @@ const AI_TOOLS = [
         qty: { type: "number", description: "Production quantity in kg (or units, for packaged FGs)" },
       },
       required: ["sku", "qty"],
+    },
+  },
+  {
+    name: "run_mrp",
+    description: "Read-only. Runs the MRP engine against the current schedule + BOMs + on-hand inventory and returns a COMPACT summary: total $ committed, suggested POs (top by line cost), deferred POs, at-risk MOs. Use this when the user asks ANY question involving materials, ordering, capital commitment, supplier orders, raw material shortages, or 'why is this PO/order looking off'. The response also lets you spot anomalies (oversized POs, unexpected demand, at-risk MOs). To dig deeper into a suspicious PO, follow up with get_orders to see what's scheduled and bom_expand on those orders to trace the demand chain. Default settings mirror the UI: poHorizonDays=30 (only suggest POs that must be ordered within 30 days), horizonDays=120 (demand window), includeUnconfirmed=false. Pipeline drafts are NOT included unless includeDrafts=true.",
+    input_schema: {
+      type: "object",
+      properties: {
+        poHorizonDays:      { type: "number",  description: "Only suggest POs whose must-order-by date falls within this many days from today. Default 30. Set to 0 to disable the cap and see every PO across the whole demand window." },
+        horizonDays:        { type: "number",  description: "Planning horizon for demand — how far ahead MRP looks at orders. Default 120." },
+        includeUnconfirmed: { type: "boolean", description: "Include tentative/unconfirmed orders. Default false." },
+        includeDrafts:      { type: "boolean", description: "Include pipeline drafts as additional demand. Default false." },
+        excludeBefore:      { type: "string",  description: "Skip orders with start date before this (YYYY-MM-DD). Useful for filtering stale TBD orders." },
+        topN:               { type: "number",  description: "How many top-$ suggested POs to return. Default 20." },
+      },
     },
   },
 ];
@@ -1297,6 +1320,114 @@ async function executeAITool(name, input) {
         leafRequirements: leaves,
         intermediateStages: enriched,
         note: "leafRequirements = leaf-level raw materials to procure. intermediateStages = each WIP that must be produced (with its machine and lead time) — use these for backward production scheduling.",
+      };
+    }
+
+    case "run_mrp": {
+      const poHorizonDays      = Math.max(0, Math.min(365, isFinite(input.poHorizonDays) ? input.poHorizonDays : 30));
+      const horizonDays        = Math.max(1, Math.min(365, isFinite(input.horizonDays) ? input.horizonDays : 120));
+      const includeUnconfirmed = !!input.includeUnconfirmed;
+      const includeDrafts      = !!input.includeDrafts;
+      const excludeBeforeRaw   = String(input.excludeBefore || "").trim();
+      const excludeBeforeDate  = /^\d{4}-\d{2}-\d{2}$/.test(excludeBeforeRaw) ? excludeBeforeRaw : null;
+      const topN               = Math.max(1, Math.min(100, isFinite(input.topN) ? input.topN : 20));
+      const today              = new Date().toISOString().slice(0, 10);
+      const poHorizonEndDate   = poHorizonDays > 0 ? mrpAddDays(today, poHorizonDays) : null;
+
+      const { orders: rawOrders, bomParents, supply, onHandBySku, costsBySku } = getMrpInputs();
+
+      // Mirror the endpoint's pipeline-draft synth so the tool can answer
+      // "what if we include drafts?" without divergent logic.
+      let mrpOrders = rawOrders;
+      let draftsCount = 0;
+      if (includeDrafts) {
+        const pipelineBlob = readData("vf_pipeline_drafts");
+        const drafts = (pipelineBlob && pipelineBlob.drafts) || [];
+        const synth = [];
+        for (const d of drafts) {
+          if (!d.fgSKU || !d.shipMonth) continue;
+          const channel = (d.channel || "").toLowerCase();
+          let machine = "mac_packout";
+          if (channel.startsWith("coffee")) machine = "grinder";
+          else if (channel.startsWith("nut free")) machine = "pouching";
+          else if (channel.startsWith("chocolate liquor") || channel.startsWith("finished chocolate")) machine = "depositing";
+          synth.push({
+            id: "draft_" + d.id, orderId: "PIPELINE-" + (d.customer || "?") + "-" + (d.quarter || ""),
+            sku: d.fgSKU, machine, start: d.shipMonth, end: d.shipMonth, due: d.shipMonth,
+            qty: d.qtyValue || 0, batches: 1, total: d.qtyValue || 0,
+            status: "queued", confirmed: false, __fromPipelineDraft: true,
+          });
+        }
+        draftsCount = synth.length;
+        mrpOrders = rawOrders.concat(synth);
+      }
+
+      const { requirements, skipped } = buildRequirements(mrpOrders, bomParents, {
+        today, horizonDays, includeUnconfirmed, applyWastage: true, excludeBeforeDate,
+      });
+      const { suggestedPOs, atRiskOrders } = allocateAndPlan(requirements, onHandBySku, supply, today);
+
+      // Split + enrich with $$
+      let totalDollars = 0, overdueDollars = 0, missingCostCount = 0, deferredDollars = 0;
+      const inWindow = [], deferred = [];
+      for (const po of suggestedPOs) {
+        const c = costsBySku[po.sku];
+        const unitCost = c && c.averageCost > 0 ? c.averageCost : null;
+        po.unitCost = unitCost;
+        po.lineCost = unitCost != null ? unitCost * po.qtyToOrder : null;
+        po.costMissing = unitCost == null;
+        const isDeferred = poHorizonEndDate && po.mustOrderByDate && po.mustOrderByDate > poHorizonEndDate;
+        if (isDeferred) {
+          deferred.push(po);
+          if (po.lineCost) deferredDollars += po.lineCost;
+        } else {
+          inWindow.push(po);
+          if (po.costMissing) missingCostCount++;
+          else {
+            totalDollars += po.lineCost;
+            if (po.isOverdue) overdueDollars += po.lineCost;
+          }
+        }
+      }
+
+      // Sort by line cost desc (nulls last) and trim to topN
+      const byCostDesc = (a, b) => (b.lineCost || -1) - (a.lineCost || -1);
+      const trim = po => ({
+        sku: po.sku, name: po.name,
+        qtyToOrder: po.qtyToOrder, unit: po.unit,
+        unitCost: po.unitCost, lineCost: po.lineCost,
+        mustOrderByDate: po.mustOrderByDate, earliestNeedDate: po.earliestNeedDate,
+        leadTimeDays: po.leadTimeDays, leadTimeSource: po.leadTimeSource,
+        isOverdue: po.isOverdue, costMissing: po.costMissing,
+        onHand: po.onHand, onOrder: po.onOrder,
+      });
+      const trimAtRisk = o => ({
+        orderId: o.orderId, sku: o.sku, machine: o.machine,
+        start: o.start, end: o.end, qty: o.qty, status: o.status,
+        shortageSkus: (o.shortages || []).slice(0, 5).map(s => ({ sku: s.sku, shortageKg: s.shortageKg })),
+      });
+
+      return {
+        ok: true,
+        runAt: new Date().toISOString(),
+        today,
+        settings: { poHorizonDays, horizonDays, includeUnconfirmed, includeDrafts, draftsCount, excludeBeforeDate },
+        summary: {
+          ordersConsidered: mrpOrders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom + skipped.excludedByDate),
+          requirementCount: requirements.length,
+          atRiskOrderCount: atRiskOrders.length,
+          suggestedPoCount: inWindow.length,
+          deferredPoCount: deferred.length,
+          overduePoCount: inWindow.filter(p => p.isOverdue).length,
+          totalDollars: Math.round(totalDollars * 100) / 100,
+          overdueDollars: Math.round(overdueDollars * 100) / 100,
+          deferredDollars: Math.round(deferredDollars * 100) / 100,
+          missingCostCount,
+        },
+        suggestedPOs: inWindow.slice().sort(byCostDesc).slice(0, topN).map(trim),
+        deferredPOs: deferred.slice().sort(byCostDesc).slice(0, topN).map(trim),
+        atRiskOrders: atRiskOrders.slice(0, 30).map(trimAtRisk),
+        note: "suggestedPOs = top-N by line cost (highest $ first). To trace why a PO looks off, call get_orders to see scheduled MOs, then bom_expand on the suspect FG/WIP SKUs to see how much of the RM they require — sum those against onHand for the same picture MRP saw.",
       };
     }
 
