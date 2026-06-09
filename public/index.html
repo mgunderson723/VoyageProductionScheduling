@@ -880,6 +880,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
   <div class="tabs">
     <button class="tab active" onclick="switchTab('calendar')">Calendar</button>
     <button class="tab" onclick="switchTab('orders')">Work orders</button>
+    <button class="tab" onclick="switchTab('pipeline')">Pipeline</button>
     <button class="tab" onclick="switchTab('capacity')">Capacity &amp; ops</button>
     <button class="tab" onclick="switchTab('traceability')">Traceability</button>
     <button class="tab" onclick="switchTab('mo-status')">MO Status</button>
@@ -934,6 +935,38 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
     <div class="header"><h2>Work orders</h2><div style="display:flex;gap:8px;"><button class="btn" onclick="openImportModal()" id="btn-import-excel">↑ Import Excel</button><button class="btn btn-primary" onclick="openModal()">+ New order</button></div></div>
     <div class="metrics" id="metrics"></div>
     <div id="board"></div>
+  </div>
+
+  <!-- PIPELINE — draft production runs from sales pipeline -->
+  <div id="tab-pipeline" style="display:none;">
+    <div class="header">
+      <div style="display:flex;align-items:center;gap:var(--vf-space-3);flex-wrap:wrap;">
+        <h2>Pipeline</h2>
+        <span id="pipeline-meta" style="font-size:var(--vf-text-sm);color:var(--vf-text-tertiary);"></span>
+      </div>
+      <div style="display:flex;gap:var(--vf-space-2);align-items:center;">
+        <input type="file" id="pipeline-file-input" accept=".xlsx,.xls" style="display:none;" onchange="onPipelineFilePicked()">
+        <button class="btn" onclick="document.getElementById('pipeline-file-input').click()">↑ Import pipeline XLSX</button>
+        <button class="btn btn-sm" onclick="loadPipeline()">⟳ Refresh</button>
+      </div>
+    </div>
+
+    <div style="font-size:var(--vf-text-sm);color:var(--vf-text-secondary);margin:var(--vf-space-2) 0 var(--vf-space-3);max-width:820px;">
+      Upload the Voyage Pipeline Review .xlsx to generate draft production runs. Only rows with
+      <strong>Include in MRP = Y</strong> are pulled in. Drafts stay here until you click <strong>Promote</strong> — they
+      don't touch the calendar or MRP until you do. Confidence color: 🟢 ≥75% · 🟡 50–74% · 🔴 &lt;50%.
+    </div>
+
+    <div id="pipeline-bulk-bar" style="display:none;background:var(--vf-surface-raised);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);padding:8px 12px;margin-bottom:var(--vf-space-3);display:flex;gap:var(--vf-space-2);align-items:center;flex-wrap:wrap;">
+      <span id="pipeline-selected-count" style="font-size:12px;color:var(--vf-text-secondary);"></span>
+      <button class="btn btn-sm btn-primary" onclick="promotePipelineSelected()">Promote selected</button>
+      <button class="btn btn-sm" onclick="clearPipelineSelection()">Clear selection</button>
+      <span style="margin-left:auto;display:flex;gap:6px;">
+        <button class="btn btn-sm" onclick="discardAllPipelineDrafts()">Discard all drafts</button>
+      </span>
+    </div>
+
+    <div id="pipeline-content"></div>
   </div>
 
   <!-- CAPACITY -->
@@ -1158,6 +1191,10 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
         <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
           <input type="checkbox" id="mrp-apply-wastage" checked style="margin:0;"/>
           Apply wastage %
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);" title="Treat pending Pipeline-tab drafts as additional demand sources for this MRP run.">
+          <input type="checkbox" id="mrp-include-drafts" style="margin:0;"/>
+          Include pipeline drafts
         </label>
         <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
           Horizon (days):
@@ -2484,10 +2521,10 @@ function switchTab(t){
   if(t==='mrp-setup'&&(!currentUser||currentUser.role!=='admin'))return;
   if(t==='yield-setup'&&(!currentUser||currentUser.role!=='admin'))return;
   if(t==='mrp'&&(!currentUser||currentUser.role==='viewer'))return;
-  ['calendar','orders','capacity','traceability','mo-status','live-inv','error-reporting','production-output','yield','mrp','mrp-setup','yield-setup','admin'].forEach(k=>{document.getElementById('tab-'+k).style.display=k===t?'':'none';});
+  ['calendar','orders','pipeline','capacity','traceability','mo-status','live-inv','error-reporting','production-output','yield','mrp','mrp-setup','yield-setup','admin'].forEach(k=>{document.getElementById('tab-'+k).style.display=k===t?'':'none';});
   document.querySelectorAll('.tab').forEach(el=>{
     const tabName=el.textContent.trim().toLowerCase();
-    const map={'calendar':'calendar','work orders':'orders','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','mo status':'mo-status','live inventory':'live-inv','error reporting':'error-reporting','production output':'production-output','yield':'yield','mrp':'mrp','mrp setup':'mrp-setup','yield setup':'yield-setup','admin console':'admin'};
+    const map={'calendar':'calendar','work orders':'orders','pipeline':'pipeline','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','mo status':'mo-status','live inventory':'live-inv','error reporting':'error-reporting','production output':'production-output','yield':'yield','mrp':'mrp','mrp setup':'mrp-setup','yield setup':'yield-setup','admin console':'admin'};
     el.classList.toggle('active',map[tabName]===t);
   });
   if(t==='calendar')renderCal();
@@ -2502,6 +2539,7 @@ function switchTab(t){
   if(t==='yield-setup')loadYieldSetup();
   if(t==='mrp-setup')loadMrpSetup();
   if(t==='mrp')loadMrp();
+  if(t==='pipeline')loadPipeline();
 }
 function shiftCal(d){calOffset+=d*4;renderCal();}
 function resetCal(){calOffset=0;renderCal();}
@@ -3111,6 +3149,7 @@ async function runMrp() {
   // disabled apart from "any date" semantics.
   const excludeBefore = (document.getElementById('mrp-exclude-before').value || '').trim();
   if (excludeBefore) params.set('excludeBefore', excludeBefore);
+  if (document.getElementById('mrp-include-drafts').checked) params.set('includeDrafts', '1');
   const tsEl = document.getElementById('mrp-run-ts');
   tsEl.textContent = 'Running…';
   try {
@@ -3125,7 +3164,10 @@ async function runMrp() {
     const filterNote = (j.settings && j.settings.excludeBeforeDate)
       ? ` · ${excludedByDate} order${excludedByDate === 1 ? '' : 's'} excluded before ${j.settings.excludeBeforeDate}`
       : '';
-    tsEl.textContent = `Last run ${d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} · today=${j.today}${filterNote}`;
+    const draftsNote = (j.settings && j.settings.includeDrafts)
+      ? ` · ${j.settings.draftsCount || 0} pipeline draft${(j.settings.draftsCount || 0) === 1 ? '' : 's'} included`
+      : '';
+    tsEl.textContent = `Last run ${d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} · today=${j.today}${filterNote}${draftsNote}`;
     renderMrp();
   } catch (e) {
     tsEl.textContent = 'Failed: ' + e.message;
@@ -4387,6 +4429,211 @@ async function saveYieldBucket(idx) {
     if (meta) meta.textContent = `Saved ${new Date().toLocaleTimeString()} — next sync will rebucket runs.`;
   } catch (e) {
     alert('Save failed: ' + e.message);
+  }
+}
+
+// ── Pipeline tab ────────────────────────────────────────────────────────────
+//
+// Sales-pipeline-driven draft production runs. Users upload the team's
+// pipeline XLSX (filtered to Include in MRP = Y), review the drafts here
+// with confidence color-coding + per-row BOM chain context, then promote
+// selected drafts into the calendar.
+let pipelineData = null;
+let pipelineSelection = new Set();
+
+async function loadPipeline() {
+  const meta = document.getElementById('pipeline-meta');
+  const content = document.getElementById('pipeline-content');
+  content.innerHTML = '<div style="padding:20px;color:var(--vf-text-tertiary);font-size:13px;">Loading…</div>';
+  let d;
+  try {
+    const r = await fetch('/api/pipeline/drafts');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    d = await r.json();
+  } catch (e) {
+    content.innerHTML = `<div style="padding:20px;color:var(--vf-danger-text);background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:13px;">Failed to load: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  pipelineData = d;
+  pipelineSelection = new Set();
+  if (d.lastImport) {
+    const dt = new Date(d.lastImport);
+    const src = d.source || {};
+    const fname = src.filename || '(unknown file)';
+    const importer = src.importedBy || '?';
+    meta.textContent = `${(d.drafts || []).length} drafts pending · imported ${dt.toLocaleString()} by ${importer} from ${fname} · MRP=Y rows: ${src.mrpYesCount || 0} (${src.mrpNoCount || 0} skipped)`;
+  } else {
+    meta.textContent = 'No pipeline imported yet — click "Import pipeline XLSX" to upload.';
+  }
+  renderPipeline();
+}
+
+function renderPipeline() {
+  const content = document.getElementById('pipeline-content');
+  const drafts = (pipelineData && pipelineData.drafts) || [];
+  document.getElementById('pipeline-bulk-bar').style.display = drafts.length > 0 ? 'flex' : 'none';
+  if (drafts.length === 0) {
+    content.innerHTML = `<div style="padding:16px;background:var(--vf-surface-raised);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);color:var(--vf-text-secondary);font-size:13px;">No pipeline drafts. Upload an XLSX to generate them.</div>`;
+    return;
+  }
+  // Sort drafts by ship month asc, then customer
+  const sorted = drafts.slice().sort((a, b) => {
+    const ds = (a.shipMonth || '').localeCompare(b.shipMonth || '');
+    if (ds !== 0) return ds;
+    return (a.customer || '').localeCompare(b.customer || '');
+  });
+  const fmtPct = c => c == null ? '—' : Math.round(c * 100) + '%';
+  const fmtQty = (v, unit) => v == null ? '—' : Number(v).toLocaleString(undefined, { maximumFractionDigits: unit === 'cases' ? 0 : 1 }) + ' ' + unit;
+  const confColor = c => c == null ? 'var(--vf-text-tertiary)' : (c >= 0.75 ? 'var(--vf-success-text)' : (c >= 0.5 ? 'var(--vf-warning-text)' : 'var(--vf-danger-text)'));
+
+  const rows = sorted.map(d => {
+    const selected = pipelineSelection.has(d.id);
+    const issuesHtml = (d.dataIssues && d.dataIssues.length)
+      ? `<div style="margin-top:4px;font-size:11px;color:var(--vf-warning-text);">${d.dataIssues.map(s => '⚠ ' + escapeHtml(s)).join('<br>')}</div>` : '';
+    const chainHtml = d.chain && d.chain.length
+      ? d.chain.map(c => `<code style="font-size:11px;background:var(--vf-surface-sunken);padding:1px 5px;border-radius:3px;margin-right:4px;">${escapeHtml(c.sku)}${c.qty ? ' · ' + Number(c.qty).toFixed(1) : ''}</code>`).join(' ')
+      : `<span style="color:var(--vf-text-tertiary);font-size:11px;">${d.chainStatus === 'no_bom' ? 'No BOM — chain not expanded' : (d.chainError ? 'Error: ' + escapeHtml(d.chainError) : 'No upstream stages')}</span>`;
+    return `
+      <tr style="border-top:1px solid var(--vf-border-subtle);">
+        <td style="text-align:center;padding:8px;"><input type="checkbox" ${selected ? 'checked' : ''} onchange="togglePipelineSelect('${d.id}')"></td>
+        <td style="font-size:12px;font-weight:500;">${escapeHtml(d.customer || '?')}</td>
+        <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(d.channel || '')}</td>
+        <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(d.shipMonth || '?')}<div style="font-size:10px;">${escapeHtml(d.quarter || '')}</div></td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;font-size:12px;">${fmtQty(d.qtyValue, d.qtyUnit)}</td>
+        <td style="text-align:center;font-weight:600;color:${confColor(d.confidence)};">${fmtPct(d.confidence)}</td>
+        <td style="font-family:var(--vf-font-mono);font-size:11px;">${escapeHtml(d.fgSKU || '')}${issuesHtml}</td>
+        <td style="font-size:11px;color:var(--vf-text-secondary);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(d.comments || '')}">${escapeHtml(d.comments || '')}</td>
+        <td>
+          <button class="btn btn-sm btn-primary" style="font-size:11px;padding:3px 8px;" onclick="promotePipelineDraft('${d.id}')">Promote</button>
+          <button class="btn btn-sm" style="font-size:11px;padding:3px 8px;margin-left:4px;" onclick="discardPipelineDraft('${d.id}')">✕</button>
+        </td>
+      </tr>
+      <tr style="border-top:0;">
+        <td></td>
+        <td colspan="8" style="font-size:11px;padding:0 8px 8px;color:var(--vf-text-tertiary);">
+          <span style="color:var(--vf-text-secondary);">Upstream chain:</span> ${chainHtml}
+        </td>
+      </tr>`;
+  }).join('');
+
+  content.innerHTML = `
+    <div style="overflow-x:auto;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);">
+      <table class="status-table" style="margin:0;">
+        <thead>
+          <tr>
+            <th style="width:32px;"><input type="checkbox" onchange="toggleAllPipelineSelect(this.checked)"></th>
+            <th>Customer</th>
+            <th>Channel</th>
+            <th>Ship</th>
+            <th style="text-align:right;">Qty</th>
+            <th style="text-align:center;">Conf</th>
+            <th>FG SKU</th>
+            <th>Comments</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+  updatePipelineSelectionUi();
+}
+
+function togglePipelineSelect(id) {
+  if (pipelineSelection.has(id)) pipelineSelection.delete(id);
+  else pipelineSelection.add(id);
+  updatePipelineSelectionUi();
+}
+function toggleAllPipelineSelect(checked) {
+  const drafts = (pipelineData && pipelineData.drafts) || [];
+  if (checked) drafts.forEach(d => pipelineSelection.add(d.id));
+  else pipelineSelection = new Set();
+  renderPipeline();
+}
+function clearPipelineSelection() {
+  pipelineSelection = new Set();
+  renderPipeline();
+}
+function updatePipelineSelectionUi() {
+  const el = document.getElementById('pipeline-selected-count');
+  if (el) el.textContent = pipelineSelection.size + ' selected';
+}
+
+async function onPipelineFilePicked() {
+  const input = document.getElementById('pipeline-file-input');
+  if (!input.files || !input.files.length) return;
+  const file = input.files[0];
+  const meta = document.getElementById('pipeline-meta');
+  meta.textContent = 'Uploading + parsing…';
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const r = await fetch('/api/pipeline/import', { method: 'POST', body: fd });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    meta.textContent = `Imported · ${j.draftCount} drafts (${j.mrpYesCount} MRP=Y rows, ${j.mrpNoCount} skipped)${j.issuesCount ? ' · ' + j.issuesCount + ' with data issues' : ''}`;
+    await loadPipeline();
+  } catch (e) {
+    meta.textContent = '';
+    alert('Import failed: ' + e.message);
+  } finally {
+    input.value = '';
+  }
+}
+
+async function promotePipelineDraft(id) {
+  await promotePipelineDraftIds([id]);
+}
+async function promotePipelineSelected() {
+  const ids = Array.from(pipelineSelection);
+  if (!ids.length) { alert('Select at least one draft first.'); return; }
+  await promotePipelineDraftIds(ids);
+}
+async function promotePipelineDraftIds(ids) {
+  try {
+    const r = await fetch('/api/pipeline/drafts/promote', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ draftIds: ids }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    const okCount = j.results.filter(r => r.ok).length;
+    const failCount = j.results.length - okCount;
+    if (failCount > 0) {
+      const fails = j.results.filter(r => !r.ok).map(r => `• ${escapeHtml(r.error || 'unknown')}`).join('\n');
+      alert(`Promoted ${okCount} draft${okCount === 1 ? '' : 's'}, ${failCount} failed:\n\n${fails}`);
+    }
+    // Refresh local orders + drafts
+    const fresh = await serverGet('vf_orders');
+    if (Array.isArray(fresh)) orders = fresh;
+    render(); renderCal();
+    await loadPipeline();
+  } catch (e) {
+    alert('Promote failed: ' + e.message);
+  }
+}
+
+async function discardPipelineDraft(id) {
+  if (!confirm('Discard this draft? It will not affect any existing calendar orders.')) return;
+  try {
+    const r = await fetch('/api/pipeline/drafts/' + encodeURIComponent(id), { method: 'DELETE' });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    pipelineSelection.delete(id);
+    await loadPipeline();
+  } catch (e) {
+    alert('Discard failed: ' + e.message);
+  }
+}
+async function discardAllPipelineDrafts() {
+  if (!confirm('Discard ALL pipeline drafts? This does not affect any existing calendar orders.')) return;
+  try {
+    const r = await fetch('/api/pipeline/drafts', { method: 'DELETE' });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    await loadPipeline();
+  } catch (e) {
+    alert('Discard failed: ' + e.message);
   }
 }
 

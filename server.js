@@ -1554,6 +1554,318 @@ app.post("/api/chat/apply-pending", requireOrderEdit, async (req, res) => {
   res.json({ ok: true, results, appliedCount, failedCount });
 });
 
+// ── Sales pipeline import + drafts ──────────────────────────────────────────
+//
+// The team's Voyage Pipeline Review.xlsx tracks customer opportunities; we
+// surface a curated subset (Include in MRP = Y) as draft production runs
+// the user can selectively promote into vf_orders. Drafts live in their
+// own blob so the calendar/MRP aren't polluted until the user explicitly
+// commits them.
+//
+// Quirks worth knowing:
+// - The "Quantity in MTs" column is in METRIC TONS for everything except
+//   Nut Free Spreads, where the team uses it for CASE COUNT. We preserve
+//   the case-count semantics with qtyUnit="cases" instead of force-
+//   converting to kg.
+// - One channel/SKU mismatch exists in the source data (e.g. Mondelez
+//   Q4 row has Channel=Chocolate Liquor but SKU=FG-604-* which is NFS).
+//   We surface these as dataIssues[] instead of silently fixing.
+// - The BOM expansion gives us informational chain context for chocolate
+//   FGs. v1 promote creates the FG packout draft only; users can ask the
+//   AI chat bot to add upstream stages with proper scheduling.
+
+const PIPELINE_NFS_CHANNEL = "Nut Free Spreads";
+const PIPELINE_NFS_SKU_PREFIX = "FG-604-";
+
+function parsePipelineXlsx(buffer) {
+  const wb = XLSX.read(buffer, { type: "buffer", cellDates: true });
+  if (!wb.SheetNames.length) throw new Error("Workbook has no sheets");
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+
+  // Find the header row by scanning for the distinctive label set
+  let hdrIdx = -1;
+  for (let i = 0; i < Math.min(rows.length, 60); i++) {
+    const fields = rows[i].map(f => String(f || "").toLowerCase().trim());
+    if (fields.includes("quarter shipping") && fields.some(f => f.startsWith("include in mrp"))) {
+      hdrIdx = i; break;
+    }
+  }
+  if (hdrIdx === -1) throw new Error("Could not find header row (expected 'Quarter Shipping' + 'Include in MRP?' on the same row)");
+
+  // Map column names to indices
+  const hdr = rows[hdrIdx].map(h => String(h || "").toLowerCase().trim());
+  const col = {};
+  hdr.forEach((h, i) => {
+    if (h === "quarter shipping") col.quarter = i;
+    else if (h === "month") col.month = i;
+    else if (h === "customer") col.customer = i;
+    else if (h === "channel") col.channel = i;
+    else if (h.startsWith("quantity in")) col.qty = i;
+    else if (h === "confidence level") col.confidence = i;
+    else if (h === "sku") col.sku = i;
+    else if (h.startsWith("include in mrp")) col.includeInMrp = i;
+    else if (h === "comments") col.comments = i;
+  });
+  for (const k of ["quarter", "month", "customer", "channel", "qty", "sku", "includeInMrp"]) {
+    if (col[k] === undefined) throw new Error(`Pipeline header is missing required column: ${k}`);
+  }
+
+  const dateToISO = d => {
+    if (!d) return null;
+    if (d instanceof Date) return d.toISOString().slice(0, 10);
+    const s = String(d);
+    let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+    return null;
+  };
+  const numOf = v => {
+    if (v == null || v === "") return null;
+    const n = parseFloat(String(v).replace(/,/g, ""));
+    return isFinite(n) ? n : null;
+  };
+
+  const opportunities = [];
+  let mrpYesCount = 0, mrpNoCount = 0, blankRowsSkipped = 0;
+  for (let i = hdrIdx + 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r || !r.length) { blankRowsSkipped++; continue; }
+    const customer = String(r[col.customer] || "").trim();
+    const sku = String(r[col.sku] || "").trim();
+    if (!customer && !sku) { blankRowsSkipped++; continue; }
+    const flag = String(r[col.includeInMrp] || "").trim().toUpperCase();
+    if (flag === "Y") mrpYesCount++; else if (flag === "N") { mrpNoCount++; continue; } else { blankRowsSkipped++; continue; }
+
+    const channel = String(r[col.channel] || "").trim();
+    const qtyValue = numOf(r[col.qty]);
+    const confidence = numOf(r[col.confidence]);
+    const shipMonth = dateToISO(r[col.month]);
+    const quarter = String(r[col.quarter] || "").trim();
+    const comments = String(r[col.comments] || "").trim();
+
+    // Unit handling: Nut Free Spreads is case-count even though the
+    // header says MTs. Everything else converts MTs → kg.
+    const isNfs = channel === PIPELINE_NFS_CHANNEL;
+    const qtyUnit = isNfs ? "cases" : "kg";
+    const qtyInUnit = isNfs ? (qtyValue || 0) : ((qtyValue || 0) * 1000);
+
+    // Surface known data-quality issues so the user can decide rather
+    // than silently fixing them in import.
+    const dataIssues = [];
+    if (!shipMonth) dataIssues.push("Missing or unparseable Month — production timing can't be inferred");
+    if (!sku) dataIssues.push("SKU column is blank — promote will fail until you set one");
+    if (channel !== PIPELINE_NFS_CHANNEL && sku.startsWith(PIPELINE_NFS_SKU_PREFIX)) {
+      dataIssues.push(`Channel '${channel}' contradicts SKU prefix '${PIPELINE_NFS_SKU_PREFIX}' (looks like a Nut Free Spread)`);
+    }
+
+    opportunities.push({
+      pipelineRow: i + 1,   // 1-indexed for human reference
+      quarter, shipMonth,
+      customer, channel,
+      qtyRaw: qtyValue, qtyValue: qtyInUnit, qtyUnit,
+      confidence,
+      fgSKU: sku,
+      comments,
+      dataIssues,
+    });
+  }
+  return {
+    opportunities,
+    mrpYesCount,
+    mrpNoCount,
+    blankRowsSkipped,
+    headerRowIndex: hdrIdx,
+  };
+}
+
+// Build pipeline drafts from parsed opportunities, attaching the BOM-
+// expanded intermediates as informational chain context (we don't auto-
+// create upstream draft orders in v1 — promote creates the FG order
+// only; the user uses the AI bot for chain scheduling).
+function buildPipelineDrafts(opportunities) {
+  const bomBlob = readData("vf_boms");
+  const bomParents = (bomBlob && bomBlob.parents) || {};
+  return opportunities.map(o => {
+    let chain = [];
+    let chainStatus = "no_bom";
+    let chainError = null;
+    if (bomParents[o.fgSKU]) {
+      try {
+        // Use 1 unit / 1 kg as the basis for expansion — we just want the
+        // STRUCTURE of upstream stages, not absolute quantities. The user
+        // can scale during promote.
+        const result = expandBom(bomParents, o.fgSKU, o.qtyValue || 1, { applyWastage: true });
+        // Intermediates = recursion trail. Dedupe by sku, keep deepest qty.
+        const bySku = new Map();
+        for (const step of (result.intermediates || [])) {
+          if (step.sku === o.fgSKU) continue;
+          if (!bySku.has(step.sku)) bySku.set(step.sku, { sku: step.sku, qty: 0, depth: step.depth });
+          const entry = bySku.get(step.sku);
+          entry.qty += step.qty;
+          entry.depth = Math.max(entry.depth, step.depth);
+        }
+        chain = Array.from(bySku.values()).sort((a, b) => b.depth - a.depth || a.sku.localeCompare(b.sku));
+        chainStatus = chain.length > 0 ? "expanded" : "no_upstream";
+      } catch (e) {
+        chainStatus = "error";
+        chainError = e.message;
+      }
+    }
+    return {
+      id: "pd_" + crypto.randomBytes(6).toString("hex"),
+      pipelineRow: o.pipelineRow,
+      customer: o.customer,
+      channel: o.channel,
+      quarter: o.quarter,
+      shipMonth: o.shipMonth,
+      confidence: o.confidence,
+      qtyValue: o.qtyValue,
+      qtyRaw: o.qtyRaw,
+      qtyUnit: o.qtyUnit,
+      fgSKU: o.fgSKU,
+      comments: o.comments,
+      dataIssues: o.dataIssues,
+      chain,
+      chainStatus,
+      chainError,
+    };
+  });
+}
+
+// POST /api/pipeline/import — upload an XLSX, parse it, write drafts blob.
+app.post("/api/pipeline/import", upload.single("file"), (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: "No file uploaded (multipart field name: 'file')" });
+  let parsed;
+  try { parsed = parsePipelineXlsx(req.file.buffer); }
+  catch (e) { return res.status(400).json({ ok: false, error: "Parse failed: " + e.message }); }
+  const drafts = buildPipelineDrafts(parsed.opportunities);
+  const users = readData("vf_users") || [];
+  const u = users.find(x => x && x.id === req.userId);
+  const blob = {
+    lastImport: new Date().toISOString(),
+    source: {
+      filename: req.file.originalname || null,
+      importedBy: u ? u.username : "(unknown)",
+      mrpYesCount: parsed.mrpYesCount,
+      mrpNoCount: parsed.mrpNoCount,
+      blankRowsSkipped: parsed.blankRowsSkipped,
+      headerRowIndex: parsed.headerRowIndex,
+    },
+    drafts,
+  };
+  writeData("vf_pipeline_drafts", blob);
+  res.json({
+    ok: true,
+    draftCount: drafts.length,
+    mrpYesCount: parsed.mrpYesCount,
+    mrpNoCount: parsed.mrpNoCount,
+    issuesCount: drafts.filter(d => d.dataIssues && d.dataIssues.length).length,
+  });
+});
+
+// GET /api/pipeline/drafts — return the current drafts blob.
+app.get("/api/pipeline/drafts", (req, res) => {
+  const blob = readData("vf_pipeline_drafts");
+  if (!blob) return res.json({ ok: true, lastImport: null, source: null, drafts: [] });
+  res.json({ ok: true, ...blob });
+});
+
+// POST /api/pipeline/drafts/promote — body { draftIds: [..] }
+// For each draft, create an FG packout order in vf_orders. Runs the same
+// duplicate guard as the AI add_order tool. Returns per-draft results so
+// the UI can flag partial failures clearly. Successful promotes are
+// removed from the drafts blob.
+app.post("/api/pipeline/drafts/promote", requireOrderEdit, (req, res) => {
+  const body = req.body || {};
+  const draftIds = Array.isArray(body.draftIds) ? body.draftIds : null;
+  if (!draftIds || !draftIds.length) return res.status(400).json({ ok: false, error: "draftIds array required" });
+  const blob = readData("vf_pipeline_drafts");
+  if (!blob || !Array.isArray(blob.drafts)) return res.status(400).json({ ok: false, error: "No drafts to promote" });
+  const allowDup = !!body.allow_duplicate;
+
+  const orders = readData("vf_orders") || [];
+  const results = [];
+  const keepIds = new Set(blob.drafts.map(d => d.id));
+  for (const draftId of draftIds) {
+    const d = blob.drafts.find(x => x && x.id === draftId);
+    if (!d) { results.push({ id: draftId, ok: false, error: "draft not found" }); continue; }
+    if (!d.fgSKU) { results.push({ id: draftId, ok: false, error: "draft has no SKU" }); continue; }
+    if (!d.shipMonth) { results.push({ id: draftId, ok: false, error: "draft has no ship month" }); continue; }
+
+    // Default scheduling: place start/end on the ship month's first day.
+    // We're not trying to do smart backward-planning here — that's the
+    // AI bot's job after the user promotes. Conservative: just create
+    // the FG row so it shows up on the calendar.
+    const start = d.shipMonth;
+    const end = d.shipMonth;
+    // Channel → machine guess. Falls back to mac_packout for chocolate
+    // packout, grinder for coffee. Nut Free Spreads guess: pouching.
+    const channel = (d.channel || "").toLowerCase();
+    let machine = "mac_packout";
+    if (channel.startsWith("coffee")) machine = "grinder";
+    else if (channel.startsWith("nut free")) machine = "pouching";
+    else if (channel.startsWith("chocolate liquor") || channel.startsWith("finished chocolate")) machine = "depositing";
+
+    const conflict = allowDup ? null : findAddOrderConflict(orders, {
+      sku: d.fgSKU, machine, start, end,
+    });
+    if (conflict) {
+      results.push({
+        id: draftId, ok: false, duplicate: true,
+        error: `Existing order '${conflict.orderId}' (${conflict.sku}, ${conflict.machine}, ${conflict.start}..${conflict.end || conflict.start}) overlaps. Re-promote with allow_duplicate=true if intended.`,
+        existing: {
+          orderId: conflict.orderId, sku: conflict.sku, machine: conflict.machine,
+          start: conflict.start, end: conflict.end, qty: conflict.qty,
+        },
+      });
+      continue;
+    }
+
+    // Derive cat/sub from machine; chocolate liquor stays liquor.
+    const inferred = inferCatSubFromMachine(machine);
+    let cat = inferred.cat, sub = inferred.sub;
+    if (channel.startsWith("chocolate liquor")) { cat = "liquor"; sub = "liquor"; }
+
+    const id = `pl-${Date.now()}-${crypto.randomBytes(2).toString("hex")}`;
+    const orderId = `TBD-${machine}-${(start || "").replace(/-/g, "")}`;
+    const newOrder = {
+      id, orderId, sku: d.fgSKU, machine,
+      start, end, due: end,
+      qty: d.qtyValue || 0, batches: 1, total: d.qtyValue || 0,
+      status: "queued", priority: "med",
+      notes: `From pipeline: ${d.customer} (${d.quarter}) · conf ${d.confidence != null ? Math.round(d.confidence * 100) + "%" : "?"}${d.comments ? " · " + d.comments : ""}`,
+      cat, sub, region: "", temper: "",
+      confirmed: false,
+      pipelineSource: { customer: d.customer, channel: d.channel, shipMonth: d.shipMonth, confidence: d.confidence, pipelineRow: d.pipelineRow },
+    };
+    orders.push(newOrder);
+    results.push({ id: draftId, ok: true, orderId, machine, qty: newOrder.qty, qtyUnit: d.qtyUnit });
+    keepIds.delete(draftId);
+  }
+  writeData("vf_orders", orders);
+  // Strip promoted drafts from the blob
+  blob.drafts = blob.drafts.filter(d => keepIds.has(d.id));
+  writeData("vf_pipeline_drafts", blob);
+  res.json({ ok: true, results, remainingDrafts: blob.drafts.length });
+});
+
+// DELETE /api/pipeline/drafts/:id — discard one draft.
+app.delete("/api/pipeline/drafts/:id", requireOrderEdit, (req, res) => {
+  const blob = readData("vf_pipeline_drafts");
+  if (!blob || !Array.isArray(blob.drafts)) return res.status(404).json({ ok: false, error: "No drafts" });
+  const before = blob.drafts.length;
+  blob.drafts = blob.drafts.filter(d => d && d.id !== req.params.id);
+  if (blob.drafts.length === before) return res.status(404).json({ ok: false, error: "draft not found" });
+  writeData("vf_pipeline_drafts", blob);
+  res.json({ ok: true, remainingDrafts: blob.drafts.length });
+});
+
+// DELETE /api/pipeline/drafts — clear everything.
+app.delete("/api/pipeline/drafts", requireOrderEdit, (req, res) => {
+  writeData("vf_pipeline_drafts", { lastImport: null, source: null, drafts: [] });
+  res.json({ ok: true });
+});
+
 // ── Cin7 Core sync ────────────────────────────────────────────────────────────
 // Field-name map — if the first run shows different keys in /api/sync-cin7/test,
 // update the values here and redeploy.
@@ -3811,7 +4123,10 @@ function buildRequirements(orders, bomParents, opts) {
   const excludeBeforeDate = opts.excludeBeforeDate || null;
 
   for (const o of orders) {
-    if (!opts.includeUnconfirmed && o.confirmed === false) { skipped.unconfirmed++; continue; }
+    // Pipeline-draft synthetic orders bypass the "unconfirmed" filter —
+    // they're inherently unconfirmed (no operator has booked them) and
+    // including them in MRP is the whole point of the toggle.
+    if (!opts.includeUnconfirmed && o.confirmed === false && !o.__fromPipelineDraft) { skipped.unconfirmed++; continue; }
     if (o.status === "complete") { skipped.complete++; continue; }
     if (!o.start) { skipped.noStart++; continue; }
     if (o.start > horizonEnd) { skipped.outsideHorizon++; continue; }
@@ -3989,10 +4304,50 @@ app.get("/api/mrp/run", (req, res) => {
     // YYYY-MM-DD. Empty/invalid → filter disabled.
     const excludeBeforeRaw = String(req.query.excludeBefore || "").trim();
     const excludeBeforeDate = /^\d{4}-\d{2}-\d{2}$/.test(excludeBeforeRaw) ? excludeBeforeRaw : null;
+    const includeDrafts = req.query.includeDrafts === "1" || req.query.includeDrafts === "true";
     const today = new Date().toISOString().slice(0, 10);
 
     const { orders, bomParents, supply, onHandBySku, costsBySku, costsLastSync } = getMrpInputs();
-    const { requirements, skipped, noBomExamples } = buildRequirements(orders, bomParents, {
+
+    // When the toggle is on, synthesize order-shaped objects from each
+    // pipeline draft and concat them with the real orders. Synthetic
+    // entries are flagged with __fromPipelineDraft so buildRequirements
+    // can bypass the unconfirmed filter (drafts are always unconfirmed
+    // by definition).
+    let mrpOrders = orders;
+    let draftsCount = 0;
+    if (includeDrafts) {
+      const pipelineBlob = readData("vf_pipeline_drafts");
+      const drafts = (pipelineBlob && pipelineBlob.drafts) || [];
+      const synth = [];
+      for (const d of drafts) {
+        if (!d.fgSKU || !d.shipMonth) continue;
+        const channel = (d.channel || "").toLowerCase();
+        let machine = "mac_packout";
+        if (channel.startsWith("coffee")) machine = "grinder";
+        else if (channel.startsWith("nut free")) machine = "pouching";
+        else if (channel.startsWith("chocolate liquor") || channel.startsWith("finished chocolate")) machine = "depositing";
+        synth.push({
+          id: "draft_" + d.id,
+          orderId: "PIPELINE-" + (d.customer || "?") + "-" + (d.quarter || ""),
+          sku: d.fgSKU,
+          machine,
+          start: d.shipMonth,
+          end: d.shipMonth,
+          due: d.shipMonth,
+          qty: d.qtyValue || 0,
+          batches: 1,
+          total: d.qtyValue || 0,
+          status: "queued",
+          confirmed: false,
+          __fromPipelineDraft: true,
+        });
+      }
+      draftsCount = synth.length;
+      mrpOrders = orders.concat(synth);
+    }
+
+    const { requirements, skipped, noBomExamples } = buildRequirements(mrpOrders, bomParents, {
       today, horizonDays, includeUnconfirmed, applyWastage, excludeBeforeDate,
     });
     const { skuResults, suggestedPOs, atRiskOrders } = allocateAndPlan(requirements, onHandBySku, supply, today);
@@ -4031,9 +4386,9 @@ app.get("/api/mrp/run", (req, res) => {
       ok: true,
       runAt: new Date().toISOString(),
       today,
-      settings: { includeUnconfirmed, applyWastage, horizonDays, excludeBeforeDate },
+      settings: { includeUnconfirmed, applyWastage, horizonDays, excludeBeforeDate, includeDrafts, draftsCount },
       summary: {
-        ordersConsidered: orders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom + skipped.excludedByDate),
+        ordersConsidered: mrpOrders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom + skipped.excludedByDate),
         ordersSkipped: skipped,
         noBomExamples,
         requirementCount: requirements.length,
