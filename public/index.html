@@ -5250,6 +5250,34 @@ function aiQuickPrompt(type) {
   input.focus();
 }
 
+// Snapshot the current MRP-tab settings so the chat handler can use them
+// as defaults for any tool call where the bot doesn't pass an explicit
+// filter. This is the structural backstop for the bot's filter-amnesia
+// problem — even when it forgets to pass excludeBefore / includeDrafts /
+// etc., the server now substitutes whatever the user has on their MRP UI
+// instead of falling back to a hardcoded default.
+function readCurrentMrpSettings() {
+  const numOr = (id, fallback) => {
+    const v = parseInt((document.getElementById(id) || {}).value, 10);
+    return Number.isFinite(v) ? v : fallback;
+  };
+  const boolOr = (id, fallback) => {
+    const el = document.getElementById(id);
+    return el ? !!el.checked : fallback;
+  };
+  const strOr = (id, fallback) => {
+    const el = document.getElementById(id);
+    return el && el.value ? String(el.value).trim() : fallback;
+  };
+  return {
+    horizonDays:        numOr('mrp-horizon-days', 120),
+    poHorizonDays:      numOr('mrp-po-horizon-days', 30),
+    includeUnconfirmed: boolOr('mrp-include-unconfirmed', false),
+    includeDrafts:      boolOr('mrp-include-drafts', false),
+    excludeBefore:      strOr('mrp-exclude-before', ''),
+  };
+}
+
 async function sendAIMessage() {
   if (aiLoading) return;
   const input = document.getElementById('ai-input');
@@ -5271,7 +5299,7 @@ async function sendAIMessage() {
     const resp = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: aiMessages }),
+      body: JSON.stringify({ messages: aiMessages, mrpSettings: readCurrentMrpSettings() }),
     });
     const data = await resp.json();
     removeTypingIndicator();

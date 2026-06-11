@@ -997,7 +997,39 @@ function shiftDate(dateStr, days) {
   return d.toISOString().slice(0, 10);
 }
 
-async function executeAITool(name, input) {
+// Human-readable summary of the user's current MRP-tab settings, injected
+// as a banner at the end of the system prompt for each chat turn. Tells
+// the bot what filters will be auto-applied if it omits them on tool
+// calls — keeps its narration honest.
+function buildMrpSettingsBanner(s) {
+  if (!s || typeof s !== "object") return "";
+  const parts = [];
+  if (isFinite(s.horizonDays))   parts.push(`planning horizon ${s.horizonDays}d`);
+  if (isFinite(s.poHorizonDays)) parts.push(`PO horizon ${s.poHorizonDays}d`);
+  if (s.includeUnconfirmed)      parts.push("includeUnconfirmed=true");
+  if (s.includeDrafts)           parts.push("includeDrafts=true");
+  if (s.excludeBefore && /^\d{4}-\d{2}-\d{2}$/.test(String(s.excludeBefore).trim())) {
+    parts.push(`excludeBefore=${String(s.excludeBefore).trim()}`);
+  }
+  if (!parts.length) return "";
+  return `USER'S CURRENT MRP TAB SETTINGS (these auto-apply to any run_mrp / trace_po_demand call where you omit the corresponding parameter): ${parts.join(", ")}. If the user explicitly asks for a different scenario in this turn, pass the parameter explicitly to override — otherwise just call the tool and the server will use these. Your narration MUST match whatever the tool's response.settings field reports as the actually-applied values.`;
+}
+
+async function executeAITool(name, input, context) {
+  // Tool-layer filter inheritance: when the bot omits a filter param on
+  // run_mrp / trace_po_demand, fall back to the user's current MRP-tab
+  // settings (passed in by the chat handler). This is the structural
+  // backstop for the bot's filter-amnesia problem — even when it forgets
+  // to pass excludeBefore or includeDrafts, the user's UI setting wins
+  // over a hardcoded default.
+  const userSettings = (context && context.mrpSettings) || {};
+  const pickNum = (paramVal, userVal, fallback) =>
+    isFinite(paramVal) ? paramVal : (isFinite(userVal) ? userVal : fallback);
+  const pickBool = (paramVal, userVal, fallback) =>
+    typeof paramVal === "boolean" ? paramVal : (typeof userVal === "boolean" ? userVal : fallback);
+  const pickStr = (paramVal, userVal) =>
+    (typeof paramVal === "string" && paramVal.trim()) ? paramVal :
+    (typeof userVal === "string" && userVal.trim()) ? userVal : "";
   const orders = readData("vf_orders") || [];
   switch (name) {
     case "get_orders": {
@@ -1380,10 +1412,10 @@ async function executeAITool(name, input) {
       const targetSku = String(input.sku || "").trim();
       if (!targetSku) return { ok: false, error: "sku required" };
 
-      const horizonDays        = Math.max(1, Math.min(365, isFinite(input.horizonDays) ? input.horizonDays : 120));
-      const includeUnconfirmed = !!input.includeUnconfirmed;
-      const includeDrafts      = !!input.includeDrafts;
-      const excludeBeforeRaw   = String(input.excludeBefore || "").trim();
+      const horizonDays        = Math.max(1, Math.min(365, pickNum(input.horizonDays, userSettings.horizonDays, 120)));
+      const includeUnconfirmed = pickBool(input.includeUnconfirmed, userSettings.includeUnconfirmed, false);
+      const includeDrafts      = pickBool(input.includeDrafts, userSettings.includeDrafts, false);
+      const excludeBeforeRaw   = pickStr(input.excludeBefore, userSettings.excludeBefore);
       const excludeBeforeDate  = /^\d{4}-\d{2}-\d{2}$/.test(excludeBeforeRaw) ? excludeBeforeRaw : null;
       const today              = new Date().toISOString().slice(0, 10);
 
@@ -1507,11 +1539,11 @@ async function executeAITool(name, input) {
     }
 
     case "run_mrp": {
-      const poHorizonDays      = Math.max(0, Math.min(365, isFinite(input.poHorizonDays) ? input.poHorizonDays : 30));
-      const horizonDays        = Math.max(1, Math.min(365, isFinite(input.horizonDays) ? input.horizonDays : 120));
-      const includeUnconfirmed = !!input.includeUnconfirmed;
-      const includeDrafts      = !!input.includeDrafts;
-      const excludeBeforeRaw   = String(input.excludeBefore || "").trim();
+      const poHorizonDays      = Math.max(0, Math.min(365, pickNum(input.poHorizonDays, userSettings.poHorizonDays, 30)));
+      const horizonDays        = Math.max(1, Math.min(365, pickNum(input.horizonDays, userSettings.horizonDays, 120)));
+      const includeUnconfirmed = pickBool(input.includeUnconfirmed, userSettings.includeUnconfirmed, false);
+      const includeDrafts      = pickBool(input.includeDrafts, userSettings.includeDrafts, false);
+      const excludeBeforeRaw   = pickStr(input.excludeBefore, userSettings.excludeBefore);
       const excludeBeforeDate  = /^\d{4}-\d{2}-\d{2}$/.test(excludeBeforeRaw) ? excludeBeforeRaw : null;
       const topN               = Math.max(1, Math.min(100, isFinite(input.topN) ? input.topN : 20));
       const today              = new Date().toISOString().slice(0, 10);
@@ -1733,10 +1765,16 @@ app.post("/api/chat", requireOrderEdit, async (req, res) => {
   if (!process.env.ANTHROPIC_API_KEY) {
     return res.status(503).json({ ok: false, error: "AI assistant is not configured (missing ANTHROPIC_API_KEY)" });
   }
-  const { messages } = req.body;
+  const { messages, mrpSettings } = req.body;
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ ok: false, error: "messages array required" });
   }
+  // Tool-layer filter inheritance context (see executeAITool comment).
+  // mrpSettings snapshots the user's current MRP-tab inputs so the chat
+  // handler can use them as defaults whenever the bot omits a filter.
+  const toolContext = {
+    mrpSettings: (mrpSettings && typeof mrpSettings === "object") ? mrpSettings : {},
+  };
 
   try {
     const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -1744,6 +1782,13 @@ app.post("/api/chat", requireOrderEdit, async (req, res) => {
       role: m.role,
       content: m.content,
     }));
+    // Surface the snapshot to the model so it can SEE the user's current
+    // settings (and override per-tool if the user explicitly asked for
+    // something else). The defaults already kick in at the server layer
+    // even if the bot ignores this; this just lets the bot narrate
+    // accurately.
+    const settingsBanner = buildMrpSettingsBanner(toolContext.mrpSettings);
+    const systemWithCtx = settingsBanner ? AI_SYSTEM + "\n\n" + settingsBanner : AI_SYSTEM;
     let response;
     const pendingActions = []; // mutating tool calls queued for user approval
 
@@ -1752,7 +1797,7 @@ app.post("/api/chat", requireOrderEdit, async (req, res) => {
       response = await client.messages.create({
         model: "claude-opus-4-6",
         max_tokens: 4096,
-        system: AI_SYSTEM,
+        system: systemWithCtx,
         tools: AI_TOOLS,
         messages: currentMessages,
       });
@@ -1794,11 +1839,12 @@ app.post("/api/chat", requireOrderEdit, async (req, res) => {
               }),
             };
           }
-          // Read-only tools execute normally
+          // Read-only tools execute normally — with the user-settings
+          // context so MRP filter inheritance kicks in.
           return {
             type: "tool_result",
             tool_use_id: block.id,
-            content: JSON.stringify(await executeAITool(block.name, block.input)),
+            content: JSON.stringify(await executeAITool(block.name, block.input, toolContext)),
           };
         })
       );
