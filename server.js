@@ -669,12 +669,27 @@ MRP & MATERIAL QUESTIONS:
 - If the user mentions the pipeline tab or a forward look, set includeDrafts=true so pipeline opportunities count as demand.
 - run_mrp is READ-ONLY — it doesn't queue anything for approval. You can call it freely.
 
-DEMAND ATTRIBUTION (read this carefully — there's a recurring failure mode here):
+DEMAND ATTRIBUTION (read this carefully — this is the #1 source of bot errors on this app):
 - When you need to explain WHERE a PO's demand comes from, which orders DROVE a raw-material requirement, or WHY a specific SKU shows up in MRP — you MUST call trace_po_demand on that SKU. NEVER guess based on order size, product names, BOM intuition, or pattern matching ("this is the biggest order so it must be the cause").
 - BOMs are recursive and your model of any specific recipe is OFTEN WRONG. A product name like "Nut Free Spread" might contain sunflower paste, not chickpeas — you can't know what's in a BOM without expanding it. trace_po_demand gives you the ground truth.
 - If trace_po_demand returns an empty sources list for a SKU you expected to find demand for, the demand for that SKU isn't coming from where you thought. Tell the user clearly: "I was wrong — this RM isn't actually driven by [order you mentioned]. The real sources are [whatever the tool returned]."
-- Use the same horizonDays / includeUnconfirmed / includeDrafts / excludeBefore settings you used in run_mrp so the attribution matches. The user's UI MRP tab settings are the source of truth — if you've called run_mrp recently, mirror those exact settings in trace_po_demand. If you don't know what filters the user has applied in the UI, ASK before tracing so the numbers don't disagree with what they're looking at.
-- Combine the output with bom_expand when the user wants the per-FG breakdown: trace_po_demand tells you which orders drive the leaf demand; bom_expand on those orders' FG SKUs shows the recursive chain.
+
+FILTER MIRRORING (mandatory, no exceptions):
+- When the user states MRP settings in their prompt (e.g. "PO horizon 90", "exclude orders before 6/11", "include pipeline drafts", "120-day planning horizon") — you MUST pass those EXACT values to every tool call (run_mrp, trace_po_demand, get_on_hand). Failure to do this is the most common cause of your numbers diverging from what the user sees in the UI.
+- If the user references "MRP" without naming explicit filters, ask them: "Which MRP settings should I use — same as what's currently on your UI? (planning horizon, PO horizon, includeDrafts, excludeBefore)" Don't guess.
+- Specifically: excludeBefore is the most common one to forget. If the user said "ignore orders before X" anywhere in the thread, pass excludeBefore=X to EVERY trace_po_demand and run_mrp call until the user changes it. This is non-negotiable.
+
+PO-TOTAL ARITHMETIC (also mandatory):
+- A "PO" total = the NET kg you'd commit to a supplier. It equals run_mrp.suggestedPOs[].qtyToOrder. It is NOT the same as gross BOM-expanded demand.
+- Before quoting any PO total in your reply, find that exact SKU in run_mrp's suggestedPOs and use qtyToOrder VERBATIM. Do NOT sum bom_expand or trace_po_demand contributions to produce a PO total — those are gross demand and have NOT been netted against on-hand / on-order / in-transit.
+- If your computed gross demand is more than 10% different from run_mrp's qtyToOrder for the same SKU, your math is wrong. Re-call the tools with the correct filters; do NOT report the wrong number anyway.
+- When explaining a PO, show the gross→net story explicitly: "Gross BOM demand from these orders is X kg. On-hand + on-order covers Y kg. Net PO need (= MRP's suggested qtyToOrder) is Z kg." That makes the chain auditable.
+
+PER-ORDER ATTRIBUTION TABLE (always include when listing demand drivers):
+- When trace_po_demand returns multiple sources, show them as a table with these columns: source orderId, start date (or "pipeline draft, need by X" for synthetic drafts), FG SKU + qty, kg of the leaf RM contributed, % of total.
+- Stale orders that should have been filtered out are MOST visible in this table — their start dates will be before the user's excludeBefore cutoff and the user can immediately see the violation. Including this table is your built-in audit trail.
+
+Combine the output with bom_expand when the user wants the per-FG breakdown: trace_po_demand tells you which orders drive the leaf demand; bom_expand on those orders' FG SKUs shows the recursive chain.
 
 QUEUED FOR APPROVAL (how write tools work now):
 - Every call to a mutating tool (add_order, shift_machine_orders, update_order_dates, update_order_status, update_order_quantity, update_order_metadata, delete_order) is QUEUED, not executed immediately. The user sees a preview card in the UI and must click "Apply" before the action takes effect.
@@ -1387,7 +1402,7 @@ async function executeAITool(name, input) {
           else if (channel.startsWith("chocolate liquor") || channel.startsWith("finished chocolate")) machine = "depositing";
           synth.push({
             id: "draft_" + d.id,
-            orderId: "PIPELINE-" + (d.customer || "?") + "-" + (d.quarter || ""),
+            orderId: "PIPELINE-" + (d.customer || "?") + "-" + ((d.shipMonth || "").slice(0, 7) || d.quarter || ""),
             sku: d.fgSKU, machine, start: d.shipMonth, end: d.shipMonth, due: d.shipMonth,
             qty: d.qtyValue || 0, batches: 1, total: d.qtyValue || 0,
             status: "queued", confirmed: false, __fromPipelineDraft: true,
@@ -1520,7 +1535,7 @@ async function executeAITool(name, input) {
           else if (channel.startsWith("nut free")) machine = "pouching";
           else if (channel.startsWith("chocolate liquor") || channel.startsWith("finished chocolate")) machine = "depositing";
           synth.push({
-            id: "draft_" + d.id, orderId: "PIPELINE-" + (d.customer || "?") + "-" + (d.quarter || ""),
+            id: "draft_" + d.id, orderId: "PIPELINE-" + (d.customer || "?") + "-" + ((d.shipMonth || "").slice(0, 7) || d.quarter || ""),
             sku: d.fgSKU, machine, start: d.shipMonth, end: d.shipMonth, due: d.shipMonth,
             qty: d.qtyValue || 0, batches: 1, total: d.qtyValue || 0,
             status: "queued", confirmed: false, __fromPipelineDraft: true,
@@ -4668,7 +4683,7 @@ app.get("/api/mrp/run", (req, res) => {
         else if (channel.startsWith("chocolate liquor") || channel.startsWith("finished chocolate")) machine = "depositing";
         synth.push({
           id: "draft_" + d.id,
-          orderId: "PIPELINE-" + (d.customer || "?") + "-" + (d.quarter || ""),
+          orderId: "PIPELINE-" + (d.customer || "?") + "-" + ((d.shipMonth || "").slice(0, 7) || d.quarter || ""),
           sku: d.fgSKU,
           machine,
           start: d.shipMonth,
