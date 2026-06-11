@@ -583,10 +583,14 @@ Machines (use these exact keys):
 - Zone 2 Other: grinder (Ground BFC line — 1,000 kg per 2-hr shift)
 
 Capacity & runtime constraints (apply these when recommending slots):
-- east_mac / west_mac (Mcintyres): Runtime 12 days. Min 2,250 kg / Max 4,300 kg per batch. EU and US products cannot be mixed on the same run.
+- east_mac / west_mac (Mcintyres): Runtime 10 days. Min 2,250 kg / Max 4,300 kg per batch. EU and US products cannot be mixed on the same run. Shift count does NOT change Mcintyre throughput — runtime is fixed.
 - refining: Runtime 1 day. Max capacity 6,000 kg/day (4 batches × 1,500 kg). Min 500 kg per batch.
 - conching: Runtime 1 day. Min 3,000 kg / Max 6,000 kg per run.
-- roaster: ~325 kg per batch, up to ~4 batches/shift (~1,300 kg/day).
+- seed_clean: Throughput 1,302 kg/shift (linear: 2,604 kg at 2 shifts, 3,906 kg at 3 shifts). Same machine for chocolate (grapeseeds) and coffee (chickpeas).
+- roaster (Alk/Roaster): Per-product throughput, multi-shift linear.
+  - Grapeseeds (chocolate): 847 kg/shift (1,694 at 2 shifts, 2,541 at 3 shifts).
+  - Chickpeas (coffee): 1,163 kg/shift (2,326 at 2 shifts, 3,489 at 3 shifts).
+  - When sizing roaster capacity for a plan, use the throughput for the SPECIFIC product going through (chickpeas roast faster than grapeseeds).
 - fat_melter: CBE-based fat 24 hr melt cycle; CBS-based fat 72 hr. Runs simultaneously with liquor melting.
 - Liquor melting (pre-conching): 72 hr.
 
@@ -606,7 +610,7 @@ So 7,000 kg of finished CFC ≠ 7,000 kg of every input. Rough sanity check:
   - Plus ~210–420 kg melted fat (30% of liquor)
   - The remaining ~5,600–6,300 kg of CFC weight comes from sugar, packaging, flavorings, etc. as defined in the FG's BOM.
 
-Liquor (sold-as-is) production: roasting → fat melting (24/72 hr) → Mcintyre (12 days) → packout. Liquor IS made on the Mcintyre, not on the chocolate line.
+Liquor (sold-as-is) production: roasting → fat melting (24/72 hr) → Mcintyre (10 days) → packout. Liquor IS made on the Mcintyre, not on the chocolate line.
 
 CRITICAL: DO NOT recommend production schedules using straight-line 1:1 scaling of the requested FG qty through every upstream stage. ALWAYS call bom_expand FIRST for any multi-stage production planning so you have BOM-driven quantities at each step. If the user names a product loosely (e.g. "CFC 506 EU"), use find_bom to resolve to the actual SKU before bom_expand.
 
@@ -3749,8 +3753,8 @@ const WC_TO_MACHINE = {
 const MACHINE_LEAD_DAYS = {
   seed_clean:  1,
   roaster:     1,
-  east_mac:    12,
-  west_mac:    12,
+  east_mac:    10,
+  west_mac:    10,
   mac_1250:    1,
   mac_packout: 10,
   pouching:    1,
