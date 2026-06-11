@@ -673,7 +673,7 @@ DEMAND ATTRIBUTION (read this carefully — there's a recurring failure mode her
 - When you need to explain WHERE a PO's demand comes from, which orders DROVE a raw-material requirement, or WHY a specific SKU shows up in MRP — you MUST call trace_po_demand on that SKU. NEVER guess based on order size, product names, BOM intuition, or pattern matching ("this is the biggest order so it must be the cause").
 - BOMs are recursive and your model of any specific recipe is OFTEN WRONG. A product name like "Nut Free Spread" might contain sunflower paste, not chickpeas — you can't know what's in a BOM without expanding it. trace_po_demand gives you the ground truth.
 - If trace_po_demand returns an empty sources list for a SKU you expected to find demand for, the demand for that SKU isn't coming from where you thought. Tell the user clearly: "I was wrong — this RM isn't actually driven by [order you mentioned]. The real sources are [whatever the tool returned]."
-- Use the same horizonDays / includeUnconfirmed / includeDrafts settings you used in run_mrp so the attribution matches.
+- Use the same horizonDays / includeUnconfirmed / includeDrafts / excludeBefore settings you used in run_mrp so the attribution matches. The user's UI MRP tab settings are the source of truth — if you've called run_mrp recently, mirror those exact settings in trace_po_demand. If you don't know what filters the user has applied in the UI, ASK before tracing so the numbers don't disagree with what they're looking at.
 - Combine the output with bom_expand when the user wants the per-FG breakdown: trace_po_demand tells you which orders drive the leaf demand; bom_expand on those orders' FG SKUs shows the recursive chain.
 
 QUEUED FOR APPROVAL (how write tools work now):
@@ -1533,7 +1533,7 @@ async function executeAITool(name, input) {
       const { requirements, skipped } = buildRequirements(mrpOrders, bomParents, {
         today, horizonDays, includeUnconfirmed, applyWastage: true, excludeBeforeDate,
       });
-      const { suggestedPOs, atRiskOrders } = allocateAndPlan(requirements, onHandBySku, supply, today);
+      const { suggestedPOs, atRiskOrders } = allocateAndPlan(requirements, onHandBySku, supply, today, poHorizonEndDate);
 
       // Split + enrich with $$
       let totalDollars = 0, overdueDollars = 0, missingCostCount = 0, deferredDollars = 0;
@@ -4487,7 +4487,7 @@ function isProcurable(sku) {
 // Forward-walk allocation. For each SKU, walk requirements in date order,
 // drawing from running supply (on-hand + on-order). When supply hits zero,
 // every subsequent need becomes a shortfall → suggested PO.
-function allocateAndPlan(requirements, onHandBySku, supply, today) {
+function allocateAndPlan(requirements, onHandBySku, supply, today, poHorizonEndDate) {
   // Group requirements by SKU
   const bySku = {};
   for (const r of requirements) {
@@ -4512,8 +4512,12 @@ function allocateAndPlan(requirements, onHandBySku, supply, today) {
 
     let totalDemand = 0;
     let totalShort = 0;
-    let earliestShortDate = null;
     const allocations = [];
+    // Per-shortfall list — each item is one demand event the supply pool
+    // couldn't cover. Keeping these granular lets us bucket POs by each
+    // shortfall's own must-order-by date instead of lumping the whole
+    // forward window into one inflated PO dated by the earliest shortage.
+    const shortfalls = [];
 
     for (const r of reqs) {
       totalDemand += r.qtyKg;
@@ -4528,7 +4532,13 @@ function allocateAndPlan(requirements, onHandBySku, supply, today) {
       });
       if (shortage > 0) {
         totalShort += shortage;
-        if (!earliestShortDate || r.neededByDate < earliestShortDate) earliestShortDate = r.neededByDate;
+        const mustOrderBy = lead.leadTimeDays != null ? mrpAddDays(r.neededByDate, -lead.leadTimeDays) : null;
+        shortfalls.push({
+          qty: shortage,
+          neededByDate: r.neededByDate,
+          mustOrderByDate: mustOrderBy,
+          sourceOrderId: r.sourceOrderId,
+        });
         // Record at-risk for this MO
         if (!allAtRiskOrders.has(r.sourceOrderId)) {
           allAtRiskOrders.set(r.sourceOrderId, {
@@ -4546,21 +4556,41 @@ function allocateAndPlan(requirements, onHandBySku, supply, today) {
       }
     }
 
-    // Suggest a PO if there's a shortfall AND the SKU isn't contract-managed
+    // Suggest PO(s) if there are shortfalls AND the SKU isn't contract-managed.
+    // Bucket shortfalls by whether their own mustOrderByDate falls within the
+    // user's PO horizon — each bucket becomes its own PO so far-future demand
+    // doesn't inflate the in-window commitment.
     if (totalShort > 0 && !lead.isContract) {
-      const mustOrderBy = lead.leadTimeDays != null ? mrpAddDays(earliestShortDate, -lead.leadTimeDays) : null;
-      const isOverdue = mustOrderBy != null && mustOrderBy < today;
-      suggestedPOs.push({
-        sku,
-        name: onHand.name || "",
-        qtyToOrder: Math.ceil(totalShort),
-        earliestNeedDate: earliestShortDate,
-        leadTimeDays: lead.leadTimeDays,
-        leadTimeSource: lead.source,
-        mustOrderByDate: mustOrderBy,
-        isOverdue,
-        projectedReceiptDate: lead.leadTimeDays != null ? mrpAddDays(today, lead.leadTimeDays) : null,
-      });
+      const buckets = new Map(); // "in-window" | "deferred" → array of shortfalls
+      for (const sf of shortfalls) {
+        const bucket = (poHorizonEndDate && sf.mustOrderByDate && sf.mustOrderByDate > poHorizonEndDate)
+          ? "deferred"
+          : "in-window";
+        if (!buckets.has(bucket)) buckets.set(bucket, []);
+        buckets.get(bucket).push(sf);
+      }
+      // Emit PO per bucket — order: in-window first, then deferred
+      for (const bucketName of ["in-window", "deferred"]) {
+        const list = buckets.get(bucketName);
+        if (!list || !list.length) continue;
+        const bucketQty = list.reduce((s, x) => s + x.qty, 0);
+        const earliestNeed = list.reduce((min, x) =>
+          !min || x.neededByDate < min ? x.neededByDate : min, null);
+        const earliestMustOrderBy = list.reduce((min, x) =>
+          !min || (x.mustOrderByDate && x.mustOrderByDate < min) ? x.mustOrderByDate : min, null);
+        suggestedPOs.push({
+          sku,
+          name: onHand.name || "",
+          qtyToOrder: Math.ceil(bucketQty),
+          earliestNeedDate: earliestNeed,
+          leadTimeDays: lead.leadTimeDays,
+          leadTimeSource: lead.source,
+          mustOrderByDate: earliestMustOrderBy,
+          isOverdue: earliestMustOrderBy != null && earliestMustOrderBy < today,
+          projectedReceiptDate: lead.leadTimeDays != null ? mrpAddDays(today, lead.leadTimeDays) : null,
+          bucket: bucketName,
+        });
+      }
     }
 
     skuResults.push({
@@ -4659,7 +4689,7 @@ app.get("/api/mrp/run", (req, res) => {
     const { requirements, skipped, noBomExamples } = buildRequirements(mrpOrders, bomParents, {
       today, horizonDays, includeUnconfirmed, applyWastage, excludeBeforeDate,
     });
-    const { skuResults, suggestedPOs, atRiskOrders } = allocateAndPlan(requirements, onHandBySku, supply, today);
+    const { skuResults, suggestedPOs, atRiskOrders } = allocateAndPlan(requirements, onHandBySku, supply, today, poHorizonEndDate);
 
     // Enrich each suggested PO with $$ — unit cost from Cin7 product cache,
     // line cost = unitCost × qtyToOrder. Mark missing-cost SKUs explicitly so
