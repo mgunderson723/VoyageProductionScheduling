@@ -632,14 +632,15 @@ When recommending a production slot for a finished good or WIP:
 1. Call get_orders to see what's currently scheduled.
 2. If the user's product reference is loose, call find_bom to get the right SKU.
 3. Call bom_expand to get per-stage quantities and the upstream WIPs that must be produced. The intermediateStages array tells you each stage's machine + its production lead time.
-4. For multi-stage products, schedule BACKWARD from the desired completion date:
+4. **Call get_on_hand on every intermediate WIP SKU returned by bom_expand** (plus the FG SKU itself if relevant). For each stage where Available ≥ required qty: SKIP the upstream production for that stage and tell the user explicitly ("100 kg of WIP-X already on hand — no need to roast it"). For stages where Available is positive but less than required: reduce the qty for that stage by the available amount and note the reduction.
+5. For multi-stage products that still need upstream production, schedule BACKWARD from the desired completion date:
    - Last step (e.g. depositing) ends at the target completion date
    - Each upstream stage must finish before its downstream stage starts (i.e. work the lead times backward)
    - Roasting + fat melting can run in parallel (both feed Mcintyre in the liquor case, or feed downstream stages directly for CFC)
-5. Check that each stage's required qty fits within that machine's capacity constraints above.
-6. Use find_available_slots (or get_orders + reason about gaps) to pick concrete dates that don't collide with existing scheduled work.
-7. Present 2–3 concrete options spanning the full pipeline (each option = a complete set of stage dates) and explain the trade-offs (lead time risk, fat type, batch size fit, etc.).
-8. Do NOT book anything — only recommend. The user must ask you to create or update orders to make it happen.
+6. Check that each stage's required qty fits within that machine's capacity constraints above.
+7. Use find_available_slots (or get_orders + reason about gaps) to pick concrete dates that don't collide with existing scheduled work.
+8. Present 2–3 concrete options spanning the full pipeline (each option = a complete set of stage dates) and explain the trade-offs (lead time risk, fat type, batch size fit, etc.). Surface any on-hand substitution in the recap so the user sees the savings.
+9. Do NOT book anything — only recommend. The user must ask you to create or update orders to make it happen.
 
 For metadata edits — renaming an MO (orderId), changing the SKU on a row, editing notes, flipping priority, marking confirmed/tentative, or recording actual produced qty — use update_order_metadata. It accepts any subset of those fields in one call. Do NOT just describe the change in text; if the user asked you to change a field, you MUST call this tool to persist it, otherwise the user will see no effect when they click the order on the calendar.
 
@@ -664,10 +665,16 @@ AMBIGUITY HANDLING:
 MRP & MATERIAL QUESTIONS:
 - For ANY question involving materials, purchase orders, ordering, capital commitment, raw-material shortages, supplier orders, or "why is this PO/order looking off", call run_mrp FIRST to see the engine's current output.
 - run_mrp returns: summary (total $, PO counts, at-risk count), top suggested POs (in-window), deferred POs (beyond PO horizon), and at-risk MOs. Suggested POs are sorted by line cost desc — biggest commitments first.
-- If a PO looks anomalously large, trace it: (1) look at the SKU + qtyToOrder, (2) call get_orders to see what's scheduled, (3) call bom_expand on the FG/WIP orders that use that RM, (4) sum the leaf qtys for that SKU and compare to onHand. Tell the user the chain: "PO X is Y kg because orders A/B/C need Z kg each via the BOM, less onHand of W."
 - Default to poHorizonDays=30 (what we'd actually order this month). If the user asks about longer-range commitments, increase or set to 0.
 - If the user mentions the pipeline tab or a forward look, set includeDrafts=true so pipeline opportunities count as demand.
 - run_mrp is READ-ONLY — it doesn't queue anything for approval. You can call it freely.
+
+DEMAND ATTRIBUTION (read this carefully — there's a recurring failure mode here):
+- When you need to explain WHERE a PO's demand comes from, which orders DROVE a raw-material requirement, or WHY a specific SKU shows up in MRP — you MUST call trace_po_demand on that SKU. NEVER guess based on order size, product names, BOM intuition, or pattern matching ("this is the biggest order so it must be the cause").
+- BOMs are recursive and your model of any specific recipe is OFTEN WRONG. A product name like "Nut Free Spread" might contain sunflower paste, not chickpeas — you can't know what's in a BOM without expanding it. trace_po_demand gives you the ground truth.
+- If trace_po_demand returns an empty sources list for a SKU you expected to find demand for, the demand for that SKU isn't coming from where you thought. Tell the user clearly: "I was wrong — this RM isn't actually driven by [order you mentioned]. The real sources are [whatever the tool returned]."
+- Use the same horizonDays / includeUnconfirmed / includeDrafts settings you used in run_mrp so the attribution matches.
+- Combine the output with bom_expand when the user wants the per-FG breakdown: trace_po_demand tells you which orders drive the leaf demand; bom_expand on those orders' FG SKUs shows the recursive chain.
 
 QUEUED FOR APPROVAL (how write tools work now):
 - Every call to a mutating tool (add_order, shift_machine_orders, update_order_dates, update_order_status, update_order_quantity, update_order_metadata, delete_order) is QUEUED, not executed immediately. The user sees a preview card in the UI and must click "Apply" before the action takes effect.
@@ -889,6 +896,32 @@ const AI_TOOLS = [
         qty: { type: "number", description: "Production quantity in kg (or units, for packaged FGs)" },
       },
       required: ["sku", "qty"],
+    },
+  },
+  {
+    name: "trace_po_demand",
+    description: "GROUND-TRUTH source attribution for a raw material's demand. Returns the list of orders/pipeline drafts whose BOM expansion produced demand for this RM SKU, with per-source kg contribution. ALWAYS call this BEFORE explaining where a PO's demand comes from — do NOT guess based on order size, product names, or your own intuition about what a BOM might contain. BOMs are recursive and your model of any specific recipe is often wrong (e.g., a 'Nut Free Spread' might contain sunflower paste, not chickpeas). If you tell the user 'this PO is driven by order X' and X doesn't appear in this tool's output, you're hallucinating — the truth is whoever IS in the output. Mirrors run_mrp's settings (poHorizonDays / horizonDays / includeUnconfirmed / includeDrafts / excludeBefore) for consistency.",
+    input_schema: {
+      type: "object",
+      properties: {
+        sku: { type: "string", description: "The raw material / leaf SKU whose demand sources you want to trace (e.g. RM-110007)" },
+        horizonDays:        { type: "number",  description: "Planning horizon (default 120) — mirror run_mrp" },
+        includeUnconfirmed: { type: "boolean", description: "Default false" },
+        includeDrafts:      { type: "boolean", description: "Default false — set true if you want pipeline drafts considered" },
+        excludeBefore:      { type: "string",  description: "YYYY-MM-DD optional" },
+      },
+      required: ["sku"],
+    },
+  },
+  {
+    name: "get_on_hand",
+    description: "Check current on-hand inventory for one or more SKUs. CRITICAL for multi-stage planning — when sequencing upstream production (after bom_expand), call this on the intermediate WIP SKUs to see if any are already in stock. If Available covers the requirement, recommend SCALING DOWN or SKIPPING the upstream production stage and explain it to the user. Returns OnHand, Allocated, Available, OnOrder, InTransit, and locations per SKU. Available = OnHand − Allocated is the right number to compare against new requirements (anything Allocated is already promised to other orders). The on-hand snapshot is daily (06:30 UTC) so it's reasonably fresh but not real-time — note that to the user if the freshness matters.",
+    input_schema: {
+      type: "object",
+      properties: {
+        skus: { type: "array", items: { type: "string" }, description: "List of SKUs to check. Cap of 50 per call." },
+      },
+      required: ["skus"],
     },
   },
   {
@@ -1325,6 +1358,136 @@ async function executeAITool(name, input) {
         leafRequirements: leaves,
         intermediateStages: enriched,
         note: "leafRequirements = leaf-level raw materials to procure. intermediateStages = each WIP that must be produced (with its machine and lead time) — use these for backward production scheduling.",
+      };
+    }
+
+    case "trace_po_demand": {
+      const targetSku = String(input.sku || "").trim();
+      if (!targetSku) return { ok: false, error: "sku required" };
+
+      const horizonDays        = Math.max(1, Math.min(365, isFinite(input.horizonDays) ? input.horizonDays : 120));
+      const includeUnconfirmed = !!input.includeUnconfirmed;
+      const includeDrafts      = !!input.includeDrafts;
+      const excludeBeforeRaw   = String(input.excludeBefore || "").trim();
+      const excludeBeforeDate  = /^\d{4}-\d{2}-\d{2}$/.test(excludeBeforeRaw) ? excludeBeforeRaw : null;
+      const today              = new Date().toISOString().slice(0, 10);
+
+      const { orders: rawOrders, bomParents } = getMrpInputs();
+      let mrpOrders = rawOrders;
+      if (includeDrafts) {
+        const pipelineBlob = readData("vf_pipeline_drafts");
+        const drafts = (pipelineBlob && pipelineBlob.drafts) || [];
+        const synth = [];
+        for (const d of drafts) {
+          if (!d.fgSKU || !d.shipMonth) continue;
+          const channel = (d.channel || "").toLowerCase();
+          let machine = "mac_packout";
+          if (channel.startsWith("coffee")) machine = "grinder";
+          else if (channel.startsWith("nut free")) machine = "pouching";
+          else if (channel.startsWith("chocolate liquor") || channel.startsWith("finished chocolate")) machine = "depositing";
+          synth.push({
+            id: "draft_" + d.id,
+            orderId: "PIPELINE-" + (d.customer || "?") + "-" + (d.quarter || ""),
+            sku: d.fgSKU, machine, start: d.shipMonth, end: d.shipMonth, due: d.shipMonth,
+            qty: d.qtyValue || 0, batches: 1, total: d.qtyValue || 0,
+            status: "queued", confirmed: false, __fromPipelineDraft: true,
+          });
+        }
+        mrpOrders = rawOrders.concat(synth);
+      }
+
+      const { requirements } = buildRequirements(mrpOrders, bomParents, {
+        today, horizonDays, includeUnconfirmed, applyWastage: true, excludeBeforeDate,
+      });
+
+      // Filter to entries that contributed to demand for the target SKU.
+      // buildRequirements emits one entry per (leaf SKU, source order) so a
+      // single FG order can contribute to multiple RMs but only one entry
+      // per RM per order — we just sum qtyKg per source for safety.
+      const matching = requirements.filter(r => r.sku === targetSku);
+      if (matching.length === 0) {
+        return {
+          ok: true,
+          sku: targetSku,
+          totalKgNeeded: 0,
+          sourceCount: 0,
+          sources: [],
+          note: `No order or pipeline draft in the current planning window expanded to demand for '${targetSku}'. If you previously claimed this RM was driven by a specific order, you were wrong — tell the user clearly. Possible reasons: the RM isn't in any active BOM, the relevant orders are outside the horizon, or the SKU spelling differs (call find_bom or get_orders to verify).`,
+        };
+      }
+
+      const bySource = new Map();
+      for (const r of matching) {
+        const key = r.sourceOrderId || "(unknown)";
+        if (!bySource.has(key)) {
+          bySource.set(key, {
+            sourceOrderId: r.sourceOrderId,
+            sourceFgSku: r.sourceFgSku,
+            sourceFgQty: r.sourceFgQty,
+            totalQtyKg: 0,
+            neededByEarliest: null,
+            contributionCount: 0,
+          });
+        }
+        const entry = bySource.get(key);
+        entry.totalQtyKg += r.qtyKg;
+        entry.contributionCount += 1;
+        if (!entry.neededByEarliest || (r.neededByDate && r.neededByDate < entry.neededByEarliest)) {
+          entry.neededByEarliest = r.neededByDate;
+        }
+      }
+
+      const sources = Array.from(bySource.values())
+        .map(s => ({ ...s, totalQtyKg: Math.round(s.totalQtyKg * 1000) / 1000 }))
+        .sort((a, b) => b.totalQtyKg - a.totalQtyKg);
+      const totalKgNeeded = Math.round(matching.reduce((s, r) => s + r.qtyKg, 0) * 1000) / 1000;
+
+      return {
+        ok: true,
+        sku: targetSku,
+        totalKgNeeded,
+        sourceCount: sources.length,
+        sources,
+        settings: { horizonDays, includeUnconfirmed, includeDrafts, excludeBeforeDate },
+        note: "Each entry is one source order/draft whose BOM expansion produced demand for this RM. If you expected an order to appear here and it isn't, that order does NOT actually use this RM (the BOM tree doesn't expand to it) — do NOT attribute demand to it.",
+      };
+    }
+
+    case "get_on_hand": {
+      const skus = Array.isArray(input.skus) ? input.skus.filter(s => typeof s === "string" && s.trim()).slice(0, 50) : [];
+      if (skus.length === 0) return { ok: false, error: "skus array required (1-50 SKUs)" };
+      const blob = readData("inventory_onhand");
+      if (!blob || !Array.isArray(blob.bySku)) {
+        return {
+          ok: false,
+          error: "On-hand snapshot not available. Admin can sync from the Live Inventory tab, or wait for the 06:30 UTC nightly sync.",
+        };
+      }
+      const map = new Map();
+      for (const r of blob.bySku) if (r && r.sku) map.set(r.sku, r);
+      const bySku = {};
+      for (const sku of skus) {
+        const row = map.get(sku);
+        if (!row) {
+          bySku[sku] = { sku, found: false };
+        } else {
+          bySku[sku] = {
+            sku,
+            found: true,
+            onHand: row.onHand,
+            allocated: row.allocated,
+            available: row.available,
+            onOrder: row.onOrder,
+            inTransit: row.inTransit,
+            locations: row.locations || [],
+          };
+        }
+      }
+      return {
+        ok: true,
+        lastSync: blob.lastSync,
+        bySku,
+        note: "Available = OnHand − Allocated. Use Available for new scheduling decisions. Snapshot is daily; warn the user if they need to know it's not real-time.",
       };
     }
 
