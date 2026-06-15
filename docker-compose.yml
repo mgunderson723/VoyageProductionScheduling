@@ -1,0 +1,53 @@
+# Voyage Production Scheduling — two-service orchestration.
+#
+# Service 1: voyage-scheduling — the main production planner app
+#   (calendar, MRP, pipeline, yield, error reporting, AI chat).
+#   Talks directly to Cin7 + Anthropic API outbound.
+#
+# Service 2: cin7-proxy — read-only Cin7 API gateway used by internal
+#   users (BI / analysts) so they can hit Cin7 without having direct
+#   access to the master keys. Each user is granted a Bearer token via
+#   PROXY_TOKEN_<USERNAME> env vars.
+#
+# Both services need:
+#   - A persistent volume mounted at /app/data (NEVER ephemeral — data
+#     loss on restart will be catastrophic)
+#   - Env vars supplied via .env.voyage and .env.proxy files (see
+#     DEPLOYMENT.md for the full list)
+#
+# Recommended deployment behind a reverse proxy (nginx/Caddy/etc.)
+# providing TLS termination. Internal users hit the scheduling app on
+# one URL and the cin7-proxy on another.
+
+services:
+  voyage-scheduling:
+    build: .
+    container_name: voyage-scheduling
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file: .env.voyage
+    volumes:
+      - ./data/voyage:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  cin7-proxy:
+    build: ./cin7-proxy
+    container_name: cin7-proxy
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    env_file: .env.proxy
+    volumes:
+      - ./data/proxy:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
