@@ -1377,8 +1377,14 @@ async function executeAITool(name, input, context) {
       const blob = readData("vf_boms");
       if (!blob || !blob.parents) return { ok: false, error: "No BOMs imported yet" };
       if (!blob.parents[sku]) return { ok: false, error: `No BOM defined for '${sku}'. Try find_bom to discover the right SKU.` };
+      // Same kgPerUnit override MRP applies — keeps bom_expand's output
+      // in lockstep with what buildRequirements sees, so the bot's
+      // analysis doesn't disagree with the MRP UI on PFS-style SKUs.
+      const supplyBlob = readData("vf_supply_settings") || { perSku: {} };
+      const overrideKgPerUnit = (supplyBlob.perSku && supplyBlob.perSku[sku] && supplyBlob.perSku[sku].kgPerUnit) || null;
+      const expandQty = overrideKgPerUnit ? (qty / overrideKgPerUnit) : qty;
       let result;
-      try { result = expandBom(blob.parents, sku, qty, { applyWastage: true }); }
+      try { result = expandBom(blob.parents, sku, expandQty, { applyWastage: true }); }
       catch (e) { return { ok: false, error: e.message }; }
       // Enrich the intermediates with each WIP's machine + production lead
       // time so the AI can sequence the upstream stages correctly.
@@ -1402,9 +1408,13 @@ async function executeAITool(name, input, context) {
         ok: true,
         parent: sku,
         qty,
+        kgPerUnit: overrideKgPerUnit,
+        adjustedExpansionQty: overrideKgPerUnit ? Math.round(expandQty * 1000) / 1000 : null,
         leafRequirements: leaves,
         intermediateStages: enriched,
-        note: "leafRequirements = leaf-level raw materials to procure. intermediateStages = each WIP that must be produced (with its machine and lead time) — use these for backward production scheduling.",
+        note: overrideKgPerUnit
+          ? `kgPerUnit=${overrideKgPerUnit} applied — your qty of ${qty} kg was divided by ${overrideKgPerUnit} to get ${Math.round(expandQty * 100) / 100} batches before BOM expansion. The leaf requirements below reflect the actual material needed for ${qty} kg of finished product.`
+          : "leafRequirements = leaf-level raw materials to procure. intermediateStages = each WIP that must be produced (with its machine and lead time) — use these for backward production scheduling.",
       };
     }
 
@@ -1419,7 +1429,7 @@ async function executeAITool(name, input, context) {
       const excludeBeforeDate  = /^\d{4}-\d{2}-\d{2}$/.test(excludeBeforeRaw) ? excludeBeforeRaw : null;
       const today              = new Date().toISOString().slice(0, 10);
 
-      const { orders: rawOrders, bomParents } = getMrpInputs();
+      const { orders: rawOrders, bomParents, supply } = getMrpInputs();
       let mrpOrders = rawOrders;
       if (includeDrafts) {
         const pipelineBlob = readData("vf_pipeline_drafts");
@@ -1444,7 +1454,7 @@ async function executeAITool(name, input, context) {
       }
 
       const { requirements } = buildRequirements(mrpOrders, bomParents, {
-        today, horizonDays, includeUnconfirmed, applyWastage: true, excludeBeforeDate,
+        today, horizonDays, includeUnconfirmed, applyWastage: true, excludeBeforeDate, supply,
       });
 
       // Filter to entries that contributed to demand for the target SKU.
@@ -1578,7 +1588,7 @@ async function executeAITool(name, input, context) {
       }
 
       const { requirements, skipped } = buildRequirements(mrpOrders, bomParents, {
-        today, horizonDays, includeUnconfirmed, applyWastage: true, excludeBeforeDate,
+        today, horizonDays, includeUnconfirmed, applyWastage: true, excludeBeforeDate, supply,
       });
       const { suggestedPOs, atRiskOrders } = allocateAndPlan(requirements, onHandBySku, supply, today, poHorizonEndDate);
 
@@ -4322,6 +4332,14 @@ app.put("/api/supply-settings", requireAdmin, (req, res) => {
       };
       if (entry.isAlias && v.aliasOf) entry.aliasOf = String(v.aliasOf);
       if (v.raw != null) entry.raw = String(v.raw);
+      // kgPerUnit override — used by buildRequirements + bom_expand to
+      // convert an order's qty (in kg) into the BOM's qtyToProduce unit
+      // (e.g. cases) before recursive expansion. Only relevant for SKUs
+      // whose Cin7 BOM was authored per-case rather than per-kg.
+      if (v.kgPerUnit != null && v.kgPerUnit !== "") {
+        const n = parseFloat(v.kgPerUnit);
+        if (isFinite(n) && n > 0) entry.kgPerUnit = n;
+      }
       // If isContract or isAlias, leadTimeDays may be null. If neither and
       // the value is null, the SKU effectively falls back to the default.
       cleanSku[sku] = entry;
@@ -4505,8 +4523,17 @@ function buildRequirements(orders, bomParents, opts) {
       continue;
     }
 
+    // kgPerUnit override: if Supply Settings flags this SKU as having a
+    // BOM authored per-case (or per-unit-of-some-fixed-mass), the order's
+    // qty in kg has to be divided down to the BOM's batch unit before
+    // expansion. Without this, a 1,050-kg pouching order against a
+    // qtyToProduce=1 BOM is misread as 1,050 cases and overstates
+    // material need by ~case-weight (~8x for PFS).
+    const overrideKgPerUnit = (opts.supply && opts.supply.perSku && opts.supply.perSku[fgSku] && opts.supply.perSku[fgSku].kgPerUnit) || null;
+    const expandQty = overrideKgPerUnit ? (plannedQty / overrideKgPerUnit) : plannedQty;
+
     let expansion;
-    try { expansion = expandBom(bomParents, fgSku, plannedQty, { applyWastage: opts.applyWastage }); }
+    try { expansion = expandBom(bomParents, fgSku, expandQty, { applyWastage: opts.applyWastage }); }
     catch (e) { skipped.noBom++; continue; }
 
     const neededBy = o.start < opts.today ? opts.today : o.start;
@@ -4748,7 +4775,7 @@ app.get("/api/mrp/run", (req, res) => {
     }
 
     const { requirements, skipped, noBomExamples } = buildRequirements(mrpOrders, bomParents, {
-      today, horizonDays, includeUnconfirmed, applyWastage, excludeBeforeDate,
+      today, horizonDays, includeUnconfirmed, applyWastage, excludeBeforeDate, supply,
     });
     const { skuResults, suggestedPOs, atRiskOrders } = allocateAndPlan(requirements, onHandBySku, supply, today, poHorizonEndDate);
 

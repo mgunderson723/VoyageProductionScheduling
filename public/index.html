@@ -1419,7 +1419,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       <div style="overflow-x:auto;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);max-height:600px;overflow-y:auto;">
         <table class="status-table" id="mrp-supply-table" style="margin-top:0;">
           <thead style="position:sticky;top:0;background:var(--vf-surface-sunken);z-index:1;">
-            <tr><th>SKU</th><th style="text-align:right;">Lead time (days)</th><th>Source</th><th>Notes</th><th></th></tr>
+            <tr><th>SKU</th><th style="text-align:right;">Lead time (days)</th><th>Source</th><th style="text-align:right;" title="Optional. Set only when the BOM's qtyToProduce is in cases/units but operators enter qty in kg (e.g. PFS pouching SKUs). MRP divides the order qty by this value before BOM expansion.">kg/unit</th><th>Notes</th><th></th></tr>
           </thead>
           <tbody id="mrp-supply-tbody"></tbody>
         </table>
@@ -3607,11 +3607,12 @@ function renderMrpSupply() {
     if (search && !r.sku.toLowerCase().includes(search)) return false;
     return true;
   }).sort((a,b) => a.sku.localeCompare(b.sku));
-  tbody.innerHTML = filtered.length === 0 ? `<tr><td colspan="5" class="empty">No SKUs match.</td></tr>` :
+  tbody.innerHTML = filtered.length === 0 ? `<tr><td colspan="6" class="empty">No SKUs match.</td></tr>` :
     filtered.map(r => {
       const sku = escapeHtml(r.sku);
       const leadDisabled = r.isContract || r.isAlias;
       const leadValue = r.leadTimeDays != null ? r.leadTimeDays : '';
+      const kgPerUnitValue = r.kgPerUnit != null ? r.kgPerUnit : '';
       const sources = ['explicit','contract','alias'];
       const sourceSelect = `<select onchange="onMrpSourceChange('${sku}', this.value)" style="padding:3px 6px;font-size:11px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;">
         ${sources.map(s => `<option value="${s}"${s===r.source?' selected':''}>${s}</option>`).join('')}
@@ -3633,12 +3634,24 @@ function renderMrpSupply() {
           <input type="number" min="0" value="${leadValue}" ${leadDisabled?'disabled':''} onblur="onMrpLeadChange('${sku}', this.value)" onkeydown="if(event.key==='Enter')this.blur()" style="width:70px;padding:3px 6px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:${leadDisabled?'var(--vf-surface-sunken)':'var(--vf-surface-raised)'};color:var(--vf-text-primary);font-family:inherit;text-align:right;font-variant-numeric:tabular-nums;">
         </td>
         <td>${sourceSelect}</td>
+        <td style="text-align:right;">
+          <input type="number" min="0" step="0.01" value="${kgPerUnitValue}" placeholder="—" onblur="onMrpKgPerUnitChange('${sku}', this.value)" onkeydown="if(event.key==='Enter')this.blur()" title="Optional. Set only for SKUs whose BOM is per-case but orders are entered in kg (e.g. PFS pouching, qty in kg, BOM qtyToProduce=1 case → kgPerUnit≈8.5)." style="width:70px;padding:3px 6px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;text-align:right;font-variant-numeric:tabular-nums;">
+        </td>
         <td>${notesCell}</td>
         <td style="text-align:right;">
           <button class="btn btn-sm btn-danger" onclick="deleteMrpSku('${sku}')" title="Remove this SKU (falls back to default)" style="padding:2px 8px;font-size:11px;">✕</button>
         </td>
       </tr>`;
     }).join('');
+}
+
+function onMrpKgPerUnitChange(sku, value) {
+  const entry = mrpSupplyData.perSku[sku];
+  if (!entry) return;
+  const v = parseFloat(value);
+  if (isFinite(v) && v > 0) entry.kgPerUnit = v;
+  else delete entry.kgPerUnit;
+  saveMrpSupply();
 }
 
 // ── Edit handlers — each mutates mrpSupplyData and triggers a save ──────────
