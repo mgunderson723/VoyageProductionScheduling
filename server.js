@@ -4301,6 +4301,40 @@ app.get("/api/supply-settings", (req, res) => {
   res.json({ ok: true, ...blob });
 });
 
+// GET /api/sku-unit-info — per-order-SKU kg-per-unit lookup used by the
+// calendar / MO Status frontend to relabel case-unit actuals (PFS pouching).
+//
+// The supply-settings perSku map is keyed by canonical FG SKU like
+// "FG-604-102-00", but `order.sku` is the operator-entered display string
+// like "(604 - pouches) PFS_1.5oz_Pouch_20oz_...". Substring matching is
+// unreliable, so the resolution has to happen here where extractBomSku can
+// walk the BOM catalog. The client just receives a flat map keyed by the
+// exact `order.sku` string and does direct lookups.
+//
+// Read-only; no auth needed (same access tier as supply-settings GET).
+app.get("/api/sku-unit-info", (req, res) => {
+  try {
+    const orders = readData("vf_orders") || [];
+    const bomBlob = readData("vf_boms") || { parents: {} };
+    const bomParents = bomBlob.parents || {};
+    const supply = readData("vf_supply_settings") || { perSku: {} };
+    const perSku = supply.perSku || {};
+    const skuMap = {};
+    const uniqueSkus = new Set();
+    for (const o of orders) if (o && o.sku) uniqueSkus.add(o.sku);
+    for (const orderSku of uniqueSkus) {
+      const fgSku = extractBomSku(orderSku, bomParents);
+      if (!fgSku) continue;
+      const entry = perSku[fgSku];
+      const kg = entry && Number(entry.kgPerUnit);
+      if (isFinite(kg) && kg > 0) skuMap[orderSku] = kg;
+    }
+    res.json({ ok: true, skuMap });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // PUT /api/supply-settings — admin-only full-blob replace. The UI edits one
 // SKU at a time but each save sends the entire perSku map + defaults so the
 // server doesn't need diff logic. Body: { defaults: {...}, perSku: {...} }.
