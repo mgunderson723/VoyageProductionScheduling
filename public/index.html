@@ -2365,10 +2365,18 @@ async function init(){
   if(!(await tryResumeSession())){
     document.getElementById('login-screen').style.display='flex';
   }
+  // Load Supply Settings kg-per-case overrides so PFS-style SKUs render the
+  // right unit on the calendar / MO Status and the auto-promote ratio uses
+  // the kg-equivalent of inventory actuals. Must run before
+  // loadInventoryCompletion() so the cache is populated when it computes.
+  await loadKgPerUnitOverrides();
   // Compute which MOs are inventory-derived complete (best-effort, after orders are loaded)
   await loadInventoryCompletion();
   // Re-derive completion + auto-promote whenever the Traceability tab uploads a fresh inventory CSV
   window.addEventListener('vf-inventory-updated', () => { loadInventoryCompletion(); });
+  // When MRP Setup saves new kgPerUnit overrides, refresh the cache so changes
+  // are reflected immediately without a page reload.
+  window.addEventListener('vf-supply-settings-updated', () => { loadKgPerUnitOverrides(); });
 }
 
 async function persist(source){
@@ -2411,6 +2419,54 @@ function fmtDate(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2
 // inventory data the user uploaded on the Traceability tab.
 let inventoryCompletedMOs = new Set();
 
+// ── PFS / case-unit handling ─────────────────────────────────────────────────
+// Some BOMs (notably the PFS pouching SKUs like FG-604-102-00) are authored in
+// Cin7 with qtyToProduce = 1 case. Operators enter pouching order qty in kg,
+// but Cin7's inventory movements record completions in cases. Without this
+// translation, the calendar shows "117 kg actual / 1050 kg planned" (which
+// reads as 11% progress) when the truth is "117 cases / ~124 cases" (94%).
+//
+// Supply Settings has a per-SKU `kgPerUnit` override that flags these. We
+// load it once at startup and use it across the calendar, Work Orders, and
+// MO Status renders so labels + the auto-promote ratio are unit-correct.
+let kgPerUnitBySku = {}; // bareSku → kg per case
+let _unitInfoCache = new Map(); // orderSku string → cached resolution
+
+async function loadKgPerUnitOverrides() {
+  try {
+    const r = await fetch('/api/supply-settings');
+    if (!r.ok) return;
+    const j = await r.json();
+    const perSku = (j && j.perSku) || {};
+    const next = {};
+    for (const sku of Object.keys(perSku)) {
+      const v = perSku[sku];
+      if (v && Number(v.kgPerUnit) > 0) next[sku] = Number(v.kgPerUnit);
+    }
+    kgPerUnitBySku = next;
+    _unitInfoCache = new Map(); // invalidate cache on reload
+  } catch (e) { /* silent — falls back to legacy kg-only display */ }
+}
+
+// Resolve unit treatment for an order's SKU string. Returns { isCaseUnit,
+// kgPerUnit } — isCaseUnit=true means actuals should be labeled "cases" and
+// the planned-vs-actual ratio needs an 8.5× (or whatever kgPerUnit) bump.
+function getUnitInfo(orderSku) {
+  if (!orderSku) return { isCaseUnit: false, kgPerUnit: null };
+  if (_unitInfoCache.has(orderSku)) return _unitInfoCache.get(orderSku);
+  let resolved = { isCaseUnit: false, kgPerUnit: null };
+  // Order.sku strings vary: "FG-604-102-00 (desc)", "FG-604-102-00 · desc",
+  // "desc  FG-604-102-00", etc. Match by substring against known overrides.
+  for (const sku of Object.keys(kgPerUnitBySku)) {
+    if (orderSku.indexOf(sku) !== -1) {
+      resolved = { isCaseUnit: true, kgPerUnit: kgPerUnitBySku[sku] };
+      break;
+    }
+  }
+  _unitInfoCache.set(orderSku, resolved);
+  return resolved;
+}
+
 async function loadInventoryCompletion(){
   try{
     const r = await fetch('/api/data/inventory');
@@ -2441,8 +2497,14 @@ async function loadInventoryCompletion(){
       const inv = moMovements[moId];
       if(!inv) return;
       const actual = inv.totalIn || 0;
+      // For case-unit SKUs (PFS), the Cin7 inventory movement reports actuals
+      // in cases while planned is in kg. Multiply by kgPerUnit before the
+      // ratio check so 117 cases × 8.5 = 994.5 kg-equivalent gets compared
+      // against 1,050 kg planned (= 94.7% complete, crosses the 0.85 bar).
+      const info = getUnitInfo((inv.sku) || '');
+      const actualForRatio = info.isCaseUnit ? actual * info.kgPerUnit : actual;
       // Treat as complete if planned was 0 but we made some, or pct ≥ 85
-      if((planned === 0 && actual > 0) || (planned > 0 && actual / planned >= 0.85)){
+      if((planned === 0 && actual > 0) || (planned > 0 && actualForRatio / planned >= 0.85)){
         next.add(moId);
       }
     });
@@ -2640,19 +2702,26 @@ function renderCal(){
             const planned = getPlannedQty(o);
             const actual = getEffectiveActual(o);
             const actualSource = (o.actualQty != null && o.actualQty !== '' && isFinite(o.actualQty)) ? 'manual' : 'inventory';
-            const showActual = actual != null && planned > 0 && Math.abs(actual - planned) / planned >= 0.05;
+            // Case-unit SKUs (PFS) have actuals in cases — relabel + use the
+            // kg-equivalent for the "show only if differs >5%" threshold so
+            // we don't hide a near-complete order just because 117 cases
+            // happens to look 11× smaller than 1,050 kg.
+            const unitInfo = getUnitInfo(o.sku || '');
+            const actualForCompare = unitInfo.isCaseUnit && actual != null ? actual * unitInfo.kgPerUnit : actual;
+            const showActual = actualForCompare != null && planned > 0 && Math.abs(actualForCompare - planned) / planned >= 0.05;
+            const actualUnit = unitInfo.isCaseUnit ? 'cases' : 'kg';
             let qtyBlock = '';
             if (planned) {
               if (showActual) {
                 qtyBlock = `<div class="mo-qty">${planned.toLocaleString()} kg planned</div>
-                            <div class="mo-qty-actual">${actual.toLocaleString()} kg actual</div>`;
+                            <div class="mo-qty-actual">${actual.toLocaleString()} ${actualUnit} actual</div>`;
               } else {
                 qtyBlock = `<div class="mo-qty">${planned.toLocaleString()} kg</div>`;
               }
             }
             const titleSuffix = (done ? '\nCompleted' : '') +
               (isTentative ? '\nTentative — not confirmed for production' : '') +
-              (showActual ? `\nActual: ${actual.toLocaleString()} kg (${actualSource}) vs planned ${planned.toLocaleString()} kg` : '');
+              (showActual ? `\nActual: ${actual.toLocaleString()} ${actualUnit} (${actualSource}) vs planned ${planned.toLocaleString()} kg${unitInfo.isCaseUnit ? ` (≈ ${Math.round(actualForCompare).toLocaleString()} kg equivalent)` : ''}` : '');
             html+=`<div class="mo-block ${chipClass(o)}${done?' mo-block--complete':''}${matchCls}${tentativeCls}"${doneAttr} title="${esc((o.sku||'')+'\n'+(o.notes||''))+titleSuffix}" onclick="event.stopPropagation();editById('${esc(o.id)}')">
               <div class="mo-id">${doneMark}${esc(o.orderId)||'—'}</div>
               ${o.sku?`<div class="mo-sku">${esc(shortSku(o.sku))}</div>`:''}
@@ -2943,11 +3012,14 @@ function render(){
             <td style="white-space:nowrap;">${(function(){
               const planned = getPlannedQty(o);
               const actual = getEffectiveActual(o);
-              const showActual = actual != null && planned > 0 && Math.abs(actual - planned) / planned >= 0.05;
+              const unitInfo = getUnitInfo(o.sku || '');
+              const actualForCompare = unitInfo.isCaseUnit && actual != null ? actual * unitInfo.kgPerUnit : actual;
+              const showActual = actualForCompare != null && planned > 0 && Math.abs(actualForCompare - planned) / planned >= 0.05;
               if (!planned) return '—';
               if (!showActual) return planned.toLocaleString() + ' kg';
               const sourceTag = (o.actualQty != null && o.actualQty !== '' && isFinite(o.actualQty)) ? 'manual' : 'inventory';
-              return planned.toLocaleString() + ' kg<div style="font-size:10px;color:var(--vf-success-text);font-weight:500;margin-top:2px;" title="Actual produced — ' + sourceTag + '">actual: ' + actual.toLocaleString() + ' kg</div>';
+              const actualUnit = unitInfo.isCaseUnit ? 'cases' : 'kg';
+              return planned.toLocaleString() + ' kg<div style="font-size:10px;color:var(--vf-success-text);font-weight:500;margin-top:2px;" title="Actual produced — ' + sourceTag + '">actual: ' + actual.toLocaleString() + ' ' + actualUnit + '</div>';
             })()}</td>
             <td><span class="badge badge-${o.priority||'low'}">${{high:'High',med:'Med',low:'Low'}[o.priority]||'—'}</span></td>
             <td><span class="badge badge-${o.status}">${{queued:'Queued','in-progress':'In progress','on-hold':'On hold',complete:'Complete'}[o.status]||o.status}</span></td>
@@ -3750,6 +3822,9 @@ async function saveMrpSupply() {
         setTimeout(() => { if (ind.textContent === 'Saved ✓') ind.textContent = ''; }, 2000);
       }
       renderMrpSetupKpis();
+      // Refresh the kgPerUnit cache so calendar / MO Status pick up edits
+      // (e.g. adding a PFS SKU) without a page reload.
+      window.dispatchEvent(new Event('vf-supply-settings-updated'));
     } catch (e) {
       if (ind) {
         ind.textContent = 'Save failed: ' + e.message;
@@ -4824,7 +4899,15 @@ async function renderMOStatus() {
       ? manualActuals.reduce((s, v) => s + v, 0)
       : (inv ? (inv.totalIn || 0) : 0);
     const actualSource = manualActuals.length > 0 ? 'manual' : (inv ? 'inventory' : 'none');
-    const pct = planned > 0 ? Math.min(Math.round(actual / planned * 100), 999) : null;
+    // Case-unit SKUs (PFS): actual comes in as cases from Cin7 inventory
+    // movements; multiply by kgPerUnit so the % progress reflects the
+    // kg-equivalent comparison against the kg-denominated `planned`.
+    const repSku = items.find(o => o.sku)?.sku || '';
+    const unitInfo = getUnitInfo(repSku);
+    const actualForPct = unitInfo.isCaseUnit && actualSource === 'inventory'
+      ? actual * unitInfo.kgPerUnit
+      : actual;
+    const pct = planned > 0 ? Math.min(Math.round(actualForPct / planned * 100), 999) : null;
 
     // Earliest start, latest end across all rows
     const starts = items.map(o => o.start).filter(Boolean).sort();
@@ -4962,7 +5045,7 @@ async function renderMOStatus() {
     return `<span class="badge ${map[s]||'badge-queued'}">${labels[s]||s}</span>`;
   };
 
-  const fmtQty = q => q > 0 ? q.toLocaleString() + ' kg' : '—';
+  const fmtQty = (q, unit) => q > 0 ? q.toLocaleString() + ' ' + (unit || 'kg') : '—';
 
   document.getElementById('mo-status-tbody').innerHTML = filtered.length === 0
     ? `<tr><td colspan="9" class="empty">No orders match the current filters.</td></tr>`
@@ -4978,8 +5061,14 @@ async function renderMOStatus() {
         const progressCell = (hasActualForRow && planned > 0)
           ? `<div class="progress-bar-wrap"><div class="progress-bar-fill${pct>100?' over':pct>=85?' near':''}" style="width:${Math.min(pct,100)}%"></div></div>${pct}%`
           : `<span style="color:var(--vf-text-tertiary);font-size:11px;">—</span>`;
+        // PFS-style case-unit SKUs: Cin7 reports actuals in cases, but the
+        // operator-entered planned figure stays in kg. Label the actual cell
+        // accordingly so the row reads correctly; manual overrides assume the
+        // operator used the same unit as planned (kg).
+        const rowUnit = getUnitInfo(o.sku || '');
+        const actualUnit = (rowUnit.isCaseUnit && actualSource === 'inventory') ? 'cases' : 'kg';
         const actualCell = hasActualForRow
-          ? `${fmtQty(actual)}${actualSource === 'manual' ? '<div style="font-size:10px;color:var(--vf-text-tertiary);">manual override</div>' : ''}`
+          ? `${fmtQty(actual, actualUnit)}${actualSource === 'manual' ? '<div style="font-size:10px;color:var(--vf-text-tertiary);">manual override</div>' : ''}`
           : '—';
         return `<tr>
           <td>${moCell}</td>
