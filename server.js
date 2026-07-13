@@ -686,7 +686,7 @@ PO-TOTAL ARITHMETIC (also mandatory):
 - When explaining a PO, show the gross→net story explicitly: "Gross BOM demand from these orders is X kg. On-hand + on-order covers Y kg. Net PO need (= MRP's suggested qtyToOrder) is Z kg." That makes the chain auditable.
 
 PER-ORDER ATTRIBUTION TABLE (always include when listing demand drivers):
-- When trace_po_demand returns multiple sources, show them as a table with these columns: source orderId, start date (or "pipeline draft, need by X" for synthetic drafts), FG SKU + qty, kg of the leaf RM contributed, % of total.
+- When trace_po_demand returns multiple sources, show them as a table with these columns: source orderId, start date (for synthetic pipeline drafts this is the *computed production start* — ship month minus a channel-specific production lead time; label as "pipeline draft, prod start X (ships Y)" so the user can see both), FG SKU + qty, kg of the leaf RM contributed, % of total.
 - Stale orders that should have been filtered out are MOST visible in this table — their start dates will be before the user's excludeBefore cutoff and the user can immediately see the violation. Including this table is your built-in audit trail.
 
 Combine the output with bom_expand when the user wants the per-FG breakdown: trace_po_demand tells you which orders drive the leaf demand; bom_expand on those orders' FG SKUs shows the recursive chain.
@@ -1434,22 +1434,7 @@ async function executeAITool(name, input, context) {
       if (includeDrafts) {
         const pipelineBlob = readData("vf_pipeline_drafts");
         const drafts = (pipelineBlob && pipelineBlob.drafts) || [];
-        const synth = [];
-        for (const d of drafts) {
-          if (!d.fgSKU || !d.shipMonth) continue;
-          const channel = (d.channel || "").toLowerCase();
-          let machine = "mac_packout";
-          if (channel.startsWith("coffee")) machine = "grinder";
-          else if (channel.startsWith("nut free")) machine = "pouching";
-          else if (channel.startsWith("chocolate liquor") || channel.startsWith("finished chocolate")) machine = "depositing";
-          synth.push({
-            id: "draft_" + d.id,
-            orderId: "PIPELINE-" + (d.customer || "?") + "-" + ((d.shipMonth || "").slice(0, 7) || d.quarter || ""),
-            sku: d.fgSKU, machine, start: d.shipMonth, end: d.shipMonth, due: d.shipMonth,
-            qty: d.qtyValue || 0, batches: 1, total: d.qtyValue || 0,
-            status: "queued", confirmed: false, __fromPipelineDraft: true,
-          });
-        }
+        const synth = drafts.map(synthPipelineDraftAsOrder).filter(Boolean);
         mrpOrders = rawOrders.concat(synth);
       }
 
@@ -1568,21 +1553,7 @@ async function executeAITool(name, input, context) {
       if (includeDrafts) {
         const pipelineBlob = readData("vf_pipeline_drafts");
         const drafts = (pipelineBlob && pipelineBlob.drafts) || [];
-        const synth = [];
-        for (const d of drafts) {
-          if (!d.fgSKU || !d.shipMonth) continue;
-          const channel = (d.channel || "").toLowerCase();
-          let machine = "mac_packout";
-          if (channel.startsWith("coffee")) machine = "grinder";
-          else if (channel.startsWith("nut free")) machine = "pouching";
-          else if (channel.startsWith("chocolate liquor") || channel.startsWith("finished chocolate")) machine = "depositing";
-          synth.push({
-            id: "draft_" + d.id, orderId: "PIPELINE-" + (d.customer || "?") + "-" + ((d.shipMonth || "").slice(0, 7) || d.quarter || ""),
-            sku: d.fgSKU, machine, start: d.shipMonth, end: d.shipMonth, due: d.shipMonth,
-            qty: d.qtyValue || 0, batches: 1, total: d.qtyValue || 0,
-            status: "queued", confirmed: false, __fromPipelineDraft: true,
-          });
-        }
+        const synth = drafts.map(synthPipelineDraftAsOrder).filter(Boolean);
         draftsCount = synth.length;
         mrpOrders = rawOrders.concat(synth);
       }
@@ -2045,6 +2016,62 @@ function parsePipelineXlsx(buffer) {
     mrpNoCount,
     blankRowsSkipped,
     headerRowIndex: hdrIdx,
+  };
+}
+
+// Pipeline drafts only have a "Ship Month" — no production start. If we
+// treat ship month as production start, MRP dates raw-material must-order-by
+// off the ship date and understates urgency (chocolate ordered a month late,
+// coffee two weeks late, etc.). Ballpark production lead per channel below
+// pushes the synth order's start N days before ship month so RM back-dating
+// lands in the right zip code. Tune values here as capacity/routing knowledge
+// improves; per-SKU override isn't exposed yet.
+const PIPELINE_PRODUCTION_LEAD_DAYS = {
+  "coffee": 14,
+  "nut free spreads": 7,
+  "chocolate liquor": 30,
+  "finished chocolate": 30,
+  default: 14,
+};
+
+function pipelineProductionLeadDays(channel) {
+  const c = (channel || "").toLowerCase();
+  for (const key of Object.keys(PIPELINE_PRODUCTION_LEAD_DAYS)) {
+    if (key !== "default" && c.startsWith(key)) return PIPELINE_PRODUCTION_LEAD_DAYS[key];
+  }
+  return PIPELINE_PRODUCTION_LEAD_DAYS.default;
+}
+
+// Convert a pipeline draft into a synth order the MRP can consume. Returns
+// null if the draft can't drive demand (missing fgSKU or shipMonth). Shifts
+// start/end back by the channel's production lead so MRP dates RM POs off
+// the *production* start rather than ship month; due keeps ship month so any
+// customer-facing view still shows the promised date.
+function synthPipelineDraftAsOrder(d) {
+  if (!d || !d.fgSKU || !d.shipMonth) return null;
+  const channel = (d.channel || "").toLowerCase();
+  let machine = "mac_packout";
+  if (channel.startsWith("coffee")) machine = "grinder";
+  else if (channel.startsWith("nut free")) machine = "pouching";
+  else if (channel.startsWith("chocolate liquor") || channel.startsWith("finished chocolate")) machine = "depositing";
+  const leadDays = pipelineProductionLeadDays(channel);
+  const productionStart = mrpAddDays(d.shipMonth, -leadDays) || d.shipMonth;
+  return {
+    id: "draft_" + d.id,
+    orderId: "PIPELINE-" + (d.customer || "?") + "-" + ((d.shipMonth || "").slice(0, 7) || d.quarter || ""),
+    sku: d.fgSKU,
+    machine,
+    start: productionStart,
+    end: productionStart,
+    due: d.shipMonth,
+    qty: d.qtyValue || 0,
+    batches: 1,
+    total: d.qtyValue || 0,
+    status: "queued",
+    confirmed: false,
+    __fromPipelineDraft: true,
+    __shipMonth: d.shipMonth,
+    __productionLeadDays: leadDays,
   };
 }
 
@@ -4780,30 +4807,7 @@ app.get("/api/mrp/run", (req, res) => {
     if (includeDrafts) {
       const pipelineBlob = readData("vf_pipeline_drafts");
       const drafts = (pipelineBlob && pipelineBlob.drafts) || [];
-      const synth = [];
-      for (const d of drafts) {
-        if (!d.fgSKU || !d.shipMonth) continue;
-        const channel = (d.channel || "").toLowerCase();
-        let machine = "mac_packout";
-        if (channel.startsWith("coffee")) machine = "grinder";
-        else if (channel.startsWith("nut free")) machine = "pouching";
-        else if (channel.startsWith("chocolate liquor") || channel.startsWith("finished chocolate")) machine = "depositing";
-        synth.push({
-          id: "draft_" + d.id,
-          orderId: "PIPELINE-" + (d.customer || "?") + "-" + ((d.shipMonth || "").slice(0, 7) || d.quarter || ""),
-          sku: d.fgSKU,
-          machine,
-          start: d.shipMonth,
-          end: d.shipMonth,
-          due: d.shipMonth,
-          qty: d.qtyValue || 0,
-          batches: 1,
-          total: d.qtyValue || 0,
-          status: "queued",
-          confirmed: false,
-          __fromPipelineDraft: true,
-        });
-      }
+      const synth = drafts.map(synthPipelineDraftAsOrder).filter(Boolean);
       draftsCount = synth.length;
       mrpOrders = orders.concat(synth);
     }
