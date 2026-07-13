@@ -2027,11 +2027,11 @@ function parsePipelineXlsx(buffer) {
 // lands in the right zip code. Tune values here as capacity/routing knowledge
 // improves; per-SKU override isn't exposed yet.
 const PIPELINE_PRODUCTION_LEAD_DAYS = {
-  "coffee": 14,
-  "nut free spreads": 7,
-  "chocolate liquor": 30,
+  "coffee": 30,
+  "nut free spreads": 14,
+  "chocolate liquor": 14,
   "finished chocolate": 30,
-  default: 14,
+  default: 30,
 };
 
 function pipelineProductionLeadDays(channel) {
