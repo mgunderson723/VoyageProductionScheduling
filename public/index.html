@@ -672,6 +672,54 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
   margin-bottom: var(--vf-space-4);
   border-left: 3px solid var(--vf-warning-base);
 }
+/* ── Traceability tab ──────────────────────────────────────────────── */
+.trace-search-row { display:flex; gap: var(--vf-space-2); margin-bottom: var(--vf-space-4); align-items:center; }
+.trace-search-input { flex: 1; min-width: 320px; padding: var(--vf-space-3); border: 1px solid var(--vf-border-strong); border-radius: var(--vf-radius-md); background: var(--vf-surface-raised); color: var(--vf-text-primary); font-family: inherit; font-size: var(--vf-text-sm); }
+.trace-search-input:focus { outline: none; border-color: var(--vf-focus-ring); box-shadow: 0 0 0 3px var(--vf-focus-soft); }
+.trace-hint { background: var(--vf-surface-raised); border: 1px solid var(--vf-border-soft); border-radius: var(--vf-radius-md); padding: var(--vf-space-4) var(--vf-space-5); color: var(--vf-text-secondary); font-size: var(--vf-text-sm); line-height: 1.6; }
+.trace-hint code { background: var(--vf-code-bg, rgba(120,120,140,0.15)); padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+.trace-result-header { background: var(--vf-surface-raised); border: 1px solid var(--vf-border-soft); border-radius: var(--vf-radius-md); padding: var(--vf-space-4); margin-bottom: var(--vf-space-3); display: flex; justify-content: space-between; align-items: flex-start; gap: var(--vf-space-4); flex-wrap: wrap; }
+.trace-result-header .trace-title { font-size: 15px; font-weight: 600; color: var(--vf-text-primary); }
+.trace-result-header .trace-subtitle { font-size: 13px; color: var(--vf-text-secondary); margin-top: 2px; }
+.trace-result-header .trace-stats { display: flex; gap: var(--vf-space-4); font-size: 12px; }
+.trace-result-header .trace-stat-label { color: var(--vf-text-tertiary); text-transform: uppercase; letter-spacing: 0.05em; font-size: 10px; }
+.trace-result-header .trace-stat-value { font-size: 14px; font-weight: 600; color: var(--vf-text-primary); font-variant-numeric: tabular-nums; }
+.trace-dq-banner { background: var(--vf-warning-soft); color: var(--vf-warning-text); border-left: 3px solid var(--vf-warning-base); padding: var(--vf-space-3) var(--vf-space-4); border-radius: var(--vf-radius-md); font-size: 13px; margin-bottom: var(--vf-space-3); }
+.trace-dq-banner ul { margin: 6px 0 0 18px; }
+.trace-view-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--vf-border-soft); margin-bottom: var(--vf-space-3); }
+.trace-view-tab { background: transparent; border: none; padding: 8px 16px; color: var(--vf-text-secondary); font-size: 13px; cursor: pointer; border-bottom: 2px solid transparent; font-family: inherit; }
+.trace-view-tab:hover { color: var(--vf-text-primary); }
+.trace-view-tab.active { color: var(--vf-text-primary); border-bottom-color: var(--vf-focus-ring); font-weight: 500; }
+.trace-view-tab:disabled { opacity: 0.4; cursor: not-allowed; }
+.trace-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.trace-table th { text-align: left; padding: 8px 10px; background: var(--vf-surface-raised); border-bottom: 1px solid var(--vf-border-strong); font-weight: 600; color: var(--vf-text-secondary); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; position: sticky; top: 0; }
+.trace-table td { padding: 6px 10px; border-bottom: 1px solid var(--vf-border-soft); vertical-align: top; font-variant-numeric: tabular-nums; }
+.trace-table tr:hover td { background: var(--vf-surface-hover, rgba(120,120,140,0.06)); }
+.trace-reftype-pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 10px; font-weight: 600; letter-spacing: 0.05em; }
+.trace-reftype-PO { background: rgba(6, 148, 108, 0.18); color: var(--vf-success-text); }
+.trace-reftype-MO { background: rgba(70, 105, 200, 0.18); color: #6a86d8; }
+.trace-reftype-ST { background: rgba(202, 138, 4, 0.18); color: var(--vf-warning-text); }
+.trace-reftype-TR { background: rgba(120, 120, 140, 0.18); color: var(--vf-text-secondary); }
+.trace-reftype-SO { background: rgba(180, 90, 200, 0.18); color: #b57bd6; }
+.trace-reftype-FG { background: rgba(200, 100, 100, 0.18); color: #d47474; }
+.trace-reftype-OTHER, .trace-reftype-null { background: rgba(120,120,140,0.12); color: var(--vf-text-tertiary); }
+.trace-dq-badge { display: inline-block; background: var(--vf-warning-soft); color: var(--vf-warning-text); border: 1px solid var(--vf-warning-base); border-radius: 10px; padding: 0 6px; font-size: 10px; font-weight: 600; margin-left: 4px; cursor: help; vertical-align: middle; }
+.trace-tree { font-family: var(--vf-font-mono, ui-monospace, "SFMono-Regular", Menlo, monospace); font-size: 12px; line-height: 1.6; background: var(--vf-surface-raised); padding: var(--vf-space-4); border-radius: var(--vf-radius-md); border: 1px solid var(--vf-border-soft); overflow-x: auto; }
+.trace-tree ul { list-style: none; padding-left: 20px; margin: 0; border-left: 1px dashed var(--vf-border-strong); }
+.trace-tree > ul { border-left: none; padding-left: 0; }
+.trace-tree li { padding: 3px 0; position: relative; }
+.trace-tree li::before { content: "└─ "; color: var(--vf-text-tertiary); }
+.trace-tree > ul > li::before { content: ""; }
+.trace-tree-node-cat { color: var(--vf-text-tertiary); font-size: 10px; padding: 1px 5px; background: rgba(120,120,140,0.15); border-radius: 3px; margin-right: 4px; }
+.trace-tree-node-lot { color: var(--vf-text-primary); font-weight: 500; }
+.trace-tree-node-sku { color: var(--vf-focus-ring); }
+.trace-tree-node-qty { color: var(--vf-text-secondary); }
+.trace-tree-node-origin { color: var(--vf-success-text); font-size: 11px; margin-left: 6px; }
+.trace-ledger-group { background: var(--vf-surface-raised); border: 1px solid var(--vf-border-soft); border-radius: var(--vf-radius-md); padding: var(--vf-space-3); margin-bottom: var(--vf-space-3); }
+.trace-ledger-group h4 { margin: 0 0 8px 0; font-size: 12px; color: var(--vf-text-secondary); text-transform: uppercase; letter-spacing: 0.05em; }
+.trace-balance-chart { background: var(--vf-surface-raised); border: 1px solid var(--vf-border-soft); border-radius: var(--vf-radius-md); padding: var(--vf-space-3); margin-bottom: var(--vf-space-3); }
+.trace-scroll-box { max-height: 60vh; overflow-y: auto; border: 1px solid var(--vf-border-soft); border-radius: var(--vf-radius-md); }
+.trace-empty { padding: 40px; text-align: center; color: var(--vf-text-tertiary); background: var(--vf-surface-raised); border-radius: var(--vf-radius-md); border: 1px dashed var(--vf-border-soft); }
 
 /* ── AI Chat Widget ──────────────────────────────────────────────────────── */
 
@@ -1009,9 +1057,49 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
     </div>
   </div>
 
-  <!-- TRACEABILITY EXPLORER -->
+  <!-- TRACEABILITY -->
   <div id="tab-traceability" style="display:none;">
-    <div id="traceability-root"></div>
+    <div class="header">
+      <h2>Traceability</h2>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span id="trace-summary-chip" class="badge badge-neutral" style="font-size:12px;">Loading…</span>
+        <label class="btn btn-sm" id="trace-upload-btn" style="display:none;cursor:pointer;">
+          Upload movement report
+          <input type="file" id="trace-upload-input" accept=".xlsx,.xls" style="display:none;">
+        </label>
+      </div>
+    </div>
+
+    <div class="trace-search-row">
+      <input id="trace-search-input" class="trace-search-input"
+             placeholder="Enter a lot code, SKU (RM-…, FG-…), or reference (PO-00040, MO-00293/1)…"
+             onkeydown="if(event.key==='Enter'){runTraceabilitySearch();}">
+      <button class="btn" onclick="runTraceabilitySearch()">Search</button>
+      <button class="btn btn-ghost" onclick="clearTraceabilityResult()">Clear</button>
+    </div>
+
+    <div class="trace-hint" id="trace-hint">
+      Search by <b>lot code</b> (batch # from Cin7) for a specific-batch history, by <b>SKU</b> (e.g. <code>RM-110000-00</code>) for a full material ledger, or by <b>reference</b> (e.g. <code>MO-00293/1</code>, <code>PO-00040</code>) to see every movement on that transaction.
+      <br><br>
+      <b>Data-quality windows</b> — flags may appear on results in these periods:
+      <ul style="margin:8px 0 0 20px;color:var(--vf-text-secondary);font-size:13px;">
+        <li>2025-01-01 → 2025-04-30 · Pre-facility-standup — historical entries incomplete</li>
+        <li>2025-10-01 → 2025-12-31 · Lot-code migration — many stock adjustments are paper relabels</li>
+        <li>2025-10-01 → 2025-12-31 · VC receipts via ST — flavor-compound receipts miscoded as stock adjustments</li>
+        <li>2026-04-01 → 2026-06-30 · Full facility count — big ST corrections are inventory reconciliation</li>
+      </ul>
+    </div>
+
+    <div id="trace-result" style="display:none;">
+      <div id="trace-result-header" class="trace-result-header"></div>
+      <div id="trace-dq-banner" class="trace-dq-banner" style="display:none;"></div>
+      <div class="trace-view-tabs" id="trace-view-tabs">
+        <button class="trace-view-tab active" data-view="timeline" onclick="setTraceView('timeline')">Timeline</button>
+        <button class="trace-view-tab" data-view="lineage" onclick="setTraceView('lineage')">Lineage tree</button>
+        <button class="trace-view-tab" data-view="ledger" onclick="setTraceView('ledger')">Ledger + balance</button>
+      </div>
+      <div id="trace-view-body"></div>
+    </div>
   </div>
 
   <!-- MO STATUS -->
@@ -2590,7 +2678,7 @@ function switchTab(t){
   if(t==='calendar')renderCal();
   if(t==='orders')render();
   if(t==='admin'){renderUsers();loadAuditLog();loadBugReports();}
-  if(t==='traceability'&&!window._traceabilityMounted){window._traceabilityMounted=true;if(window.App){ReactDOM.createRoot(document.getElementById('traceability-root')).render(React.createElement(window.App));}}
+  if(t==='traceability'){ renderTraceability(); }
   if(t==='mo-status'){populateMOStatusMachineFilter();renderMOStatus();loadSyncStatus();}
   if(t==='live-inv')loadLiveInventory();
   if(t==='error-reporting')loadErrorReporting();
@@ -3911,6 +3999,337 @@ async function syncLiveInventory() {
   if (btn) { btn.disabled = false; btn.textContent = '⟳ Sync from Cin7'; }
 }
 
+// ── Traceability tab ───────────────────────────────────────────────────────
+// Search a lot code, SKU, or reference and get a lineage tree + ledger view.
+// See server.js /api/traceability/* for the backend.
+
+let _traceState = { view: 'timeline', lastResult: null, lastQuery: '', lastKind: null };
+
+async function renderTraceability() {
+  // First-time mount: wire the upload input, load the summary chip.
+  if (!window._traceMounted) {
+    window._traceMounted = true;
+    // Admin gets the upload button.
+    if (currentUser && currentUser.role === 'admin') {
+      const btn = document.getElementById('trace-upload-btn');
+      if (btn) btn.style.display = '';
+      const input = document.getElementById('trace-upload-input');
+      if (input) input.addEventListener('change', handleTraceabilityUpload);
+    }
+    await loadTraceabilitySummary();
+  }
+}
+
+async function loadTraceabilitySummary() {
+  const chip = document.getElementById('trace-summary-chip');
+  if (!chip) return;
+  try {
+    const r = await fetch('/api/traceability/summary');
+    const j = await r.json();
+    if (!j.ok || !j.totals || j.totals.rows === 0 || j.totals.rows === '0') {
+      chip.className = 'badge badge-warning';
+      chip.textContent = 'No movement data — upload a report to begin';
+      return;
+    }
+    const t = j.totals;
+    const lastImp = j.last_import ? ` · last import ${(j.last_import.at || '').slice(0, 10)}` : '';
+    chip.className = 'badge badge-neutral';
+    chip.textContent = `${Number(t.rows).toLocaleString()} movements · ${Number(t.distinct_lots).toLocaleString()} lots · ${t.from_date || '?'} → ${t.to_date || '?'}${lastImp}`;
+  } catch (e) {
+    chip.className = 'badge badge-danger';
+    chip.textContent = 'Summary unavailable';
+  }
+}
+
+async function handleTraceabilityUpload(ev) {
+  const file = ev.target.files && ev.target.files[0];
+  if (!file) return;
+  const btn = document.getElementById('trace-upload-btn');
+  const orig = btn ? btn.textContent : '';
+  if (btn) btn.textContent = 'Uploading…';
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const r = await fetch('/api/traceability/movements/import', { method: 'POST', body: fd });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    alert(`Loaded ${j.counts.inserted.toLocaleString()} movement rows (${j.date_range.from} → ${j.date_range.to}). Replaced ${j.counts.deleted.toLocaleString()} previous rows in that range. Total now: ${j.counts.total.toLocaleString()}.`);
+    await loadTraceabilitySummary();
+  } catch (e) {
+    alert('Upload failed: ' + e.message);
+  }
+  if (btn) btn.textContent = 'Upload movement report';
+  ev.target.value = '';
+}
+
+function clearTraceabilityResult() {
+  document.getElementById('trace-search-input').value = '';
+  document.getElementById('trace-result').style.display = 'none';
+  document.getElementById('trace-hint').style.display = '';
+  _traceState.lastResult = null;
+}
+
+// Detect what the user typed: SKU / reference / lot code.
+function detectTraceQueryKind(q) {
+  const s = q.trim();
+  if (/^(RM|VC|PK|WIP|FG|LB)-[A-Z0-9-]+/i.test(s)) return 'sku';
+  if (/^(PO|MO|ST|TR|SO|FG)-\d+/i.test(s)) return 'reference';
+  return 'lot';
+}
+
+async function runTraceabilitySearch() {
+  const q = document.getElementById('trace-search-input').value.trim();
+  if (!q) return;
+  const kind = detectTraceQueryKind(q);
+  const hint = document.getElementById('trace-hint');
+  const box  = document.getElementById('trace-result');
+  const body = document.getElementById('trace-view-body');
+  hint.style.display = 'none';
+  box.style.display = '';
+  body.innerHTML = '<div class="trace-empty">Loading…</div>';
+
+  let endpoint, primary, extra = {};
+  if (kind === 'sku') endpoint = '/api/traceability/sku/' + encodeURIComponent(q);
+  else if (kind === 'reference') endpoint = '/api/traceability/reference/' + encodeURIComponent(q);
+  else endpoint = '/api/traceability/lot/' + encodeURIComponent(q);
+
+  try {
+    const primaryResp = await fetch(endpoint).then(r => r.json());
+    if (!primaryResp.ok) throw new Error(primaryResp.error || 'Search failed');
+    primary = primaryResp;
+
+    // For lot lookups, also fetch lineage + rm-history in parallel so tab switching is instant.
+    if (kind === 'lot') {
+      const [lineage, rm] = await Promise.all([
+        fetch('/api/traceability/fg-lineage/' + encodeURIComponent(q)).then(r => r.json()).catch(() => null),
+        fetch('/api/traceability/rm-history/' + encodeURIComponent(q)).then(r => r.json()).catch(() => null),
+      ]);
+      extra.lineage = lineage;
+      extra.rm = rm;
+    } else if (kind === 'sku') {
+      const rm = await fetch('/api/traceability/rm-history/' + encodeURIComponent(q)).then(r => r.json()).catch(() => null);
+      extra.rm = rm;
+    }
+  } catch (e) {
+    body.innerHTML = `<div class="trace-empty" style="color:var(--vf-danger-text);">Error: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+
+  _traceState.lastResult = { primary, extra };
+  _traceState.lastQuery = q;
+  _traceState.lastKind = kind;
+  _traceState.view = 'timeline';
+
+  renderTraceResultHeader(primary, kind, q, extra);
+  updateTraceViewTabs(kind, primary, extra);
+  renderTraceView();
+}
+
+function renderTraceResultHeader(primary, kind, q, extra) {
+  const hdr = document.getElementById('trace-result-header');
+  const movs = primary.movements || primary.timeline || [];
+  const first = movs[0] || {};
+  const rep = extra.lineage && extra.lineage.upstream ? extra.lineage.upstream : first;
+  const sku = rep.sku || first.sku || (kind === 'sku' ? q : '—');
+  const prod = rep.product || first.product || '';
+  const titleLabel = kind === 'sku' ? 'SKU' : kind === 'reference' ? 'Reference' : 'Lot code';
+  const bal = primary.final_balance != null ? primary.final_balance : (extra.rm && extra.rm.final_balance != null ? extra.rm.final_balance : null);
+  hdr.innerHTML = `
+    <div>
+      <div class="trace-title">${escapeHtml(titleLabel)}: <span style="color:var(--vf-focus-ring);">${escapeHtml(q)}</span></div>
+      <div class="trace-subtitle">${escapeHtml(sku)}${prod ? ' · ' + escapeHtml(prod) : ''}</div>
+    </div>
+    <div class="trace-stats">
+      <div>
+        <div class="trace-stat-label">Movements</div>
+        <div class="trace-stat-value">${(movs.length).toLocaleString()}</div>
+      </div>
+      ${bal != null ? `<div>
+        <div class="trace-stat-label">Final balance</div>
+        <div class="trace-stat-value">${Number(bal).toLocaleString(undefined,{maximumFractionDigits:2})}</div>
+      </div>` : ''}
+      ${extra.lineage && extra.lineage.upstream && extra.lineage.upstream.producing_mo ? `<div>
+        <div class="trace-stat-label">Produced via</div>
+        <div class="trace-stat-value">${escapeHtml(extra.lineage.upstream.producing_mo)}</div>
+      </div>` : ''}
+    </div>
+  `;
+
+  // DQ banner: aggregate flags from all sources.
+  const dqSources = [primary.data_quality, extra.lineage && extra.lineage.data_quality, extra.rm && extra.rm.data_quality].filter(Boolean);
+  const flaggedById = new Map();
+  for (const s of dqSources) {
+    for (const w of (s.flagged_windows || [])) {
+      const cur = flaggedById.get(w.id);
+      flaggedById.set(w.id, cur ? { ...w, count: cur.count + w.count } : w);
+    }
+  }
+  const banner = document.getElementById('trace-dq-banner');
+  if (flaggedById.size) {
+    banner.style.display = '';
+    banner.innerHTML = `<b>Data-quality caveats apply to this result:</b><ul>` +
+      [...flaggedById.values()].map(w => `<li><b>${w.count.toLocaleString()} movement(s) in ${escapeHtml(w.window)}:</b> ${escapeHtml(w.note)}</li>`).join('') +
+      `</ul>`;
+  } else {
+    banner.style.display = 'none';
+  }
+}
+
+function updateTraceViewTabs(kind, primary, extra) {
+  const tabs = document.querySelectorAll('.trace-view-tab');
+  tabs.forEach(t => {
+    const view = t.dataset.view;
+    let enabled = true;
+    if (view === 'lineage') enabled = kind === 'lot' && extra.lineage && (extra.lineage.upstream || extra.lineage.downstream);
+    if (view === 'ledger') enabled = !!extra.rm && (extra.rm.timeline || []).length > 0;
+    t.disabled = !enabled;
+    t.classList.toggle('active', view === _traceState.view);
+  });
+}
+
+function setTraceView(view) {
+  _traceState.view = view;
+  document.querySelectorAll('.trace-view-tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
+  renderTraceView();
+}
+
+function renderTraceView() {
+  const body = document.getElementById('trace-view-body');
+  const s = _traceState;
+  if (!s.lastResult) { body.innerHTML = ''; return; }
+  const { primary, extra } = s.lastResult;
+  if (s.view === 'timeline') body.innerHTML = renderTimelineTable(primary.movements || primary.timeline || []);
+  else if (s.view === 'lineage') body.innerHTML = renderLineageView(extra.lineage);
+  else if (s.view === 'ledger') body.innerHTML = renderLedgerView(extra.rm);
+}
+
+function renderTimelineTable(movements) {
+  if (!movements.length) return `<div class="trace-empty">No movements match.</div>`;
+  const rows = movements.map(m => {
+    const dq = renderDqBadges(m.dq_notes);
+    const rt = m.ref_type || 'null';
+    const qIn = m.qty_in && Number(m.qty_in) > 0 ? Number(m.qty_in).toLocaleString(undefined,{maximumFractionDigits:3}) : '';
+    const qOut = m.qty_out && Number(m.qty_out) > 0 ? Number(m.qty_out).toLocaleString(undefined,{maximumFractionDigits:3}) : '';
+    const bal = m.running_balance != null ? Number(m.running_balance).toLocaleString(undefined,{maximumFractionDigits:2}) : '';
+    return `<tr>
+      <td style="white-space:nowrap;">${escapeHtml(String(m.movement_date || '').slice(0,10))}</td>
+      <td><span class="trace-reftype-pill trace-reftype-${rt}">${rt}</span></td>
+      <td style="white-space:nowrap;">${escapeHtml(m.reference || '')}${dq}</td>
+      <td>${escapeHtml(m.sku || '')}</td>
+      <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(m.product || '')}">${escapeHtml((m.product || '').slice(0, 40))}</td>
+      <td style="text-align:right;color:var(--vf-success-text);">${qIn}</td>
+      <td style="text-align:right;color:var(--vf-danger-text);">${qOut}</td>
+      ${bal !== '' ? `<td style="text-align:right;">${bal}</td>` : '<td></td>'}
+      <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(m.location || '')}</td>
+      <td style="font-size:11px;">${escapeHtml(m.batch || '')}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="trace-scroll-box"><table class="trace-table">
+    <thead><tr>
+      <th>Date</th><th>Type</th><th>Reference</th><th>SKU</th><th>Product</th>
+      <th style="text-align:right;">In</th><th style="text-align:right;">Out</th>
+      <th style="text-align:right;">Bal</th><th>Location</th><th>Lot #</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
+}
+
+function renderDqBadges(notes) {
+  if (!notes || !notes.length) return '';
+  return notes.map(n => `<span class="trace-dq-badge" title="${escapeHtml(n.note)}">⚠ ${escapeHtml(n.id)}</span>`).join('');
+}
+
+function renderLineageView(lineage) {
+  if (!lineage) return `<div class="trace-empty">Lineage unavailable.</div>`;
+  const u = lineage.upstream || {};
+  const d = lineage.downstream || [];
+  const upstreamHtml = u.inputs && u.inputs.length
+    ? `<div style="font-weight:600;margin-bottom:8px;color:var(--vf-text-secondary);font-size:12px;text-transform:uppercase;letter-spacing:0.05em;">Upstream — what went into this lot</div>
+       <div class="trace-tree">${renderTreeNode(u, true)}</div>`
+    : `<div class="trace-empty">No upstream chain — this appears to be a receipt-only lot (RM/VC/PK) or the producing MO isn't in the loaded data range.</div>`;
+  const downHtml = d.length
+    ? `<div style="font-weight:600;margin:16px 0 8px 0;color:var(--vf-text-secondary);font-size:12px;text-transform:uppercase;letter-spacing:0.05em;">Downstream — where this lot went</div>
+       ${renderTimelineTable(d)}`
+    : `<div style="margin-top:16px;" class="trace-empty">No downstream movements — nothing shipped/transferred/adjusted from this lot yet.</div>`;
+  return upstreamHtml + downHtml;
+}
+
+function renderTreeNode(node, isRoot) {
+  const label = renderNodeLabel(node, isRoot);
+  if (!node.inputs || !node.inputs.length) {
+    return isRoot ? `<ul><li>${label}</li></ul>` : label;
+  }
+  const children = node.inputs.map(c => `<li>${renderTreeNode(c, false)}</li>`).join('');
+  return `${label}<ul>${children}</ul>`;
+}
+
+function renderNodeLabel(node, isRoot) {
+  const cat = node.category || (node.sku ? node.sku.split('-')[0] : '');
+  const sku = node.sku || '—';
+  const lot = node.lot ? `lot=${escapeHtml(node.lot)}` : '<i style="color:var(--vf-text-tertiary);">no lot</i>';
+  const qty = node.qty != null ? `qty=${Number(node.qty).toLocaleString(undefined,{maximumFractionDigits:3})} ${escapeHtml(node.unit || '')}` :
+              node.producing_qty != null ? `produced=${Number(node.producing_qty).toLocaleString(undefined,{maximumFractionDigits:3})} ${escapeHtml(node.unit || '')}` : '';
+  const via = node.producing_mo ? `via <b>${escapeHtml(node.producing_mo)}</b> on ${escapeHtml((node.producing_date || '').slice(0,10))}` : '';
+  const origin = node.origin && !node.producing_mo
+    ? `<span class="trace-tree-node-origin">← ${escapeHtml(node.origin.reference || 'unknown')} on ${escapeHtml((node.origin.movement_date || '').slice(0,10))}</span>`
+    : '';
+  const catPill = cat ? `<span class="trace-tree-node-cat">${escapeHtml(cat)}</span>` : '';
+  return `${catPill}<span class="trace-tree-node-sku">${escapeHtml(sku)}</span> <span class="trace-tree-node-lot">${lot}</span> <span class="trace-tree-node-qty">${escapeHtml(qty)}</span> ${via}${origin}`;
+}
+
+function renderLedgerView(rm) {
+  if (!rm || !rm.timeline) return `<div class="trace-empty">Ledger unavailable.</div>`;
+  const timeline = rm.timeline;
+  const chart = renderBalanceChart(timeline);
+  const g = rm.grouped || {};
+  const section = (title, rows, emptyMsg) => {
+    if (!rows || !rows.length) return `<div class="trace-ledger-group"><h4>${title}</h4><div style="color:var(--vf-text-tertiary);font-size:12px;">${emptyMsg}</div></div>`;
+    return `<div class="trace-ledger-group"><h4>${title} (${rows.length})</h4>${renderTimelineTable(rows)}</div>`;
+  };
+  return `
+    <div class="trace-balance-chart">
+      <div style="font-size:12px;color:var(--vf-text-secondary);text-transform:uppercase;letter-spacing:0.05em;font-weight:600;margin-bottom:4px;">Running on-hand balance</div>
+      ${chart}
+    </div>
+    ${section('Receipts (PO)', g.receipts, 'No purchase-order receipts in the timeline.')}
+    ${section('Consumptions (MO)', g.consumptions, 'No production consumption in the timeline.')}
+    ${section('Adjustments (ST)', g.adjustments, 'No stock adjustments in the timeline.')}
+    ${section('Transfers (TR)', g.transfers, 'No transfers in the timeline.')}
+    ${g.other && g.other.length ? section('Other movements', g.other, '') : ''}
+  `;
+}
+
+// Inline SVG balance chart — no dep. Sparkline-style with axis labels.
+function renderBalanceChart(timeline) {
+  if (!timeline.length) return `<div style="color:var(--vf-text-tertiary);font-size:12px;padding:20px;text-align:center;">No data.</div>`;
+  const W = 720, H = 140, PAD_L = 44, PAD_R = 12, PAD_T = 12, PAD_B = 22;
+  const innerW = W - PAD_L - PAD_R;
+  const innerH = H - PAD_T - PAD_B;
+  const bals = timeline.map(m => Number(m.running_balance || 0));
+  let bMin = Math.min(0, ...bals), bMax = Math.max(0, ...bals);
+  if (bMin === bMax) { bMin -= 1; bMax += 1; }
+  const range = bMax - bMin;
+  const scaleY = v => PAD_T + innerH - ((v - bMin) / range) * innerH;
+  const scaleX = i => PAD_L + (timeline.length <= 1 ? innerW / 2 : (i / (timeline.length - 1)) * innerW);
+  const pts = timeline.map((m, i) => `${scaleX(i).toFixed(1)},${scaleY(Number(m.running_balance || 0)).toFixed(1)}`).join(' ');
+  const zeroY = scaleY(0);
+  const firstDate = String(timeline[0].movement_date || '').slice(0, 10);
+  const lastDate  = String(timeline[timeline.length - 1].movement_date || '').slice(0, 10);
+  const gridLabels = [bMax, (bMax + bMin) / 2, bMin].map(v => {
+    const y = scaleY(v).toFixed(1);
+    const label = Math.abs(v) >= 1000 ? (v / 1000).toFixed(1) + 'k' : v.toFixed(0);
+    return `<text x="${PAD_L - 4}" y="${y}" text-anchor="end" font-size="9" fill="var(--vf-text-tertiary)" dominant-baseline="middle">${label}</text>
+            <line x1="${PAD_L}" y1="${y}" x2="${W - PAD_R}" y2="${y}" stroke="var(--vf-border-soft)" stroke-dasharray="2,3"/>`;
+  }).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px;">
+    ${gridLabels}
+    ${zeroY > PAD_T && zeroY < PAD_T + innerH ? `<line x1="${PAD_L}" y1="${zeroY}" x2="${W - PAD_R}" y2="${zeroY}" stroke="var(--vf-border-strong)" stroke-width="1"/>` : ''}
+    <polyline points="${pts}" fill="none" stroke="var(--vf-focus-ring)" stroke-width="1.5"/>
+    <text x="${PAD_L}" y="${H - 4}" font-size="10" fill="var(--vf-text-tertiary)">${firstDate}</text>
+    <text x="${W - PAD_R}" y="${H - 4}" text-anchor="end" font-size="10" fill="var(--vf-text-tertiary)">${lastDate}</text>
+  </svg>`;
+}
+
 function renderLiveInventory() {
   if (!liveInventoryData) return;
   const { lastSync, bySku, rows, rowCount, skuCount } = liveInventoryData;
@@ -5122,8 +5541,6 @@ async function confirmImport(){
   setTimeout(()=>{n.style.display='none';},5000);
 }
 </script>
-<script type="text/babel" src="traceability_explorer.jsx"></script>
-
 <!-- AI CHAT WIDGET -->
 <div id="ai-widget" style="display:none;">
   <div id="ai-panel" style="display:none;">

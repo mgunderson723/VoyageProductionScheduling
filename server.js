@@ -6,6 +6,8 @@ const multer = require("multer");
 const XLSX = require("xlsx");
 const Anthropic = require("@anthropic-ai/sdk");
 const cron      = require("node-cron");
+const { parseMovementFile } = require("./lib/movement-parser");
+const { annotateMovements, summarizeDataQuality } = require("./lib/data-quality");
 
 // ── Excel import helpers ──────────────────────────────────────────────────────
 
@@ -697,6 +699,17 @@ QUEUED FOR APPROVAL (how write tools work now):
 - In your reply, narrate what you queued in plain language ("I've queued an add_order for {SKU} on {machine}, qty {qty}, {start}..{end}. Click Apply to commit.") so the preview card has clear context.
 - Multiple queued actions accumulate. If you queue several in one turn, list them all in your reply.
 
+TRACEABILITY (SQF audit prep — Q3/Q4 2026):
+- Three tools cover lot-level questions: trace_lot (single lot history), trace_fg_lineage (FG → components upstream + shipments downstream), trace_rm_history (RM receipt + consumption ledger).
+- Every response includes data_quality flags for any movement falling in one of the four known-noisy windows. You MUST surface these to the user verbatim in your narration — do not silently paper over them. The auditor will ask about the same anomalies the flags call out.
+- The four windows (as of 2026-07-15, tunable via env):
+    1. Pre-standup (2025-01-01 → 2025-04-30): historical entries incomplete; absence of a receipt before this window is not proof it didn't happen.
+    2. Lot-code migration (2025-10-01 → 2025-12-31): many stock adjustments were paper relabels (lot-only → lot+pallet tracking), not physical movements. Two offsetting ST rows around this time are likely a relabel.
+    3. VC-via-stock-adjustment (2025-10-01 → 2025-12-31): flavor-component (VC-*) receipts entered as ST rather than PO due to bad process. A ST-in on a VC- SKU here is likely a legitimate supplier receipt without linked PO.
+    4. Full facility count (2026-04-01 → 2026-06-30): large ST corrections are inventory-count reconciliation, not shrinkage.
+- When the user asks "what happened to lot X", "how was FG lot Y built", "trace this batch back to the raw materials" — call the trace_* tool. Do NOT reason from BOM structure or MRP data — the lot-level movement history is ground truth; BOM expansion is a plan of intent, movement history is what actually happened.
+- Reference-type prefixes in the response: PO (purchase order receipt), MO (production activity — 'MO-NNNNN/N' means batch N of the MO), ST (stock adjustment), TR (transfer between locations), SO (sales order shipment), FG (Cin7 'Assembly' — UOM conversion or lot consolidation, legacy at Voyage, paper-only movement).
+
 Dates are always in YYYY-MM-DD format.`;
 
 // Tools that mutate vf_orders. Used by /api/chat to set a dataChanged flag
@@ -952,6 +965,36 @@ const AI_TOOLS = [
         excludeBefore:      { type: "string",  description: "Skip orders with start date before this (YYYY-MM-DD). Useful for filtering stale TBD orders." },
         topN:               { type: "number",  description: "How many top-$ suggested POs to return. Default 20." },
       },
+    },
+  },
+  {
+    name: "trace_lot",
+    description: "Return the full chronological movement history for a specific lot code (batch #) — every PO receipt, MO consumption, stock adjustment, transfer, sales-order dispatch that touched this lot. Use when the user asks 'what happened to lot X', 'where did lot Y come from', 'audit trail for lot Z'. Response includes data-quality flags if any movements fall in one of the four known-noisy windows (pre-standup Q2 2025, lot-code migration Q4 2025, VC-via-stock-adjustment Q4 2025, full facility count Q2 2026) — SURFACE those flags verbatim in your reply.",
+    input_schema: {
+      type: "object",
+      properties: { lot: { type: "string", description: "Lot code / batch # exactly as it appears in Cin7 (case-sensitive, may contain spaces or hyphens)." } },
+      required: ["lot"],
+    },
+  },
+  {
+    name: "trace_fg_lineage",
+    description: "For a finished-good (or WIP) lot code, walk the assembly graph upstream (FG lot → producing MO → BOM inputs consumed → recurse until raw material receipts) AND downstream (where the FG shipped — SO, TR, ST, FG-assembly consolidation). Use when the user asks 'how was FG lot X built', 'what went into this pack', 'trace this shipment back to the raw material batch', 'if RM lot Y was recalled, which FG lots would we recall'.",
+    input_schema: {
+      type: "object",
+      properties: {
+        lot:       { type: "string", description: "Lot code to trace." },
+        max_depth: { type: "number", description: "Upstream recursion depth cap (default 5, max 10)." },
+      },
+      required: ["lot"],
+    },
+  },
+  {
+    name: "trace_rm_history",
+    description: "For a raw material (RM/VC/PK) — either a specific lot code OR a SKU — return the full receipt/consumption/adjustment ledger with a running on-hand balance. Groups: receipts (PO in), consumptions (MO out), adjustments (ST), transfers (TR). Use when the user asks 'when did we receive this RM', 'where has this ingredient been consumed', 'why did the RM balance drop on date X'.",
+    input_schema: {
+      type: "object",
+      properties: { query: { type: "string", description: "Either a lot code (batch #) or a SKU (RM-/VC-/PK-/WIP-/FG- prefixed)." } },
+      required: ["query"],
     },
   },
 ];
@@ -1624,6 +1667,59 @@ async function executeAITool(name, input, context) {
         deferredPOs: deferred.slice().sort(byCostDesc).slice(0, topN).map(trim),
         atRiskOrders: atRiskOrders.slice(0, 30).map(trimAtRisk),
         note: "suggestedPOs = top-N by line cost (highest $ first). To trace why a PO looks off, call get_orders to see scheduled MOs, then bom_expand on the suspect FG/WIP SKUs to see how much of the RM they require — sum those against onHand for the same picture MRP saw.",
+      };
+    }
+
+    case "trace_lot": {
+      const lot = String(input.lot || "").trim();
+      if (!lot) return { ok: false, error: "trace_lot requires a lot code (batch #)." };
+      const idx = getMovementIndex();
+      const rows = (idx.byBatch.get(lot) || []).slice().sort((a, b) => (a.movement_date || "").localeCompare(b.movement_date || ""));
+      if (!rows.length) {
+        return { ok: true, lot, count: 0, movements: [], note: "No movements found for this lot code. Double-check the exact case/spacing — Cin7 lot codes sometimes contain spaces or hyphens the user may have mistyped." };
+      }
+      return {
+        ok: true, lot, count: rows.length,
+        movements: annotateMovements(rows),
+        data_quality: summarizeDataQuality(rows),
+        note: "movements sorted oldest first. dq_notes on any row explains a known data-quality caveat for that period — surface those to the user verbatim.",
+      };
+    }
+
+    case "trace_fg_lineage": {
+      const lot = String(input.lot || "").trim();
+      if (!lot) return { ok: false, error: "trace_fg_lineage requires a lot code." };
+      const maxDepth = Math.max(1, Math.min(10, Number(input.max_depth) || 5));
+      const idx = getMovementIndex();
+      const upstream = buildLineageTree(idx, lot, 0, maxDepth, new Set());
+      const downstream = findDownstream(idx, lot);
+      const all = collectMovementsFromTree(upstream).concat(downstream);
+      return {
+        ok: true, lot, max_depth: maxDepth,
+        upstream: annotateTreeMovements(upstream),
+        downstream: annotateMovements(downstream),
+        data_quality: summarizeDataQuality(all),
+        note: "upstream.inputs is a recursive tree: each input has its own inputs[] for its BOM components. Terminal leaves have inputs=[] and an origin PO/ST showing where the raw material entered inventory. downstream shows every Out movement of the original lot (shipments, transfers, adjustments, consolidations).",
+      };
+    }
+
+    case "trace_rm_history": {
+      const q = String(input.query || "").trim();
+      if (!q) return { ok: false, error: "trace_rm_history requires a lot code or SKU." };
+      const isSku = /^(RM|VC|PK|WIP|FG)-/i.test(q);
+      const idx = getMovementIndex();
+      const rows = ((isSku ? idx.bySku.get(q) : idx.byBatch.get(q)) || []).slice().sort((a, b) => (a.movement_date || "").localeCompare(b.movement_date || ""));
+      let running = 0;
+      const timeline = rows.map(mv => {
+        running += Number(mv.qty_in || 0) - Number(mv.qty_out || 0);
+        return { ...mv, running_balance: running };
+      });
+      return {
+        ok: true, query: q, resolved_via: isSku ? "sku" : "batch",
+        count: timeline.length, final_balance: running,
+        timeline: annotateMovements(timeline),
+        data_quality: summarizeDataQuality(timeline),
+        note: "running_balance is cumulative qty_in − qty_out across the timeline. For a single-lot query it should end near zero (all consumed) unless there's residual on hand or a data-quality window inflated it. For a SKU query it spans all lots of that SKU.",
       };
     }
 
@@ -3660,7 +3756,20 @@ app.post("/api/cin7/inventory-movements", async (req, res) => {
     };
     writeData("inventory", finalData);
 
-    console.log(`[gdrive-sync] Ingested ${filename || "(unnamed)"} — ${parsed.rowCount} rows · ${parsed.invSku.length} new-window SKUs · ${Object.keys(parsed.moMovements).length} new-window MOs · merged total: ${finalData.invSku.length} SKUs · ${Object.keys(finalData.moMovements).length} MOs`);
+    // Traceability side-channel: same buffer, line-level parse, persist to
+    // vf_inventory_movements. Non-fatal if it errors — the primary aggregation
+    // above is what the dashboard depends on. Line-level is best-effort.
+    let traceCounts = null;
+    try {
+      const traceParsed = parseMovementFile(buffer);
+      if (traceParsed.lines.length) {
+        traceCounts = persistMovementLines(traceParsed.lines, traceParsed.min_date, traceParsed.max_date, filename || null);
+      }
+    } catch (traceErr) {
+      console.warn(`[gdrive-sync] Traceability side-channel skipped: ${traceErr.message}`);
+    }
+
+    console.log(`[gdrive-sync] Ingested ${filename || "(unnamed)"} — ${parsed.rowCount} rows · ${parsed.invSku.length} new-window SKUs · ${Object.keys(parsed.moMovements).length} new-window MOs · merged total: ${finalData.invSku.length} SKUs · ${Object.keys(finalData.moMovements).length} MOs${traceCounts ? ` · traceability +${traceCounts.inserted}/-${traceCounts.deleted} (total ${traceCounts.total})` : ''}`);
     res.json({
       ok: true,
       filename: filename || null,
@@ -3672,6 +3781,7 @@ app.post("/api/cin7/inventory-movements", async (req, res) => {
       windowMonths: parsed.months,
       allMonths: finalData.months,
       lastSync: finalData.lastSync,
+      traceability: traceCounts,
     });
   } catch (e) {
     console.error("[gdrive-sync] Ingest error:", e.message);
@@ -4902,6 +5012,260 @@ app.get("/api/mrp/run", (req, res) => {
     console.error("[mrp] Run failed:", e);
     res.status(500).json({ ok: false, error: e.message });
   }
+});
+
+// ── Traceability (SQF audit): line-level lot / SKU / MO / PO lookups ────────
+//
+// Ships as a matt-planner-side capability while FMDS/Masterdata ownership is
+// worked out. The daily "Inventory Movement Details" report is exploded into
+// per-line rows in the vf_inventory_movements blob and indexed in-memory for
+// O(1) lot/SKU/ref lookups. Same shape and endpoints as the FMDS-side design
+// so we can retire this cleanly once Masterdata's UI meets audit needs.
+
+// vf_inventory_movements blob shape:
+//   { lines: [{...movement...}], last_import: { source_file, at, min_date, max_date, count } }
+
+let _movementIndex = null;
+
+function rebuildMovementIndex() {
+  const blob = readData("vf_inventory_movements") || { lines: [] };
+  const idx = {
+    byBatch: new Map(),
+    bySku: new Map(),
+    byRef: new Map(),
+    byRefNumber: new Map(),
+    all: blob.lines,
+  };
+  for (const m of blob.lines) {
+    if (m.batch)      pushMap(idx.byBatch, m.batch, m);
+    if (m.sku)        pushMap(idx.bySku, m.sku, m);
+    if (m.reference)  pushMap(idx.byRef, m.reference, m);
+    if (m.ref_number) pushMap(idx.byRefNumber, m.ref_number, m);
+  }
+  _movementIndex = idx;
+  return idx;
+}
+function pushMap(map, key, val) {
+  if (!map.has(key)) map.set(key, []);
+  map.get(key).push(val);
+}
+function getMovementIndex() {
+  if (!_movementIndex) rebuildMovementIndex();
+  return _movementIndex;
+}
+
+// Replace-by-date-range ingest. Removes any existing rows in [minDate, maxDate]
+// then appends the fresh ones. Idempotent for a given file. Called by both the
+// manual upload endpoint and the daily gdrive-sync path.
+function persistMovementLines(newLines, minDate, maxDate, sourceFile) {
+  const blob = readData("vf_inventory_movements") || { lines: [] };
+  const nowIso = new Date().toISOString();
+  const kept = blob.lines.filter(m => m.movement_date < minDate || m.movement_date > maxDate);
+  const stamped = newLines.map(l => ({ ...l, source_file: sourceFile || null, source_upload_at: nowIso }));
+  const merged = kept.concat(stamped).sort((a, b) => (a.movement_date || "").localeCompare(b.movement_date || ""));
+  writeData("vf_inventory_movements", {
+    lines: merged,
+    last_import: { source_file: sourceFile || null, at: nowIso, min_date: minDate, max_date: maxDate, count: newLines.length },
+  });
+  rebuildMovementIndex();
+  return { deleted: blob.lines.length - kept.length, inserted: newLines.length, total: merged.length };
+}
+
+// Rebuild index on load so first request doesn't pay startup cost.
+try { rebuildMovementIndex(); } catch (_) { /* no blob yet */ }
+
+// POST /api/traceability/movements/import — admin XLSX upload, backfill path.
+app.post("/api/traceability/movements/import", requireAdmin, upload.single("file"), (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: "No file uploaded (field name must be 'file')" });
+  let parsed;
+  try { parsed = parseMovementFile(req.file.buffer); }
+  catch (e) { return res.status(400).json({ ok: false, error: "Parse failed: " + e.message }); }
+  if (!parsed.lines.length) return res.status(400).json({ ok: false, error: "File contained no valid movement rows" });
+  try {
+    const counts = persistMovementLines(parsed.lines, parsed.min_date, parsed.max_date, req.file.originalname || null);
+    res.json({
+      ok: true,
+      filename: req.file.originalname,
+      row_count: parsed.row_count,
+      date_range: { from: parsed.min_date, to: parsed.max_date },
+      counts,
+    });
+  } catch (e) {
+    console.error("[traceability] persist failed:", e);
+    res.status(500).json({ ok: false, error: "Persist failed: " + e.message });
+  }
+});
+
+// GET /api/traceability/lot/:code — every movement of a lot code, oldest first.
+app.get("/api/traceability/lot/:code", (req, res) => {
+  const code = String(req.params.code || "").trim();
+  if (!code) return res.status(400).json({ ok: false, error: "Empty lot code" });
+  const idx = getMovementIndex();
+  const rows = (idx.byBatch.get(code) || []).slice().sort((a, b) => (a.movement_date || "").localeCompare(b.movement_date || ""));
+  res.json({ ok: true, lot: code, count: rows.length, movements: annotateMovements(rows), data_quality: summarizeDataQuality(rows) });
+});
+
+// GET /api/traceability/sku/:sku — full history for a SKU (newest first, capped).
+app.get("/api/traceability/sku/:sku", (req, res) => {
+  const sku = String(req.params.sku || "").trim();
+  if (!sku) return res.status(400).json({ ok: false, error: "Empty SKU" });
+  const limit = Math.min(parseInt(req.query.limit, 10) || 500, 5000);
+  const from = req.query.from || null;
+  const to = req.query.to || null;
+  const refTypes = (req.query.ref_type || "").split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+  const idx = getMovementIndex();
+  let rows = (idx.bySku.get(sku) || []).slice();
+  if (from) rows = rows.filter(m => m.movement_date >= from);
+  if (to) rows = rows.filter(m => m.movement_date <= to);
+  if (refTypes.length) rows = rows.filter(m => refTypes.includes(m.ref_type));
+  rows.sort((a, b) => (b.movement_date || "").localeCompare(a.movement_date || ""));
+  const clipped = rows.slice(0, limit);
+  res.json({ ok: true, sku, filters: { from, to, ref_types: refTypes }, count: clipped.length, total_matches: rows.length, limit, movements: annotateMovements(clipped), data_quality: summarizeDataQuality(rows) });
+});
+
+// GET /api/traceability/reference/:ref — full-ref or normalized-number lookup.
+app.get("/api/traceability/reference/:ref", (req, res) => {
+  const ref = String(req.params.ref || "").trim();
+  if (!ref) return res.status(400).json({ ok: false, error: "Empty reference" });
+  const isSpecific = ref.includes("/");
+  const idx = getMovementIndex();
+  const rows = ((isSpecific ? idx.byRef.get(ref) : idx.byRefNumber.get(ref)) || []).slice().sort((a, b) => (a.movement_date || "").localeCompare(b.movement_date || ""));
+  res.json({ ok: true, reference: ref, resolved_via: isSpecific ? "reference" : "ref_number", count: rows.length, movements: annotateMovements(rows), data_quality: summarizeDataQuality(rows) });
+});
+
+// GET /api/traceability/summary — dashboard stats.
+app.get("/api/traceability/summary", (_req, res) => {
+  const idx = getMovementIndex();
+  const all = idx.all;
+  const byType = {};
+  const skus = new Set();
+  const lots = new Set();
+  let fromDate = null, toDate = null;
+  for (const m of all) {
+    if (m.sku) skus.add(m.sku);
+    if (m.batch) lots.add(m.batch);
+    byType[m.ref_type || "null"] = (byType[m.ref_type || "null"] || 0) + 1;
+    if (!fromDate || m.movement_date < fromDate) fromDate = m.movement_date;
+    if (!toDate || m.movement_date > toDate) toDate = m.movement_date;
+  }
+  const blob = readData("vf_inventory_movements") || {};
+  res.json({
+    ok: true,
+    totals: { rows: all.length, distinct_lots: lots.size, distinct_skus: skus.size, from_date: fromDate, to_date: toDate },
+    by_ref_type: Object.entries(byType).map(([ref_type, n]) => ({ ref_type, n })).sort((a, b) => b.n - a.n),
+    last_import: blob.last_import || null,
+  });
+});
+
+// ── Chain traversal ──────────────────────────────────────────────────────────
+// FG lot → producing MO → BOM inputs consumed → recurse on each input lot.
+
+function skuCategory(sku) {
+  const s = String(sku || "").toUpperCase();
+  if (s.startsWith("FG-")) return "FG";
+  if (s.startsWith("WIP-")) return "WIP";
+  if (s.startsWith("RM-")) return "RM";
+  if (s.startsWith("VC-")) return "VC";
+  if (s.startsWith("PK-")) return "PK";
+  return "OTHER";
+}
+
+function findProducingMovement(idx, lot) {
+  const rows = idx.byBatch.get(lot) || [];
+  return rows.find(m => m.movement_type === "In" && m.ref_type === "MO") || null;
+}
+function findOriginMovement(idx, lot) {
+  const rows = idx.byBatch.get(lot) || [];
+  return rows.find(m => m.movement_type === "In" && (m.ref_type === "PO" || m.ref_type === "ST")) || null;
+}
+function findMoInputs(idx, moRef) {
+  return (idx.byRef.get(moRef) || []).filter(m => m.movement_type === "Out");
+}
+function findDownstream(idx, lot) {
+  return (idx.byBatch.get(lot) || []).filter(m => m.movement_type === "Out").slice().sort((a, b) => (a.movement_date || "").localeCompare(b.movement_date || ""));
+}
+
+function buildLineageTree(idx, lot, depth, maxDepth, seen) {
+  if (depth > maxDepth) return { lot, sku: null, note: "max depth reached", inputs: [] };
+  if (seen.has(lot)) return { lot, sku: null, note: "cycle detected", inputs: [] };
+  seen.add(lot);
+  const producing = findProducingMovement(idx, lot);
+  if (!producing) {
+    const origin = findOriginMovement(idx, lot);
+    return { lot, sku: origin ? origin.sku : null, product: origin ? origin.product : null, origin: origin || null, inputs: [] };
+  }
+  const inputMovements = findMoInputs(idx, producing.reference);
+  const inputs = inputMovements.map(im => {
+    if (!im.batch) {
+      return { lot: null, sku: im.sku, product: im.product, category: skuCategory(im.sku), qty: im.qty_out, unit: im.unit, movement: im, inputs: [] };
+    }
+    const subtree = buildLineageTree(idx, im.batch, depth + 1, maxDepth, seen);
+    return { lot: im.batch, sku: im.sku, product: im.product, category: skuCategory(im.sku), qty: im.qty_out, unit: im.unit, movement: im, ...subtree };
+  });
+  return { lot, sku: producing.sku, product: producing.product, producing_mo: producing.reference, producing_date: producing.movement_date, producing_qty: producing.qty_in, unit: producing.unit, origin: producing, inputs };
+}
+
+function collectMovementsFromTree(node, acc = []) {
+  if (node.origin) acc.push(node.origin);
+  if (node.movement) acc.push(node.movement);
+  for (const child of node.inputs || []) collectMovementsFromTree(child, acc);
+  return acc;
+}
+function annotateTreeMovements(node) {
+  const out = { ...node };
+  if (node.origin) out.origin = annotateMovements([node.origin])[0];
+  if (node.movement) out.movement = annotateMovements([node.movement])[0];
+  if (node.inputs) out.inputs = node.inputs.map(annotateTreeMovements);
+  return out;
+}
+
+app.get("/api/traceability/fg-lineage/:lot", (req, res) => {
+  const lot = String(req.params.lot || "").trim();
+  if (!lot) return res.status(400).json({ ok: false, error: "Empty lot code" });
+  const maxDepth = Math.max(1, Math.min(10, parseInt(req.query.max_depth, 10) || 5));
+  const idx = getMovementIndex();
+  const upstream = buildLineageTree(idx, lot, 0, maxDepth, new Set());
+  const downstream = findDownstream(idx, lot);
+  const all = collectMovementsFromTree(upstream).concat(downstream);
+  res.json({
+    ok: true, lot, max_depth: maxDepth,
+    upstream: annotateTreeMovements(upstream),
+    downstream: annotateMovements(downstream),
+    data_quality: summarizeDataQuality(all),
+  });
+});
+
+app.get("/api/traceability/rm-history/:query", (req, res) => {
+  const q = String(req.params.query || "").trim();
+  if (!q) return res.status(400).json({ ok: false, error: "Empty query" });
+  const isSku = /^(RM|VC|PK|WIP|FG)-/i.test(q);
+  const idx = getMovementIndex();
+  const rows = ((isSku ? idx.bySku.get(q) : idx.byBatch.get(q)) || []).slice().sort((a, b) => (a.movement_date || "").localeCompare(b.movement_date || ""));
+  let running = 0;
+  const timeline = rows.map(mv => {
+    running += Number(mv.qty_in || 0) - Number(mv.qty_out || 0);
+    return { ...mv, running_balance: running };
+  });
+  const grouped = {
+    receipts:     timeline.filter(m => m.movement_type === "In"  && m.ref_type === "PO"),
+    consumptions: timeline.filter(m => m.movement_type === "Out" && m.ref_type === "MO"),
+    adjustments:  timeline.filter(m => m.ref_type === "ST"),
+    transfers:    timeline.filter(m => m.ref_type === "TR"),
+    other:        timeline.filter(m => !["PO", "MO", "ST", "TR"].includes(m.ref_type)),
+  };
+  res.json({
+    ok: true, query: q, resolved_via: isSku ? "sku" : "batch",
+    count: timeline.length, final_balance: running,
+    timeline: annotateMovements(timeline),
+    grouped: {
+      receipts:     annotateMovements(grouped.receipts),
+      consumptions: annotateMovements(grouped.consumptions),
+      adjustments:  annotateMovements(grouped.adjustments),
+      transfers:    annotateMovements(grouped.transfers),
+      other:        annotateMovements(grouped.other),
+    },
+    data_quality: summarizeDataQuality(timeline),
+  });
 });
 
 app.get("/", (req, res) => {
