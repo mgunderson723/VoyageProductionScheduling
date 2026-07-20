@@ -4146,7 +4146,7 @@ function renderTraceResultHeader(primary, kind, q, extra) {
       </div>
       ${bal != null ? `<div>
         <div class="trace-stat-label">Final balance</div>
-        <div class="trace-stat-value">${Number(bal).toLocaleString(undefined,{maximumFractionDigits:2})}</div>
+        <div class="trace-stat-value" style="${Number(bal) < 0 ? 'color:var(--vf-warning-text);' : ''}">${Number(bal).toLocaleString(undefined,{maximumFractionDigits:2})}</div>
       </div>` : ''}
       ${extra.lineage && extra.lineage.upstream && extra.lineage.upstream.producing_mo ? `<div>
         <div class="trace-stat-label">Produced via</div>
@@ -4155,7 +4155,11 @@ function renderTraceResultHeader(primary, kind, q, extra) {
     </div>
   `;
 
-  // DQ banner: aggregate flags from all sources.
+  // DQ banner: aggregate flags from all sources, plus infer a pre-window
+  // receipt callout when the running balance goes/ends negative. Cin7 cannot
+  // physically hold negative inventory of a lot, so a negative balance in our
+  // reconstructed ledger is a smoking-gun signal that the initial receipt
+  // happened before the loaded date range (2025-03-28+ in the current data).
   const dqSources = [primary.data_quality, extra.lineage && extra.lineage.data_quality, extra.rm && extra.rm.data_quality].filter(Boolean);
   const flaggedById = new Map();
   for (const s of dqSources) {
@@ -4164,12 +4168,27 @@ function renderTraceResultHeader(primary, kind, q, extra) {
       flaggedById.set(w.id, cur ? { ...w, count: cur.count + w.count } : w);
     }
   }
+
+  // Pre-window inference: fires when final_balance < 0 OR the earliest
+  // visible movement for this lot is an Out (no receipt on record).
+  const timeline = (extra.rm && extra.rm.timeline) || primary.movements || primary.timeline || [];
+  const earliestIsOut = timeline.length > 0 && timeline[0].movement_type === "Out";
+  const negativeBalance = Number(bal || 0) < 0;
+  const inferPreWindow = kind === "lot" && (negativeBalance || earliestIsOut);
+  const inferMsg = inferPreWindow
+    ? `<b>Pre-window receipt inferred.</b> The initial receipt for this lot appears to be <b>before ${escapeHtml((timeline[0] && timeline[0].movement_date || '').slice(0,10)) || 'the loaded data range'}</b> — we can see it being consumed / adjusted, but not received. Cin7 does not permit negative on-hand of a real lot, so the ${negativeBalance ? 'negative balance of ' + Number(bal).toLocaleString(undefined,{maximumFractionDigits:2}) + ' ' : ''}${earliestIsOut ? 'first-movement-is-Out pattern ' : ''}means the receipt PO is outside the currently-loaded reports (start: 2025-03-28). For the full history, pull an earlier-date "Inventory Movement Details" report from Cin7 and re-import.`
+    : '';
+
   const banner = document.getElementById('trace-dq-banner');
-  if (flaggedById.size) {
-    banner.style.display = '';
-    banner.innerHTML = `<b>Data-quality caveats apply to this result:</b><ul>` +
+  const dqHtml = flaggedById.size
+    ? `<b>Data-quality caveats apply to this result:</b><ul>` +
       [...flaggedById.values()].map(w => `<li><b>${w.count.toLocaleString()} movement(s) in ${escapeHtml(w.window)}:</b> ${escapeHtml(w.note)}</li>`).join('') +
-      `</ul>`;
+      `</ul>`
+    : '';
+  const combinedHtml = [inferMsg, dqHtml].filter(Boolean).join('<hr style="border:none;border-top:1px solid var(--vf-warning-base);opacity:0.3;margin:8px 0;">');
+  if (combinedHtml) {
+    banner.style.display = '';
+    banner.innerHTML = combinedHtml;
   } else {
     banner.style.display = 'none';
   }
@@ -4321,13 +4340,25 @@ function renderBalanceChart(timeline) {
     return `<text x="${PAD_L - 4}" y="${y}" text-anchor="end" font-size="9" fill="var(--vf-text-tertiary)" dominant-baseline="middle">${label}</text>
             <line x1="${PAD_L}" y1="${y}" x2="${W - PAD_R}" y2="${y}" stroke="var(--vf-border-soft)" stroke-dasharray="2,3"/>`;
   }).join('');
+  // If any part of the balance dips below zero, shade that region and add a
+  // callout — negative balance means the opening receipt is outside our data.
+  const dipsNegative = bMin < 0;
+  const negativeShade = dipsNegative && zeroY < PAD_T + innerH
+    ? `<rect x="${PAD_L}" y="${Math.max(zeroY, PAD_T)}" width="${innerW}" height="${(PAD_T + innerH) - Math.max(zeroY, PAD_T)}" fill="var(--vf-warning-base)" opacity="0.08"/>`
+    : '';
+  const negativeCallout = dipsNegative
+    ? `<div style="font-size:11px;color:var(--vf-warning-text);margin-top:6px;line-height:1.4;">
+         ⚠ Chart dips below zero — the receipt that opened this lot is outside the loaded date range (pre-2025-03-28). The area shaded amber is the inferred pre-window balance.
+       </div>`
+    : '';
   return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px;">
     ${gridLabels}
+    ${negativeShade}
     ${zeroY > PAD_T && zeroY < PAD_T + innerH ? `<line x1="${PAD_L}" y1="${zeroY}" x2="${W - PAD_R}" y2="${zeroY}" stroke="var(--vf-border-strong)" stroke-width="1"/>` : ''}
     <polyline points="${pts}" fill="none" stroke="var(--vf-focus-ring)" stroke-width="1.5"/>
     <text x="${PAD_L}" y="${H - 4}" font-size="10" fill="var(--vf-text-tertiary)">${firstDate}</text>
     <text x="${W - PAD_R}" y="${H - 4}" text-anchor="end" font-size="10" fill="var(--vf-text-tertiary)">${lastDate}</text>
-  </svg>`;
+  </svg>${negativeCallout}`;
 }
 
 function renderLiveInventory() {
