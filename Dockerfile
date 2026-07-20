@@ -6,6 +6,7 @@ COPY package.json ./
 RUN npm install --production --no-package-lock
 
 COPY server.js ./
+COPY lib/ ./lib/
 COPY public/ ./public/
 
 EXPOSE 3000
