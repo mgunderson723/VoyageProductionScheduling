@@ -1076,6 +1076,59 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
              onkeydown="if(event.key==='Enter'){runTraceabilitySearch();}">
       <button class="btn" onclick="runTraceabilitySearch()">Search</button>
       <button class="btn btn-ghost" onclick="clearTraceabilityResult()">Clear</button>
+      <button class="btn btn-ghost" onclick="toggleStaleLotsView()" id="trace-stale-toggle-btn" style="margin-left:auto;">📋 Stale lots</button>
+    </div>
+
+    <div id="trace-stale-panel" style="display:none;background:var(--vf-surface-raised);border:1px solid var(--vf-border-soft);border-radius:var(--vf-radius-md);padding:var(--vf-space-4);margin-bottom:var(--vf-space-4);">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:var(--vf-space-3);margin-bottom:var(--vf-space-3);flex-wrap:wrap;">
+        <div>
+          <div style="font-size:15px;font-weight:600;color:var(--vf-text-primary);">Stale lots — floor-count triage</div>
+          <div style="font-size:12px;color:var(--vf-text-secondary);margin-top:2px;">Lots with a non-zero paper balance and no recorded movement for a while. Target these for a physical count against Cin7 on-hand.</div>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button class="btn btn-sm" onclick="downloadStaleLotsCsv()">⬇ Download CSV</button>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill, minmax(160px, 1fr));gap:var(--vf-space-2);margin-bottom:var(--vf-space-3);">
+        <div>
+          <label style="font-size:11px;color:var(--vf-text-tertiary);text-transform:uppercase;letter-spacing:0.05em;display:block;margin-bottom:2px;">Min days idle</label>
+          <input id="stale-min-days" type="number" value="30" min="0" onchange="loadStaleLots()" style="width:100%;padding:6px 8px;background:var(--vf-surface-base);border:1px solid var(--vf-border-strong);border-radius:var(--vf-radius-sm);color:var(--vf-text-primary);font-family:inherit;">
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--vf-text-tertiary);text-transform:uppercase;letter-spacing:0.05em;display:block;margin-bottom:2px;">Min |balance|</label>
+          <input id="stale-min-bal" type="number" value="1" min="0" step="0.1" onchange="loadStaleLots()" style="width:100%;padding:6px 8px;background:var(--vf-surface-base);border:1px solid var(--vf-border-strong);border-radius:var(--vf-radius-sm);color:var(--vf-text-primary);font-family:inherit;">
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--vf-text-tertiary);text-transform:uppercase;letter-spacing:0.05em;display:block;margin-bottom:2px;">Category</label>
+          <select id="stale-category" onchange="loadStaleLots()" style="width:100%;padding:6px 8px;background:var(--vf-surface-base);border:1px solid var(--vf-border-strong);border-radius:var(--vf-radius-sm);color:var(--vf-text-primary);font-family:inherit;">
+            <option value="">All</option>
+            <option value="RM">RM only</option>
+            <option value="VC">VC only</option>
+            <option value="PK">PK only</option>
+            <option value="WIP">WIP only</option>
+            <option value="FG">FG only</option>
+            <option value="RM,VC,PK">Raw + Packaging</option>
+          </select>
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--vf-text-tertiary);text-transform:uppercase;letter-spacing:0.05em;display:block;margin-bottom:2px;">Sort by</label>
+          <select id="stale-sort" onchange="loadStaleLots()" style="width:100%;padding:6px 8px;background:var(--vf-surface-base);border:1px solid var(--vf-border-strong);border-radius:var(--vf-radius-sm);color:var(--vf-text-primary);font-family:inherit;">
+            <option value="idle_desc">Most idle first</option>
+            <option value="balance_desc">Highest balance first</option>
+            <option value="balance_asc">Lowest / negative balance first</option>
+            <option value="idle_asc">Least idle first</option>
+          </select>
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--vf-text-tertiary);text-transform:uppercase;letter-spacing:0.05em;display:block;margin-bottom:2px;">Negative balances</label>
+          <select id="stale-negative" onchange="loadStaleLots()" style="width:100%;padding:6px 8px;background:var(--vf-surface-base);border:1px solid var(--vf-border-strong);border-radius:var(--vf-radius-sm);color:var(--vf-text-primary);font-family:inherit;">
+            <option value="true">Include (default)</option>
+            <option value="false">Exclude</option>
+          </select>
+        </div>
+      </div>
+      <div id="stale-lots-status" style="font-size:12px;color:var(--vf-text-secondary);margin-bottom:var(--vf-space-2);">Loading…</div>
+      <div id="stale-lots-body"></div>
     </div>
 
     <div class="trace-hint" id="trace-hint">
@@ -4067,6 +4120,145 @@ function clearTraceabilityResult() {
   document.getElementById('trace-result').style.display = 'none';
   document.getElementById('trace-hint').style.display = '';
   _traceState.lastResult = null;
+}
+
+// ── Stale lots (floor-count triage) ────────────────────────────────────────
+// Lightweight subview alongside the per-lot search. Loads on demand.
+
+let _staleLotsCache = null;
+
+async function toggleStaleLotsView() {
+  const panel = document.getElementById('trace-stale-panel');
+  const btn = document.getElementById('trace-stale-toggle-btn');
+  if (!panel) return;
+  if (panel.style.display === 'none') {
+    panel.style.display = '';
+    btn.textContent = '📋 Stale lots ✕';
+    document.getElementById('trace-hint').style.display = 'none';
+    document.getElementById('trace-result').style.display = 'none';
+    await loadStaleLots();
+  } else {
+    panel.style.display = 'none';
+    btn.textContent = '📋 Stale lots';
+    document.getElementById('trace-hint').style.display = '';
+  }
+}
+
+function currentStaleFilters() {
+  return {
+    min_days_idle: parseInt(document.getElementById('stale-min-days').value, 10) || 0,
+    min_balance:   parseFloat(document.getElementById('stale-min-bal').value) || 0,
+    category:      document.getElementById('stale-category').value || '',
+    sort:          document.getElementById('stale-sort').value || 'idle_desc',
+    include_negative: document.getElementById('stale-negative').value || 'true',
+    limit:         2000,
+  };
+}
+
+async function loadStaleLots() {
+  const status = document.getElementById('stale-lots-status');
+  const body   = document.getElementById('stale-lots-body');
+  status.textContent = 'Loading…';
+  body.innerHTML = '';
+  const f = currentStaleFilters();
+  const qs = new URLSearchParams(f).toString();
+  try {
+    const r = await fetch('/api/traceability/stale-lots?' + qs);
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    _staleLotsCache = j;
+    const showing = j.count.toLocaleString();
+    const total = j.total_matches.toLocaleString();
+    const cap = j.count < j.total_matches ? ` (capped at ${showing} of ${total})` : ` (${total})`;
+    status.textContent = `Showing ${showing} stale lot${j.count === 1 ? '' : 's'}${cap} · as of ${j.as_of}. Click a row to see its full history.`;
+    body.innerHTML = renderStaleLotsTable(j.lots);
+  } catch (e) {
+    status.textContent = 'Error: ' + e.message;
+    body.innerHTML = '';
+  }
+}
+
+function renderStaleLotsTable(lots) {
+  if (!lots.length) return `<div class="trace-empty">No lots match the current filters. Try lowering the "Min days idle" or "Min |balance|" threshold.</div>`;
+  const today = new Date().toISOString().slice(0, 10);
+  const rows = lots.map((l) => {
+    const idleCls = l.days_idle >= 180 ? 'color:var(--vf-danger-text);font-weight:600;' :
+                    l.days_idle >= 90  ? 'color:var(--vf-warning-text);font-weight:500;' : '';
+    const bal = Number(l.running_balance).toLocaleString(undefined, { maximumFractionDigits: 2 });
+    const balCls = l.running_balance < 0 ? 'color:var(--vf-danger-text);' : '';
+    const cat = l.category || '—';
+    const catCls = 'trace-tree-node-cat';
+    return `<tr onclick="jumpToLotFromStale('${esc(l.batch)}')" style="cursor:pointer;">
+      <td style="text-align:right;font-variant-numeric:tabular-nums;${idleCls}">${l.days_idle}d</td>
+      <td><span class="${catCls}">${escapeHtml(cat)}</span></td>
+      <td style="white-space:nowrap;">${escapeHtml(l.sku || '')}</td>
+      <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(l.product || '')}">${escapeHtml((l.product || '').slice(0, 42))}</td>
+      <td style="font-family:var(--vf-font-mono, monospace);font-size:12px;">${escapeHtml(l.batch)}</td>
+      <td style="text-align:right;font-variant-numeric:tabular-nums;${balCls}">${bal} <span style="color:var(--vf-text-tertiary);font-size:11px;">${escapeHtml(l.unit || '')}</span></td>
+      <td style="white-space:nowrap;">${escapeHtml(l.last_movement_date || '')}</td>
+      <td style="white-space:nowrap;font-size:12px;color:var(--vf-text-secondary);">${escapeHtml(l.last_reference || '')} ${l.last_movement_type ? `<span style="color:var(--vf-text-tertiary);font-size:10px;">(${escapeHtml(l.last_movement_type)})</span>` : ''}</td>
+      <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(l.last_location || '')}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="trace-scroll-box"><table class="trace-table">
+    <thead><tr>
+      <th style="text-align:right;">Idle</th>
+      <th>Cat</th>
+      <th>SKU</th>
+      <th>Product</th>
+      <th>Lot code</th>
+      <th style="text-align:right;">Balance</th>
+      <th>Last move</th>
+      <th>Last ref</th>
+      <th>Last location</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>
+  <div style="font-size:11px;color:var(--vf-text-tertiary);margin-top:8px;">
+    <span style="color:var(--vf-danger-text);">■</span> Idle ≥ 180d ·
+    <span style="color:var(--vf-warning-text);">■</span> Idle ≥ 90d ·
+    <span style="color:var(--vf-danger-text);">■</span> Negative balance (likely pre-window receipt not in loaded data, or over-consumption)
+  </div>`;
+}
+
+function jumpToLotFromStale(lotCode) {
+  document.getElementById('trace-search-input').value = lotCode;
+  toggleStaleLotsView(); // close the panel
+  runTraceabilitySearch();
+}
+
+function downloadStaleLotsCsv() {
+  if (!_staleLotsCache || !_staleLotsCache.lots || !_staleLotsCache.lots.length) {
+    alert('No lots loaded to export. Adjust filters and try again.');
+    return;
+  }
+  const headers = [
+    'days_idle', 'category', 'sku', 'product', 'lot_code', 'running_balance',
+    'unit', 'last_movement_date', 'last_reference', 'last_movement_type',
+    'last_location', 'first_movement_date', 'movement_count', 'total_in', 'total_out',
+  ];
+  const rows = _staleLotsCache.lots.map(l => headers.map(h => {
+    let v;
+    switch (h) {
+      case 'lot_code': v = l.batch; break;
+      default: v = l[h];
+    }
+    v = v == null ? '' : String(v);
+    // CSV-escape: wrap in quotes if contains comma/quote/newline, and double-up embedded quotes.
+    return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+  }).join(','));
+  const filters = _staleLotsCache.filters || {};
+  const meta = `# Stale lots export from Voyage Production Scheduling\n# as_of=${_staleLotsCache.as_of}, min_days_idle=${filters.min_days_idle}, min_balance=${filters.min_balance}, sort=${filters.sort}\n# total_matches=${_staleLotsCache.total_matches}, in_export=${_staleLotsCache.lots.length}\n`;
+  const csv = meta + headers.join(',') + '\n' + rows.join('\n') + '\n';
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `stale-lots-${_staleLotsCache.as_of}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 // Detect what the user typed: SKU / reference / lot code.

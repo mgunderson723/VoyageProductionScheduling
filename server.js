@@ -5157,6 +5157,133 @@ app.get("/api/traceability/summary", (_req, res) => {
   });
 });
 
+// GET /api/traceability/stale-lots — lot-level triage for floor counts.
+//
+// Aggregates every movement row keyed on batch to compute per-lot:
+//   * last_movement_date — anchor for "days idle"
+//   * running_balance     — sum(qty_in) − sum(qty_out); the "supposedly on
+//                           hand" figure that QA/ops should physically verify
+//   * category            — RM/WIP/VC/PK/FG from SKU prefix
+//   * last_location, last_reference — what happened last and where
+//   * dq_notes            — flagged if the lot ever sits in a noisy window
+//
+// Filters (query params, all optional):
+//   as_of              YYYY-MM-DD (defaults to today; useful for reproducing
+//                      what a report from a specific date would have looked
+//                      like). Anchors "days idle" and ignores movements after.
+//   min_days_idle      Only include lots idle >= this many days. Default 30.
+//   min_balance        Only include lots whose |balance| >= this. Default 0.1
+//                      so numeric-noise lots don't dominate the list.
+//   include_negative   Include lots with negative running_balance too. Default
+//                      true — negatives are the "pre-window receipt missing"
+//                      or over-consumed cases that also warrant floor-count.
+//   category           Comma-separated filter (RM,VC,PK,WIP,FG,OTHER). Default: all.
+//   limit              Cap result size. Default 500, max 5000.
+//   sort               "idle_desc" (default), "idle_asc", "balance_desc",
+//                      "balance_asc".
+function computeLotIdleStats(idx, opts) {
+  const byLot = new Map(); // batch -> aggregated stats
+  const asOf = opts.asOf || null;
+  for (const m of idx.all) {
+    if (!m.batch) continue;
+    if (asOf && m.movement_date > asOf) continue;
+    let stat = byLot.get(m.batch);
+    if (!stat) {
+      stat = {
+        batch: m.batch,
+        sku: m.sku || "",
+        product: m.product || "",
+        unit: m.unit || "",
+        category: skuCategory(m.sku),
+        first_movement_date: m.movement_date,
+        last_movement_date: m.movement_date,
+        last_location: m.location || null,
+        last_reference: m.reference || null,
+        last_ref_type: m.ref_type || null,
+        last_movement_type: m.movement_type || null,
+        total_in: 0,
+        total_out: 0,
+        movement_count: 0,
+      };
+      byLot.set(m.batch, stat);
+    } else {
+      // Update SKU if the current row is more informative (some rows have
+      // empty sku but the lot has a real one elsewhere)
+      if (!stat.sku && m.sku) stat.sku = m.sku;
+      if (!stat.product && m.product) stat.product = m.product;
+      if (!stat.unit && m.unit) stat.unit = m.unit;
+      if (!stat.category || stat.category === "OTHER") stat.category = skuCategory(m.sku);
+      if (m.movement_date < stat.first_movement_date) stat.first_movement_date = m.movement_date;
+      if (m.movement_date > stat.last_movement_date) {
+        stat.last_movement_date = m.movement_date;
+        stat.last_location = m.location || null;
+        stat.last_reference = m.reference || null;
+        stat.last_ref_type = m.ref_type || null;
+        stat.last_movement_type = m.movement_type || null;
+      }
+    }
+    stat.total_in += Number(m.qty_in || 0);
+    stat.total_out += Number(m.qty_out || 0);
+    stat.movement_count += 1;
+  }
+  const today = asOf || new Date().toISOString().slice(0, 10);
+  const results = [];
+  for (const stat of byLot.values()) {
+    stat.running_balance = Math.round((stat.total_in - stat.total_out) * 1000) / 1000;
+    stat.days_idle = daysBetween(stat.last_movement_date, today);
+    results.push(stat);
+  }
+  return results;
+}
+
+function daysBetween(fromIso, toIso) {
+  if (!fromIso || !toIso) return null;
+  const a = new Date(fromIso + "T00:00:00Z").getTime();
+  const b = new Date(toIso + "T00:00:00Z").getTime();
+  return Math.max(0, Math.floor((b - a) / 86400000));
+}
+
+app.get("/api/traceability/stale-lots", (req, res) => {
+  const asOf = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.as_of || "")) ? req.query.as_of : null;
+  const minDaysIdle = Math.max(0, parseInt(req.query.min_days_idle, 10) || 30);
+  const minBalance = Math.max(0, parseFloat(req.query.min_balance || 0.1));
+  const includeNegative = req.query.include_negative !== "false";
+  const categories = (req.query.category || "").split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+  const limit = Math.min(parseInt(req.query.limit, 10) || 500, 5000);
+  const sort = String(req.query.sort || "idle_desc");
+
+  const idx = getMovementIndex();
+  const stats = computeLotIdleStats(idx, { asOf });
+  const filtered = stats.filter(s => {
+    if (s.days_idle == null) return false;
+    if (s.days_idle < minDaysIdle) return false;
+    const absBal = Math.abs(s.running_balance);
+    if (absBal < minBalance) return false;
+    if (!includeNegative && s.running_balance < 0) return false;
+    if (categories.length && !categories.includes(s.category)) return false;
+    return true;
+  });
+
+  filtered.sort((a, b) => {
+    switch (sort) {
+      case "idle_asc":    return a.days_idle - b.days_idle;
+      case "balance_desc":return b.running_balance - a.running_balance;
+      case "balance_asc": return a.running_balance - b.running_balance;
+      case "idle_desc":
+      default:            return b.days_idle - a.days_idle;
+    }
+  });
+
+  res.json({
+    ok: true,
+    as_of: asOf || new Date().toISOString().slice(0, 10),
+    filters: { min_days_idle: minDaysIdle, min_balance: minBalance, include_negative: includeNegative, categories, sort },
+    total_matches: filtered.length,
+    count: Math.min(filtered.length, limit),
+    lots: filtered.slice(0, limit),
+  });
+});
+
 // ── Chain traversal ──────────────────────────────────────────────────────────
 // FG lot → producing MO → BOM inputs consumed → recurse on each input lot.
 
