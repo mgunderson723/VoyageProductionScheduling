@@ -4279,7 +4279,7 @@ function detectTraceQueryKind(q) {
 async function runTraceabilitySearch() {
   const q = document.getElementById('trace-search-input').value.trim();
   if (!q) return;
-  const kind = detectTraceQueryKind(q);
+  let kind = detectTraceQueryKind(q);
   const hint = document.getElementById('trace-hint');
   const box  = document.getElementById('trace-result');
   const body = document.getElementById('trace-view-body');
@@ -4287,14 +4287,37 @@ async function runTraceabilitySearch() {
   box.style.display = '';
   body.innerHTML = '<div class="trace-empty">Loading…</div>';
 
-  let endpoint, primary, extra = {};
-  if (kind === 'sku') endpoint = '/api/traceability/sku/' + encodeURIComponent(q);
-  else if (kind === 'reference') endpoint = '/api/traceability/reference/' + encodeURIComponent(q);
-  else endpoint = '/api/traceability/lot/' + encodeURIComponent(q);
+  const endpointFor = (k) => (
+    k === 'sku'       ? '/api/traceability/sku/'       + encodeURIComponent(q) :
+    k === 'reference' ? '/api/traceability/reference/' + encodeURIComponent(q) :
+                        '/api/traceability/lot/'       + encodeURIComponent(q)
+  );
+
+  let primary, extra = {};
 
   try {
-    const primaryResp = await fetch(endpoint).then(r => r.json());
+    let primaryResp = await fetch(endpointFor(kind)).then(r => r.json());
     if (!primaryResp.ok) throw new Error(primaryResp.error || 'Search failed');
+
+    // Silent fallback for ambiguous inputs. Newer lot codes like
+    // "MO-00XXX/190" (where /190 is a Julian date) look identical to an
+    // MO-batch reference. If the detected kind returns 0 hits, retry as
+    // the other kind. Lot codes are unique identifiers so we prefer them
+    // when ambiguity exists.
+    const primaryCount = primaryResp.count || 0;
+    if (primaryCount === 0) {
+      const fallbackKind =
+        kind === 'reference' ? 'lot' :
+        kind === 'lot'       ? 'reference' :
+        null;
+      if (fallbackKind) {
+        const alt = await fetch(endpointFor(fallbackKind)).then(r => r.json()).catch(() => null);
+        if (alt && alt.ok && (alt.count || 0) > 0) {
+          kind = fallbackKind;
+          primaryResp = alt;
+        }
+      }
+    }
     primary = primaryResp;
 
     // For lot lookups, also fetch lineage + forward + rm-history in parallel so tab switching is instant.
@@ -4310,7 +4333,7 @@ async function runTraceabilitySearch() {
     } else if (kind === 'sku') {
       const rm = await fetch('/api/traceability/rm-history/' + encodeURIComponent(q)).then(r => r.json()).catch(() => null);
       extra.rm = rm;
-    } else if (kind === 'reference' && /^MO-/i.test(q)) {
+    } else if (kind === 'reference' && /^MO-\d+(\/\d+)?$/i.test(q)) {
       // MO refs can be forward-traced (find outputs, walk forward from each).
       const forward = await fetch('/api/traceability/forward/' + encodeURIComponent(q)).then(r => r.json()).catch(() => null);
       extra.forward = forward;

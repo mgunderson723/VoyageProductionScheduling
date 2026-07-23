@@ -5501,11 +5501,17 @@ app.get("/api/traceability/forward/:query", (req, res) => {
   const maxDepth = Math.max(1, Math.min(10, parseInt(req.query.max_depth, 10) || 5));
   const idx = getMovementIndex();
 
-  // Strict-match MO reference — must be MO-NNNNN with optional /N batch
-  // suffix and NOTHING after it. Voyage lot codes derived from MOs (e.g.
-  // "MO-00539/2-10-22-2025") also start with MO- so a loose /^MO-/ check
-  // misclassifies them as references and returns an empty forward tree.
-  const isMoRef = /^MO-\d+(\/\d+)?$/i.test(q);
+  // Ambiguous case: a string like "MO-00XXX/190" could be either an MO
+  // reference (MO-00XXX batch 190) or a lot code (where /190 is a Julian
+  // date used in newer naming conventions). Older lot codes like
+  // "MO-00539/2-10-22-2025" also start with MO- but have extra dashes so
+  // they're syntactically distinguishable. Rather than guess by shape,
+  // check the data: if the query is present as a batch code, treat it as
+  // a lot; otherwise fall back to MO-ref detection. Lot codes are unique
+  // identifiers so this preference is safe.
+  const strictMoPattern = /^MO-\d+(\/\d+)?$/i.test(q);
+  const existsAsBatch = idx.byBatch.has(q);
+  const isMoRef = strictMoPattern && !existsAsBatch;
   if (isMoRef) {
     // For an MO ref, forward-trace means: find the outputs of that MO and
     // walk forward from each output lot.
