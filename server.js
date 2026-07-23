@@ -5501,7 +5501,11 @@ app.get("/api/traceability/forward/:query", (req, res) => {
   const maxDepth = Math.max(1, Math.min(10, parseInt(req.query.max_depth, 10) || 5));
   const idx = getMovementIndex();
 
-  const isMoRef = /^MO-/i.test(q);
+  // Strict-match MO reference — must be MO-NNNNN with optional /N batch
+  // suffix and NOTHING after it. Voyage lot codes derived from MOs (e.g.
+  // "MO-00539/2-10-22-2025") also start with MO- so a loose /^MO-/ check
+  // misclassifies them as references and returns an empty forward tree.
+  const isMoRef = /^MO-\d+(\/\d+)?$/i.test(q);
   if (isMoRef) {
     // For an MO ref, forward-trace means: find the outputs of that MO and
     // walk forward from each output lot.

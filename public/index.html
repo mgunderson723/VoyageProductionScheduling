@@ -4263,10 +4263,16 @@ function downloadStaleLotsCsv() {
 }
 
 // Detect what the user typed: SKU / reference / lot code.
+// Reference detection has to be STRICT-ANCHORED because Voyage lot codes
+// derived from an MO start with the MO number as a prefix — e.g.
+// "MO-00539/2-10-22-2025" is a lot, not the reference "MO-00539/2". A
+// loose /^MO-/ match would misclassify it.
 function detectTraceQueryKind(q) {
   const s = q.trim();
   if (/^(RM|VC|PK|WIP|FG|LB)-[A-Z0-9-]+/i.test(s)) return 'sku';
-  if (/^(PO|MO|ST|TR|SO|FG)-\d+/i.test(s)) return 'reference';
+  // PO/ST/TR/SO/FG references: prefix + digits only, nothing after.
+  // MO references: prefix + digits + optional /N batch suffix, nothing after.
+  if (/^((PO|ST|TR|SO|FG)-\d+|MO-\d+(\/\d+)?)$/i.test(s)) return 'reference';
   return 'lot';
 }
 
