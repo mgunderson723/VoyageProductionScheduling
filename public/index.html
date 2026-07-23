@@ -1149,6 +1149,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       <div class="trace-view-tabs" id="trace-view-tabs">
         <button class="trace-view-tab active" data-view="timeline" onclick="setTraceView('timeline')">Timeline</button>
         <button class="trace-view-tab" data-view="lineage" onclick="setTraceView('lineage')">Lineage tree</button>
+        <button class="trace-view-tab" data-view="forward" onclick="setTraceView('forward')">Forward trace</button>
         <button class="trace-view-tab" data-view="ledger" onclick="setTraceView('ledger')">Ledger + balance</button>
       </div>
       <div id="trace-view-body"></div>
@@ -4290,17 +4291,23 @@ async function runTraceabilitySearch() {
     if (!primaryResp.ok) throw new Error(primaryResp.error || 'Search failed');
     primary = primaryResp;
 
-    // For lot lookups, also fetch lineage + rm-history in parallel so tab switching is instant.
+    // For lot lookups, also fetch lineage + forward + rm-history in parallel so tab switching is instant.
     if (kind === 'lot') {
-      const [lineage, rm] = await Promise.all([
+      const [lineage, forward, rm] = await Promise.all([
         fetch('/api/traceability/fg-lineage/' + encodeURIComponent(q)).then(r => r.json()).catch(() => null),
+        fetch('/api/traceability/forward/' + encodeURIComponent(q)).then(r => r.json()).catch(() => null),
         fetch('/api/traceability/rm-history/' + encodeURIComponent(q)).then(r => r.json()).catch(() => null),
       ]);
       extra.lineage = lineage;
+      extra.forward = forward;
       extra.rm = rm;
     } else if (kind === 'sku') {
       const rm = await fetch('/api/traceability/rm-history/' + encodeURIComponent(q)).then(r => r.json()).catch(() => null);
       extra.rm = rm;
+    } else if (kind === 'reference' && /^MO-/i.test(q)) {
+      // MO refs can be forward-traced (find outputs, walk forward from each).
+      const forward = await fetch('/api/traceability/forward/' + encodeURIComponent(q)).then(r => r.json()).catch(() => null);
+      extra.forward = forward;
     }
   } catch (e) {
     body.innerHTML = `<div class="trace-empty" style="color:var(--vf-danger-text);">Error: ${escapeHtml(e.message)}</div>`;
@@ -4392,10 +4399,23 @@ function updateTraceViewTabs(kind, primary, extra) {
     const view = t.dataset.view;
     let enabled = true;
     if (view === 'lineage') enabled = kind === 'lot' && extra.lineage && (extra.lineage.upstream || extra.lineage.downstream);
+    if (view === 'forward') {
+      const f = extra.forward;
+      enabled = !!f && (
+        (f.kind === 'lot' && f.forward) ||
+        (f.kind === 'mo' && (f.outputs_produced || []).length > 0)
+      );
+    }
     if (view === 'ledger') enabled = !!extra.rm && (extra.rm.timeline || []).length > 0;
     t.disabled = !enabled;
     t.classList.toggle('active', view === _traceState.view);
   });
+  // If the currently-selected view is now disabled (e.g. user was on 'forward'
+  // and the new search doesn't support it), fall back to 'timeline'.
+  const active = document.querySelector('.trace-view-tab.active');
+  if (active && active.disabled) {
+    setTraceView('timeline');
+  }
 }
 
 function setTraceView(view) {
@@ -4411,6 +4431,7 @@ function renderTraceView() {
   const { primary, extra } = s.lastResult;
   if (s.view === 'timeline') body.innerHTML = renderTimelineTable(primary.movements || primary.timeline || []);
   else if (s.view === 'lineage') body.innerHTML = renderLineageView(extra.lineage);
+  else if (s.view === 'forward') body.innerHTML = renderForwardView(extra.forward);
   else if (s.view === 'ledger') body.innerHTML = renderLedgerView(extra.rm);
 }
 
@@ -4486,6 +4507,125 @@ function renderNodeLabel(node, isRoot) {
     : '';
   const catPill = cat ? `<span class="trace-tree-node-cat">${escapeHtml(cat)}</span>` : '';
   return `${catPill}<span class="trace-tree-node-sku">${escapeHtml(sku)}</span> <span class="trace-tree-node-lot">${lot}</span> <span class="trace-tree-node-qty">${escapeHtml(qty)}</span> ${via}${origin}`;
+}
+
+// Forward-trace view: recursive tree showing where a lot / MO's outputs
+// ended up. Root can be a lot code (single starting point) or an MO ref
+// (multiple output-lot starting points). Terminals include shipments,
+// transfers, adjustments, and still-on-hand.
+function renderForwardView(forward) {
+  if (!forward) return `<div class="trace-empty">Forward trace unavailable.</div>`;
+  const isMo = forward.kind === 'mo';
+  const roots = isMo ? (forward.outputs_produced || []) : (forward.forward ? [forward.forward] : []);
+  if (!roots.length) {
+    return `<div class="trace-empty">No forward trace available. ${isMo ? 'This MO reference has no output rows in the loaded data.' : 'This lot has no downstream movements — nothing has left inventory yet.'}</div>`;
+  }
+  const legend = `<div style="font-size:11px;color:var(--vf-text-tertiary);margin-top:8px;">
+    <b>Icons:</b>
+    ▸ SO shipment · ▸ TR transfer · ▸ ST adjustment · ▸ FG assembly ·
+    ▸ MO consumed → produces new lot(s) shown as children
+  </div>`;
+  const treeHtml = roots.map(r => `<li>${renderForwardNode(r, true)}</li>`).join('');
+  const heading = isMo
+    ? `<div style="font-weight:600;margin-bottom:8px;color:var(--vf-text-secondary);font-size:12px;text-transform:uppercase;letter-spacing:0.05em;">
+         MO ${escapeHtml(forward.query)} — ${roots.length} output lot${roots.length===1?'':'s'} · forward trace
+       </div>`
+    : `<div style="font-weight:600;margin-bottom:8px;color:var(--vf-text-secondary);font-size:12px;text-transform:uppercase;letter-spacing:0.05em;">
+         Lot ${escapeHtml(forward.query)} — where it ended up
+       </div>`;
+  return heading + `<div class="trace-tree"><ul>${treeHtml}</ul></div>` + legend;
+}
+
+function renderForwardNode(node, isRoot) {
+  if (!node) return '<i style="color:var(--vf-text-tertiary);">empty</i>';
+  const label = renderForwardNodeLabel(node);
+  const details = renderForwardDestinations(node);
+  const consumed = (node.consumed_by_mos || []);
+  if (!consumed.length && !details) return label;
+  let childHtml = '';
+  if (consumed.length) {
+    const consumedHtml = consumed.map(c => {
+      const outputs = (c.produced_outputs || []).map(o => `<li>${renderForwardNode(o, false)}</li>`).join('');
+      const qtyStr = Number(c.qty_consumed || 0).toLocaleString(undefined,{maximumFractionDigits:3});
+      return `<li>
+        <span class="trace-tree-node-cat">MO</span>
+        <b>${escapeHtml(c.mo)}</b>
+        <span class="trace-tree-node-qty">consumed ${qtyStr} ${escapeHtml(c.unit || '')} on ${escapeHtml((c.date || '').slice(0,10))}</span>
+        ${outputs ? `<ul>${outputs}</ul>` : '<span style="color:var(--vf-text-tertiary);font-size:11px;margin-left:6px;">— no outputs recorded for this MO</span>'}
+      </li>`;
+    }).join('');
+    childHtml += `<ul>${consumedHtml}</ul>`;
+  }
+  if (details) childHtml += details;
+  return label + childHtml;
+}
+
+function renderForwardNodeLabel(node) {
+  const cat = node.category || (node.sku ? node.sku.split('-')[0] : '');
+  const catPill = cat ? `<span class="trace-tree-node-cat">${escapeHtml(cat)}</span>` : '';
+  const sku = escapeHtml(node.sku || '—');
+  const lot = node.lot ? `lot=${escapeHtml(node.lot)}` : '<i style="color:var(--vf-text-tertiary);">no lot</i>';
+  const producedInfo = node.qty_produced != null
+    ? `produced ${Number(node.qty_produced).toLocaleString(undefined,{maximumFractionDigits:3})} ${escapeHtml(node.unit || '')} on ${escapeHtml((node.date || '').slice(0,10))}`
+    : '';
+  const soh = node.still_on_hand != null
+    ? `<span style="color:${node.still_on_hand > 0 ? 'var(--vf-success-text)' : node.still_on_hand < 0 ? 'var(--vf-danger-text)' : 'var(--vf-text-tertiary)'};font-weight:500;">still ${Number(node.still_on_hand).toLocaleString(undefined,{maximumFractionDigits:2})} ${escapeHtml(node.unit || '')}</span>`
+    : '';
+  const jump = node.lot ? ` <a href="#" onclick="jumpToLotFromForward('${esc(node.lot)}');return false;" style="font-size:11px;">↗ drill in</a>` : '';
+  const noteBadge = node.note ? ` <span style="color:var(--vf-warning-text);font-size:11px;">⚠ ${escapeHtml(node.note)}</span>` : '';
+  return `${catPill}<span class="trace-tree-node-sku">${sku}</span> <span class="trace-tree-node-lot">${lot}</span> <span class="trace-tree-node-qty">${escapeHtml(producedInfo)}</span> ${soh}${jump}${noteBadge}`;
+}
+
+function renderForwardDestinations(node) {
+  const parts = [];
+  const shipments = node.shipments || [];
+  const transfers = node.transfers_out || [];
+  const adjustments = node.adjustments_out || [];
+  const assemblies = node.assemblies || [];
+  const fmt = n => Number(n || 0).toLocaleString(undefined, { maximumFractionDigits: 3 });
+
+  if (shipments.length) {
+    const items = shipments.map(s => `<li>
+      <span class="trace-reftype-pill trace-reftype-SO">SO</span>
+      <b>${escapeHtml(s.ref)}</b> on ${escapeHtml((s.date || '').slice(0,10))} —
+      shipped <b>${fmt(s.qty)} ${escapeHtml(s.unit || '')}</b>
+      ${s.location ? ` from ${escapeHtml(s.location)}` : ''}
+      ${s.document_reference ? ` <span style="color:var(--vf-text-tertiary);font-size:11px;">(doc: ${escapeHtml(s.document_reference)})</span>` : ''}
+    </li>`).join('');
+    parts.push(`<ul>${items}</ul>`);
+  }
+  if (transfers.length) {
+    const items = transfers.map(t => `<li>
+      <span class="trace-reftype-pill trace-reftype-TR">TR</span>
+      <b>${escapeHtml(t.ref)}</b> on ${escapeHtml((t.date || '').slice(0,10))} —
+      transferred <b>${fmt(t.qty)} ${escapeHtml(t.unit || '')}</b> from ${escapeHtml(t.from || '(unknown)')}
+    </li>`).join('');
+    parts.push(`<ul>${items}</ul>`);
+  }
+  if (adjustments.length) {
+    const items = adjustments.map(a => `<li>
+      <span class="trace-reftype-pill trace-reftype-ST">ST</span>
+      <b>${escapeHtml(a.ref)}</b> on ${escapeHtml((a.date || '').slice(0,10))} —
+      adjusted-out <b>${fmt(a.qty)} ${escapeHtml(a.unit || '')}</b>
+      ${a.document_reference ? ` <span style="color:var(--vf-text-tertiary);font-size:11px;">(reason: ${escapeHtml(a.document_reference)})</span>` : ''}
+    </li>`).join('');
+    parts.push(`<ul>${items}</ul>`);
+  }
+  if (assemblies.length) {
+    const items = assemblies.map(a => `<li>
+      <span class="trace-reftype-pill trace-reftype-FG">FG</span>
+      <b>${escapeHtml(a.ref)}</b> on ${escapeHtml((a.date || '').slice(0,10))} —
+      <b>${fmt(a.qty)} ${escapeHtml(a.unit || '')}</b>
+      <span style="color:var(--vf-text-tertiary);font-size:11px;">(${escapeHtml(a.note || 'assembly')})</span>
+    </li>`).join('');
+    parts.push(`<ul>${items}</ul>`);
+  }
+  return parts.join('');
+}
+
+function jumpToLotFromForward(lotCode) {
+  document.getElementById('trace-search-input').value = lotCode;
+  runTraceabilitySearch();
 }
 
 function renderLedgerView(rm) {

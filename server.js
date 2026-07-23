@@ -5362,6 +5362,190 @@ app.get("/api/traceability/fg-lineage/:lot", (req, res) => {
   });
 });
 
+// ── Forward trace ────────────────────────────────────────────────────────────
+// The mirror of the lineage tree: given a lot (or an MO reference), walk
+// forward — this lot was consumed by which MOs, those MOs produced which
+// lots, and where did those lots end up (SO shipments, transfers, further
+// production, adjustments, still-on-hand). Recursive with depth cap.
+//
+// This is what QA needs to answer "if this raw-material lot is contaminated,
+// which finished goods do we recall?" or "where did this specific batch end
+// up — did it ship, is it still in stock, was it written off?".
+//
+// Response shape (recursive):
+//   {
+//     lot, sku, product, unit, category,
+//     still_on_hand,       // ins − outs for THIS lot (best-effort)
+//     total_in, total_out, // ins/outs summed
+//     consumed_by_mos: [
+//       { mo, date, qty_consumed, unit,
+//         produced_outputs: [ {lot, sku, ...subtree...} ] }
+//     ],
+//     shipments: [{ ref: SO-*, date, qty, unit, location, doc_ref }],
+//     transfers_out: [{ ref: TR-*, date, qty, unit, from, to }],
+//     adjustments_out: [{ ref: ST-*, date, qty, unit }],
+//     assemblies: [{ ref: FG-*, date, qty, unit, note: "UOM/consolidation" }],
+//     movements: [ ... raw Out rows for reference ... ]
+//   }
+
+function buildForwardTree(idx, lot, depth, maxDepth, seen) {
+  if (depth > maxDepth) return { lot, note: "max depth reached", consumed_by_mos: [], shipments: [], transfers_out: [], adjustments_out: [], assemblies: [], still_on_hand: null };
+  if (seen.has(lot)) return { lot, note: "cycle detected", consumed_by_mos: [], shipments: [], transfers_out: [], adjustments_out: [], assemblies: [], still_on_hand: null };
+  seen.add(lot);
+
+  const all = (idx.byBatch.get(lot) || []).slice().sort((a, b) => (a.movement_date || "").localeCompare(b.movement_date || ""));
+  const ins = all.filter(m => m.movement_type === "In");
+  const outs = all.filter(m => m.movement_type === "Out");
+  const totalIn = ins.reduce((s, m) => s + Number(m.qty_in || 0), 0);
+  const totalOut = outs.reduce((s, m) => s + Number(m.qty_out || 0), 0);
+  const sample = ins[0] || outs[0] || {};
+
+  const shipments = [];
+  const transfersOut = [];
+  const adjustmentsOut = [];
+  const assemblies = [];
+  const byMo = new Map();
+
+  for (const m of outs) {
+    if (m.ref_type === "MO") {
+      if (!byMo.has(m.reference)) {
+        byMo.set(m.reference, { mo: m.reference, date: m.movement_date, qty: 0, unit: m.unit || sample.unit || null });
+      }
+      const e = byMo.get(m.reference);
+      e.qty += Number(m.qty_out || 0);
+      if (!e.date || m.movement_date < e.date) e.date = m.movement_date;
+    } else if (m.ref_type === "SO") {
+      shipments.push({
+        ref: m.reference, date: m.movement_date, qty: Number(m.qty_out || 0), unit: m.unit,
+        location: m.location, document_reference: m.document_reference,
+      });
+    } else if (m.ref_type === "TR") {
+      transfersOut.push({
+        ref: m.reference, date: m.movement_date, qty: Number(m.qty_out || 0), unit: m.unit,
+        from: m.location, // ORM movement.location = where it left from on Out rows
+      });
+    } else if (m.ref_type === "ST") {
+      adjustmentsOut.push({
+        ref: m.reference, date: m.movement_date, qty: Number(m.qty_out || 0), unit: m.unit,
+        document_reference: m.document_reference,
+      });
+    } else if (m.ref_type === "FG") {
+      assemblies.push({
+        ref: m.reference, date: m.movement_date, qty: Number(m.qty_out || 0), unit: m.unit,
+        note: "Cin7 Assembly (UOM conversion / lot consolidation — paper-only movement)",
+      });
+    }
+  }
+
+  // For each consuming MO, find the outputs of that same MO and recurse.
+  const consumedByMos = [];
+  for (const entry of byMo.values()) {
+    const outputs = (idx.byRef.get(entry.mo) || []).filter(m => m.movement_type === "In");
+    const outputTrees = outputs.map(out => {
+      if (!out.batch) {
+        return {
+          lot: null, sku: out.sku, product: out.product, unit: out.unit,
+          date: out.movement_date, qty_produced: Number(out.qty_in || 0),
+          note: "output row has no batch code — chain terminates here",
+          consumed_by_mos: [], shipments: [], transfers_out: [], adjustments_out: [], assemblies: [], still_on_hand: null,
+        };
+      }
+      const subtree = buildForwardTree(idx, out.batch, depth + 1, maxDepth, seen);
+      return {
+        lot: out.batch, sku: out.sku, product: out.product, unit: out.unit,
+        date: out.movement_date, qty_produced: Number(out.qty_in || 0),
+        category: skuCategory(out.sku),
+        ...subtree,
+      };
+    });
+    consumedByMos.push({
+      mo: entry.mo, date: entry.date, qty_consumed: entry.qty, unit: entry.unit,
+      produced_outputs: outputTrees,
+    });
+  }
+
+  return {
+    lot,
+    sku: sample.sku || null,
+    product: sample.product || null,
+    unit: sample.unit || null,
+    category: skuCategory(sample.sku),
+    total_in: Math.round(totalIn * 1000) / 1000,
+    total_out: Math.round(totalOut * 1000) / 1000,
+    still_on_hand: Math.round((totalIn - totalOut) * 1000) / 1000,
+    consumed_by_mos: consumedByMos,
+    shipments,
+    transfers_out: transfersOut,
+    adjustments_out: adjustmentsOut,
+    assemblies,
+    movements_out: outs,
+  };
+}
+
+// Collect all movement rows referenced anywhere in the forward tree — for
+// data-quality summarization.
+function collectMovementsFromForwardTree(node, acc = []) {
+  if (!node) return acc;
+  if (node.movements_out) for (const m of node.movements_out) acc.push(m);
+  for (const c of (node.consumed_by_mos || [])) {
+    for (const o of (c.produced_outputs || [])) collectMovementsFromForwardTree(o, acc);
+  }
+  return acc;
+}
+
+// GET /api/traceability/forward/:query — accepts a lot code OR an MO ref
+// (with or without the /N batch suffix).
+app.get("/api/traceability/forward/:query", (req, res) => {
+  const q = String(req.params.query || "").trim();
+  if (!q) return res.status(400).json({ ok: false, error: "Empty query" });
+  const maxDepth = Math.max(1, Math.min(10, parseInt(req.query.max_depth, 10) || 5));
+  const idx = getMovementIndex();
+
+  const isMoRef = /^MO-/i.test(q);
+  if (isMoRef) {
+    // For an MO ref, forward-trace means: find the outputs of that MO and
+    // walk forward from each output lot.
+    const specific = q.includes("/");
+    const rows = specific ? (idx.byRef.get(q) || []) : (idx.byRefNumber.get(q) || []);
+    const outputs = rows.filter(m => m.movement_type === "In");
+    const seen = new Set();
+    const outputTrees = outputs.map(out => {
+      if (!out.batch) {
+        return {
+          lot: null, sku: out.sku, product: out.product, unit: out.unit,
+          date: out.movement_date, qty_produced: Number(out.qty_in || 0),
+          note: "output row has no batch code",
+          consumed_by_mos: [], shipments: [], transfers_out: [], adjustments_out: [], assemblies: [], still_on_hand: null,
+        };
+      }
+      const subtree = buildForwardTree(idx, out.batch, 0, maxDepth, seen);
+      return {
+        lot: out.batch, sku: out.sku, product: out.product, unit: out.unit,
+        date: out.movement_date, qty_produced: Number(out.qty_in || 0),
+        category: skuCategory(out.sku),
+        ...subtree,
+      };
+    });
+    const allMovements = [];
+    for (const t of outputTrees) collectMovementsFromForwardTree(t, allMovements);
+    return res.json({
+      ok: true, query: q, kind: "mo", max_depth: maxDepth,
+      resolved_via: specific ? "reference" : "ref_number",
+      outputs_produced: outputTrees,
+      data_quality: summarizeDataQuality(allMovements),
+    });
+  }
+
+  // Lot code path.
+  const tree = buildForwardTree(idx, q, 0, maxDepth, new Set());
+  const allMovements = collectMovementsFromForwardTree(tree);
+  res.json({
+    ok: true, query: q, kind: "lot", max_depth: maxDepth,
+    forward: tree,
+    data_quality: summarizeDataQuality(allMovements),
+  });
+});
+
 app.get("/api/traceability/rm-history/:query", (req, res) => {
   const q = String(req.params.query || "").trim();
   if (!q) return res.status(400).json({ ok: false, error: "Empty query" });
