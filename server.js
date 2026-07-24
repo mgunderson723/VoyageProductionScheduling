@@ -4879,12 +4879,27 @@ function translateCin7Bom(product, bomEntry) {
   };
 }
 
+// Cin7 wraps BOM data under slightly different field names across tenants and
+// API versions — try them in order of likelihood. Returns the first non-empty
+// array found, or [] if none match.
+function _extractCin7Boms(detail) {
+  if (!detail) return { boms: [], fieldUsed: null, topLevelKeys: [] };
+  const candidates = ["BillOfMaterials", "BOM", "Boms", "BOMs", "AssemblyBOM", "AssemblyBoms", "ProductBOM", "Assembly", "AssemblyLines", "Components"];
+  for (const k of candidates) {
+    if (Array.isArray(detail[k]) && detail[k].length) {
+      return { boms: detail[k], fieldUsed: k, topLevelKeys: Object.keys(detail) };
+    }
+  }
+  return { boms: [], fieldUsed: null, topLevelKeys: Object.keys(detail) };
+}
+
 async function performCin7BomsSync() {
   const candidates = await fetchCin7BomCandidates();
   const bucket = {};
   const failures = [];
   let detailFetched = 0;
   let withBoms = 0;
+  let firstResponseSample = null; // stashed on first success for diagnostics
 
   for (let i = 0; i < candidates.length; i++) {
     const p = candidates[i];
@@ -4898,8 +4913,19 @@ async function performCin7BomsSync() {
       await _bomSleep(e.retryable ? 5000 : 1100);
       continue;
     }
-    const boms = detail && Array.isArray(detail.BillOfMaterials) ? detail.BillOfMaterials : [];
+    // Sample the first successful response so we can inspect the shape when a
+    // sync returns zero BOMs across the board — that means we're reading the
+    // wrong field. Logged + kept on the sync-state blob for the UI to surface.
+    if (!firstResponseSample) {
+      firstResponseSample = { sku: p.SKU, topLevelKeys: Object.keys(detail || {}) };
+      console.log(`[Cin7 BOMs] First detail response for ${p.SKU} — top-level keys: ${firstResponseSample.topLevelKeys.join(", ")}`);
+    }
+    const { boms, fieldUsed } = _extractCin7Boms(detail);
     if (boms.length) {
+      if (!firstResponseSample.fieldUsed) {
+        firstResponseSample.fieldUsed = fieldUsed;
+        console.log(`[Cin7 BOMs] Using response field '${fieldUsed}' for BOM extraction`);
+      }
       withBoms++;
       for (const b of boms) {
         const entry = translateCin7Bom(p, b);
@@ -4936,6 +4962,24 @@ async function performCin7BomsSync() {
     );
     err.failures = failures;
     err.candidatesScanned = candidates.length;
+    err.detailFetched = detailFetched;
+    throw err;
+  }
+
+  // Zero-BOM guardrail: if we successfully fetched a meaningful number of
+  // product detail records and NONE of them had a recognizable BOM field,
+  // the API shape has changed (or the field-name candidates are wrong).
+  // Overwriting the prior BOMs with an empty result would silently kill
+  // MRP downstream, so refuse the write and surface what Cin7 actually
+  // returned so we can extend _extractCin7Boms.
+  if (detailFetched >= 10 && withBoms === 0) {
+    const keys = (firstResponseSample && firstResponseSample.topLevelKeys) || [];
+    const err = new Error(
+      `${detailFetched} products checked, 0 had a recognizable BOM field — keeping prior BOMs. ` +
+      `First response top-level keys: [${keys.join(", ")}]. ` +
+      `If you see a BOM-related key here that isn't in _extractCin7Boms, add it to the candidates list.`
+    );
+    err.firstResponseSample = firstResponseSample;
     err.detailFetched = detailFetched;
     throw err;
   }
@@ -5018,6 +5062,58 @@ app.get("/api/cin7/boms/sync-status", (req, res) => {
       productsWithBoms: blob.productsWithBoms || null,
     },
   });
+});
+
+// GET /api/cin7/boms/debug-detail?sku=FG-XXX — admin diagnostic. Fetches
+// the raw Cin7 product detail for one SKU and returns the top-level keys
+// plus the FULL response (truncated body up to ~50 kB). Used to figure out
+// what field name Cin7 actually puts BOM data under when the sync returns
+// zero BOMs.
+app.get("/api/cin7/boms/debug-detail", requireAdmin, async (req, res) => {
+  try {
+    const sku = String(req.query.sku || "").trim();
+    if (!sku) return res.status(400).json({ ok: false, error: "sku query param required" });
+    // Look up the product ID from the cached costs blob (populated by the
+    // nightly product-costs sync) — avoids a whole-list refetch just for one lookup.
+    // If costs blob is missing / stale, fall through to a fresh list fetch.
+    let productID = null;
+    let productName = null;
+    const costsBlob = readData("product_costs") || {};
+    // costs blob is keyed by SKU but doesn't store ID; do the fresh list fetch.
+    // (Keeps this endpoint honest — never uses stale IDs.)
+    const products = await fetchCin7ProductCosts();
+    const match = products.find(p => String(p.SKU || "").toUpperCase() === sku.toUpperCase());
+    if (!match) {
+      return res.status(404).json({ ok: false, error: `SKU ${sku} not found in Cin7 product list`, checked: products.length });
+    }
+    productID = match.ID;
+    productName = match.Name;
+    const detail = await fetchCin7ProductDetail(productID);
+    const extraction = _extractCin7Boms(detail);
+    // Return the raw response but cap the size so browsers don't choke.
+    const rawJson = JSON.stringify(detail);
+    const truncated = rawJson.length > 50000;
+    res.json({
+      ok: true,
+      sku,
+      productID,
+      productName,
+      topLevelKeys: extraction.topLevelKeys,
+      bomFieldUsed: extraction.fieldUsed,
+      bomsFound: extraction.boms.length,
+      firstBomSample: extraction.boms[0] ? Object.keys(extraction.boms[0]) : null,
+      firstComponentSample: (extraction.boms[0] && Array.isArray(extraction.boms[0].Components) && extraction.boms[0].Components[0])
+        ? Object.keys(extraction.boms[0].Components[0])
+        : null,
+      rawResponseBytes: rawJson.length,
+      rawResponseTruncated: truncated,
+      raw: truncated ? JSON.parse(rawJson.slice(0, 50000) + '"}') : detail,
+      // Also include the full raw as a string field so the UI can copy it
+      rawString: truncated ? rawJson.slice(0, 50000) + "…[truncated]" : rawJson,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // POST /api/supply-settings/import — admin-only. Body: { leadTimeCsv?, packagingCsv?, defaults? }
