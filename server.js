@@ -4613,16 +4613,250 @@ function expandBom(parents, parentSku, qty, opts) {
 }
 
 // POST /api/boms/import — admin-only, accepts raw CSV text in body { csv: "..." }
+// Kept as an escape hatch for manual corrections; the primary path is the
+// nightly Cin7 API sync below.
 app.post("/api/boms/import", requireAdmin, (req, res) => {
   try {
     const csv = req.body && req.body.csv;
     if (!csv) return res.status(400).json({ ok: false, error: "Missing 'csv' field in body" });
     const blob = parseBomCsv(csv);
+    blob.source = "csv-upload";
     writeData("vf_boms", blob);
     res.json({ ok: true, ...blob, parents: undefined });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
+});
+
+// ── Cin7 BOM auto-sync (per-product detail fetch) ───────────────────────────
+//
+// Cin7's list endpoint (/product) returns only summary fields — components
+// are exposed exclusively on the detail endpoint (/product?ID=<uuid>). So
+// this sync is N+1: fetch the list once, filter to SKUs that plausibly
+// have a BOM (Voyage's FG-* and WIP-* prefixes plus anything Cin7 tagged
+// Type=Assembled), then hit detail per SKU with rate limiting.
+//
+// Runs 2–5 minutes wall-clock depending on the BOM count, so the endpoint
+// is fire-and-forget: it starts the job and returns immediately; the UI
+// polls /sync-status. Failures below 10% overwrite vf_boms; above 10% we
+// keep the prior blob to avoid a partial-write corruption.
+//
+// The CSV upload endpoint above is retained as a manual override — QA can
+// still hand-tune BOMs by uploading a modified Cin7 export.
+
+function _bomSleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function fetchCin7BomCandidates() {
+  // Reuse fetchCin7ProductCosts — it already paginates /product cleanly.
+  // We just filter server-side.
+  const products = await fetchCin7ProductCosts();
+  return products.filter(p => {
+    if (!p.SKU || !p.ID) return false;
+    const t = String(p.Type || "").toLowerCase();
+    const sku = String(p.SKU).toUpperCase();
+    return t.includes("assembl") || sku.startsWith("FG-") || sku.startsWith("WIP-");
+  });
+}
+
+async function fetchCin7ProductDetail(productID) {
+  const url = `https://inventory.dearsystems.com/ExternalApi/v2/product?ID=${encodeURIComponent(productID)}`;
+  const resp = await fetch(url, { headers: cin7Headers(), redirect: "follow" });
+  const ct = resp.headers.get("content-type") || "";
+  const text = await resp.text().catch(() => "");
+  if (resp.status === 429) {
+    const err = new Error("Cin7 rate limit hit (429)");
+    err.retryable = true;
+    throw err;
+  }
+  if (!resp.ok) throw new Error(`Cin7 product detail ${resp.status} [${ct}]: ${text.slice(0, 300)}`);
+  let data;
+  try { data = JSON.parse(text); }
+  catch (_) { throw new Error(`Cin7 product detail ${resp.status} non-JSON [${ct}]: ${text.slice(0, 300)}`); }
+  // Some Cin7 tenants wrap in { Products: [...] }, others return the bare object.
+  if (data && Array.isArray(data.Products) && data.Products.length) return data.Products[0];
+  return data;
+}
+
+// Translate a single Cin7 BillOfMaterials entry into the vf_boms bucket shape.
+// Mirrors parseBomCsv's component projection so downstream code is agnostic.
+function translateCin7Bom(product, bomEntry) {
+  const version = String(bomEntry.Version != null ? bomEntry.Version : (bomEntry.VersionNo != null ? bomEntry.VersionNo : 1));
+  const rawComponents = Array.isArray(bomEntry.Components) ? bomEntry.Components
+                       : Array.isArray(bomEntry.Lines) ? bomEntry.Lines
+                       : [];
+  const components = [];
+  for (const c of rawComponents) {
+    if (!c) continue;
+    // Cin7 detail rows carry an ItemType similar to the CSV; if present, skip
+    // Output/Resource just like parseBomCsv does. Otherwise assume component.
+    const itemType = String(c.ItemType || "Component");
+    if (itemType === "Output" || itemType === "Resource") continue;
+    const sku = c.SKU || c.ComponentSKU || c.ProductSKU || c.ComponentSKU_ResourceCode;
+    if (!sku) continue;
+    components.push({
+      sku,
+      name: c.Name || c.ProductName || c.ComponentName || "",
+      qty: Number(c.Quantity) || 0,
+      wastagePct: Number(c.Wastage != null ? c.Wastage : (c.WastagePercent != null ? c.WastagePercent : 0)) || 0,
+      op: parseInt(c.OperationSequence || c.OperationOrder || c.Sequence || 1, 10) || 1,
+      opName: c.OperationName || "",
+      workCentre: c.WorkCentreName || c.WorkCentre || "",
+    });
+  }
+  return {
+    parent: product.SKU,
+    parentName: product.Name || "",
+    version,
+    versionName: bomEntry.VersionName || "",
+    isDefault: !!(bomEntry.IsDefault || bomEntry.Default || bomEntry.VersionDefault === "Yes"),
+    qtyToProduce: Number(bomEntry.QuantityToProduce) || 1,
+    runSize: Number(bomEntry.RunSize) || 0,
+    minQty: Number(bomEntry.MinQuantity) || 0,
+    maxQty: Number(bomEntry.MaxQuantity) || 0,
+    productionLeadTimeRaw: parseInt(bomEntry.ProductionLeadTime, 10) || 0,
+    components,
+  };
+}
+
+async function performCin7BomsSync() {
+  const candidates = await fetchCin7BomCandidates();
+  const bucket = {};
+  const failures = [];
+  let detailFetched = 0;
+  let withBoms = 0;
+
+  for (let i = 0; i < candidates.length; i++) {
+    const p = candidates[i];
+    let detail;
+    try {
+      detail = await fetchCin7ProductDetail(p.ID);
+      detailFetched++;
+    } catch (e) {
+      failures.push({ sku: p.SKU, error: e.message });
+      // Back off harder on 429; otherwise standard pause and continue.
+      await _bomSleep(e.retryable ? 5000 : 1100);
+      continue;
+    }
+    const boms = detail && Array.isArray(detail.BillOfMaterials) ? detail.BillOfMaterials : [];
+    if (boms.length) {
+      withBoms++;
+      for (const b of boms) {
+        const entry = translateCin7Bom(p, b);
+        if (!entry.components.length) continue; // skip empty definitions
+        const key = entry.parent + "|" + entry.version;
+        bucket[key] = entry;
+      }
+    }
+    await _bomSleep(1100); // ~55/min to stay under Cin7's 60/min cap
+  }
+
+  // Post-process identically to parseBomCsv: derive machine + lead time,
+  // group by parent, sort so default version is first.
+  const parents = {};
+  for (const key of Object.keys(bucket)) {
+    const b = bucket[key];
+    b.machine = deriveMachineFromBom(b);
+    b.productionLeadTime = b.machine ? (MACHINE_LEAD_DAYS[b.machine] || null) : null;
+    if (!parents[b.parent]) parents[b.parent] = [];
+    parents[b.parent].push(b);
+  }
+  for (const sku of Object.keys(parents)) {
+    parents[sku].sort((a, b) => {
+      if (a.isDefault !== b.isDefault) return a.isDefault ? -1 : 1;
+      return Number(a.version) - Number(b.version);
+    });
+  }
+
+  const failureRate = candidates.length ? failures.length / candidates.length : 0;
+  if (failureRate > 0.10) {
+    const err = new Error(
+      `Failure rate ${(failureRate*100).toFixed(1)}% exceeds 10% threshold — keeping prior BOMs. ` +
+      `First failures: ${failures.slice(0,3).map(f=>f.sku+': '+f.error).join(' | ')}`
+    );
+    err.failures = failures;
+    err.candidatesScanned = candidates.length;
+    err.detailFetched = detailFetched;
+    throw err;
+  }
+
+  const now = new Date().toISOString();
+  const parentCount = Object.keys(parents).length;
+  const rowCount = Object.values(parents).reduce((s, vs) => s + vs.reduce((s2, v) => s2 + v.components.length, 0), 0);
+  const blob = {
+    lastImport: now,      // keep existing field name for backward compat
+    lastSync: now,
+    source: "cin7-api",
+    productsScanned: candidates.length,
+    detailFetched,
+    productsWithBoms: withBoms,
+    failureCount: failures.length,
+    parents,
+    parentCount,
+    rowCount,
+  };
+  writeData("vf_boms", blob);
+  return {
+    ok: true,
+    lastSync: now,
+    productsScanned: candidates.length,
+    detailFetched,
+    productsWithBoms: withBoms,
+    parentCount,
+    rowCount,
+    failureCount: failures.length,
+    firstFailures: failures.slice(0, 10),
+  };
+}
+
+// Fire-and-forget: BOM sync runs 2–5 minutes; can't hold an HTTP request that
+// long behind the Railway edge proxy. POST kicks off the background job and
+// returns immediately; the UI polls the status endpoint.
+let _bomSyncState = { state: "idle", startedAt: null, finishedAt: null, error: null, result: null };
+
+app.post("/api/cin7/boms/sync", requireAdmin, (req, res) => {
+  if (_bomSyncState.state === "running") {
+    return res.status(409).json({ ok: false, error: "Sync already in progress", state: _bomSyncState });
+  }
+  _bomSyncState = { state: "running", startedAt: new Date().toISOString(), finishedAt: null, error: null, result: null };
+  res.json({ ok: true, message: "Sync started in background — poll /api/cin7/boms/sync-status", state: _bomSyncState });
+  performCin7BomsSync()
+    .then(result => {
+      _bomSyncState = {
+        state: "complete",
+        startedAt: _bomSyncState.startedAt,
+        finishedAt: new Date().toISOString(),
+        error: null,
+        result,
+      };
+      console.log(`[Cin7 BOMs] Sync done — ${result.detailFetched} products checked, ${result.productsWithBoms} with BOMs, ${result.parentCount} parents, ${result.failureCount} failures`);
+    })
+    .catch(e => {
+      _bomSyncState = {
+        state: "failed",
+        startedAt: _bomSyncState.startedAt,
+        finishedAt: new Date().toISOString(),
+        error: e.message,
+        result: null,
+      };
+      console.error("[Cin7 BOMs] Sync failed:", e.message);
+    });
+});
+
+app.get("/api/cin7/boms/sync-status", (req, res) => {
+  const blob = readData("vf_boms") || {};
+  res.json({
+    ok: true,
+    ..._bomSyncState,
+    currentBlob: {
+      lastImport: blob.lastImport || null,
+      lastSync: blob.lastSync || null,
+      source: blob.source || null,
+      parentCount: blob.parentCount || 0,
+      rowCount: blob.rowCount || 0,
+      productsScanned: blob.productsScanned || null,
+      productsWithBoms: blob.productsWithBoms || null,
+    },
+  });
 });
 
 // POST /api/supply-settings/import — admin-only. Body: { leadTimeCsv?, packagingCsv?, defaults? }
@@ -4771,6 +5005,20 @@ app.put("/api/supply-settings", requireAdmin, (req, res) => {
 
 // Nightly on-hand sync at 06:30 UTC (just after the manual movement-upload window)
 if (process.env.CIN7_ACCOUNT_ID && process.env.CIN7_APPLICATION_KEY) {
+  // BOM sync runs first at 05:30 UTC because it's the slowest (multi-minute
+  // N+1 detail fetch) and we want it to finish before the on-hand/costs/PO/SO
+  // burst hits Cin7's 60/min rate budget at 06:30 and after.
+  cron.schedule("30 5 * * *", async () => {
+    console.log("[Cin7 BOMs] Nightly sync starting…");
+    try {
+      const s = await performCin7BomsSync();
+      console.log(`[Cin7 BOMs] Sync done — ${s.detailFetched} products checked, ${s.productsWithBoms} with BOMs, ${s.parentCount} parents, ${s.failureCount} failures`);
+    } catch (e) {
+      console.error("[Cin7 BOMs] Nightly sync failed:", e.message);
+    }
+  });
+  console.log("[Cin7 BOMs] Nightly sync scheduled at 05:30 UTC");
+
   cron.schedule("30 6 * * *", async () => {
     console.log("[Cin7 OnHand] Nightly sync starting…");
     try {

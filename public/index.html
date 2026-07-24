@@ -1458,12 +1458,15 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
         <span style="font-size:var(--vf-text-sm);color:var(--vf-text-tertiary);">BOMs · Supply settings · Product costs · Recursive expand</span>
       </div>
       <div style="display:flex;gap:var(--vf-space-2);align-items:center;">
+        <span id="mrp-boms-ts" style="font-size:var(--vf-text-xs);color:var(--vf-text-tertiary);"></span>
+        <button class="btn btn-sm" id="mrp-boms-sync-btn" onclick="syncBomsFromCin7()">↻ Sync BOMs from Cin7</button>
         <span id="mrp-costs-ts" style="font-size:var(--vf-text-xs);color:var(--vf-text-tertiary);"></span>
         <button class="btn btn-sm" onclick="syncProductCosts()">↻ Sync product costs</button>
       </div>
     </div>
 
     <div class="status-summary" id="mrp-setup-kpis"></div>
+    <div id="mrp-boms-sync-status" style="display:none;margin-bottom:var(--vf-space-3);padding:var(--vf-space-2) var(--vf-space-3);background:var(--vf-surface-sunken);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);font-size:var(--vf-text-sm);"></div>
 
     <!-- Sub-section selector -->
     <div style="display:flex;gap:var(--vf-space-2);margin-bottom:var(--vf-space-4);border-bottom:1px solid var(--vf-border-default);">
@@ -3653,9 +3656,20 @@ async function loadMrpSetup() {
   }
   renderMrpSetupKpis();
   renderCostsTimestamp();
+  renderBomsTimestamp();
   populateMrpMachineFilter();
   renderMrpBoms();
   renderMrpSupply();
+  // Surface any in-progress background sync (e.g. nightly cron or another
+  // admin's manual run). If it's still running, start polling; otherwise this
+  // just renders once and does nothing further.
+  pollBomSyncStatus().then(() => {
+    // If the initial poll found the sync running, kick off recurring polling
+    const box = document.getElementById('mrp-boms-sync-status');
+    if (box && box.style.display !== 'none' && !_bomSyncPollTimer) {
+      _bomSyncPollTimer = setInterval(pollBomSyncStatus, 5000);
+    }
+  });
 }
 
 let mrpCostsData = null;
@@ -3687,6 +3701,116 @@ async function syncProductCosts() {
     renderCostsTimestamp();
   } catch (e) {
     if (el) { el.textContent = 'Sync failed: ' + e.message; el.style.color = 'var(--vf-danger-text)'; }
+  }
+}
+
+// ── Cin7 BOM sync (fire-and-forget + polling) ───────────────────────────────
+// Server runs the sync in the background (2–5 min); we kick it off, then
+// poll /sync-status every 5s to surface progress and refresh the BOM cache
+// when it completes.
+let _bomSyncPollTimer = null;
+
+function renderBomsTimestamp() {
+  const el = document.getElementById('mrp-boms-ts');
+  if (!el) return;
+  const b = mrpBomsData || {};
+  const ts = b.lastSync || b.lastImport;
+  if (!ts) {
+    el.textContent = 'BOMs: never synced';
+    el.style.color = 'var(--vf-warning-text)';
+    return;
+  }
+  const d = new Date(ts);
+  const ageMin = Math.round((Date.now() - d.getTime()) / 60000);
+  const ageStr = ageMin < 60 ? `${ageMin}m ago` : ageMin < 1440 ? `${Math.round(ageMin/60)}h ago` : `${Math.round(ageMin/1440)}d ago`;
+  const src = b.source === 'cin7-api' ? 'Cin7 API' : (b.source === 'csv-upload' ? 'CSV upload' : 'CSV');
+  el.textContent = `BOMs synced ${ageStr} · ${(b.parentCount||0).toLocaleString()} parents · ${src}`;
+  el.style.color = 'var(--vf-text-tertiary)';
+}
+
+function renderBomSyncStatus(state) {
+  const box = document.getElementById('mrp-boms-sync-status');
+  if (!box) return;
+  if (!state || state.state === 'idle') { box.style.display = 'none'; return; }
+  box.style.display = 'block';
+  let icon, color, msg;
+  if (state.state === 'running') {
+    icon = '⏳';
+    color = 'var(--vf-text-secondary)';
+    const started = state.startedAt ? new Date(state.startedAt) : null;
+    const elapsed = started ? Math.round((Date.now() - started.getTime()) / 1000) : 0;
+    msg = `Sync in progress — running ${elapsed}s (usually finishes in 2–5 min). This page will refresh when done.`;
+  } else if (state.state === 'complete') {
+    icon = '✓';
+    color = 'var(--vf-success-text)';
+    const r = state.result || {};
+    msg = `Sync complete — ${(r.detailFetched||0)} products checked, ${(r.productsWithBoms||0)} with BOMs, ${(r.parentCount||0)} parents, ${(r.failureCount||0)} failures.`;
+  } else if (state.state === 'failed') {
+    icon = '⚠';
+    color = 'var(--vf-danger-text)';
+    msg = `Sync failed: ${state.error || 'unknown error'}`;
+  } else {
+    box.style.display = 'none';
+    return;
+  }
+  box.innerHTML = `<span style="color:${color};font-weight:600;">${icon}</span> <span style="color:${color};">${msg}</span>`;
+}
+
+async function pollBomSyncStatus() {
+  try {
+    const r = await fetch('/api/cin7/boms/sync-status');
+    const j = await r.json();
+    if (!j.ok) return;
+    renderBomSyncStatus(j);
+    if (j.state === 'running') return; // keep polling
+    // Terminal state — stop polling, refresh cache + UI
+    if (_bomSyncPollTimer) { clearInterval(_bomSyncPollTimer); _bomSyncPollTimer = null; }
+    const btn = document.getElementById('mrp-boms-sync-btn');
+    if (btn) { btn.disabled = false; btn.textContent = '↻ Sync BOMs from Cin7'; }
+    // Refresh the BOMs cache + tables so the new data appears immediately
+    try {
+      mrpBomsData = await fetch('/api/boms').then(r => r.json());
+      renderBomsTimestamp();
+      renderMrpSetupKpis();
+      renderMrpBoms();
+    } catch (_) {}
+  } catch (_) {}
+}
+
+async function syncBomsFromCin7() {
+  const btn = document.getElementById('mrp-boms-sync-btn');
+  const box = document.getElementById('mrp-boms-sync-status');
+  if (!confirm(
+    'Pull all BOMs from Cin7?\n\n' +
+    'This runs in the background (2–5 minutes typical). Existing BOMs stay ' +
+    'in place until the sync succeeds. If more than 10% of products fail to ' +
+    'fetch, the old BOMs are kept and the sync is reported as failed.\n\n' +
+    'You can leave this page — the sync keeps running on the server.'
+  )) return;
+  try {
+    if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
+    const r = await fetch('/api/cin7/boms/sync', { method: 'POST' });
+    const j = await r.json();
+    if (!r.ok) {
+      if (r.status === 409) {
+        alert('A BOM sync is already running. Waiting for it to finish…');
+      } else {
+        throw new Error(j.error || ('HTTP ' + r.status));
+      }
+    }
+    if (btn) btn.textContent = 'Syncing…';
+    renderBomSyncStatus({ state: 'running', startedAt: new Date().toISOString() });
+    // Poll every 5s until terminal state
+    if (_bomSyncPollTimer) clearInterval(_bomSyncPollTimer);
+    _bomSyncPollTimer = setInterval(pollBomSyncStatus, 5000);
+    // Also poll once immediately
+    pollBomSyncStatus();
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = '↻ Sync BOMs from Cin7'; }
+    if (box) {
+      box.style.display = 'block';
+      box.innerHTML = `<span style="color:var(--vf-danger-text);font-weight:600;">⚠</span> <span style="color:var(--vf-danger-text);">Failed to start sync: ${e.message}</span>`;
+    }
   }
 }
 
