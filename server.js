@@ -693,6 +693,12 @@ FG-LEVEL NETTING (default ON in run_mrp — behavior you must narrate accurately
 - trace_po_demand rows now include sourceFgGrossQty (pre-netting), sourceFgQty (net, drives RM), and sourceFgOffsetKg (FG on-hand absorbed). If gross does not equal net for a row, mention it in your attribution table: "PIPELINE-Cargill US-2026-12 · FG-888-858 · 15,000 kg planned → 5,136 kg offset by FG on-hand → 9,864 kg net → 3,156 kg RM contribution."
 - Only set netFgOnHand=false if the user explicitly asks for a "gross production plan" or "what would we need to buy if the FG shelf were empty" scenario. Never disable it silently.
 
+WIP-LEVEL NETTING (multi-level MRP, always on, no toggle):
+- MRP also cuts off recursion at WIP SKUs that are already being produced by another scheduled MO. Example: MO-00933 produces WIP1-XXX and MO-00934 consumes WIP1-XXX in its BOM. Without this cutoff, expanding MO-00934 would recurse through WIP1's recipe and double-count all the RMs (sugar, fat, etc.) that MO-00933's expansion already accounted for. With the cutoff, MO-00934's expansion stops at WIP1 (treats it as a leaf) because MO-00933 is already producing it.
+- run_mrp responses include wipNettingSummary — an array of WIP SKUs where cutoff fired, with fields: consumedKg (total demand from downstream MOs), plannedProductionKg (what other MOs will make), onHandKg (available WIP stock), coverageGapKg (max(0, consumed − planned − onHand)), downstreamOrderCount.
+- If coverageGapKg > 0 for a WIP, that means the scheduled production is UNDER-planned relative to downstream consumption. RM demand for that gap is NOT reflected in this MRP run. SURFACE THIS to the user as a warning: "WIP1-XXX has a 500 kg planning gap — scheduled production of X kg doesn't cover downstream consumption of Y kg. Ops should schedule an additional MO to close the gap; the RM contribution for the gap is not in the current PO suggestions."
+- If coverageGapKg = 0 (planned production + on-hand fully covers consumption), no user-visible narration needed unless they ask. Just don't be surprised that expanding downstream MOs shows sugar/fat demand as zero — that's expected because the producing MO's expansion has it.
+
 PER-ORDER ATTRIBUTION TABLE (always include when listing demand drivers):
 - When trace_po_demand returns multiple sources, show them as a table with these columns: source orderId, start date (for synthetic pipeline drafts this is the *computed production start* — ship month minus a channel-specific production lead time; label as "pipeline draft, prod start X (ships Y)" so the user can see both), FG SKU + qty, kg of the leaf RM contributed, % of total.
 - Stale orders that should have been filtered out are MOST visible in this table — their start dates will be before the user's excludeBefore cutoff and the user can immediately see the violation. Including this table is your built-in audit trail.
@@ -1489,7 +1495,7 @@ async function executeAITool(name, input, context) {
       }
 
       const netFgOnHand = pickBool(input.netFgOnHand, userSettings.netFgOnHand, true);
-      const { requirements, fgNettingSummary } = buildRequirements(mrpOrders, bomParents, {
+      const { requirements, fgNettingSummary, wipNettingSummary } = buildRequirements(mrpOrders, bomParents, {
         today, horizonDays, includeUnconfirmed, applyWastage: true, excludeBeforeDate, supply,
         onHandBySku, netFgOnHand,
       });
@@ -1627,7 +1633,7 @@ async function executeAITool(name, input, context) {
       }
 
       const netFgOnHand = pickBool(input.netFgOnHand, userSettings.netFgOnHand, true);
-      const { requirements, skipped, fgNettingSummary } = buildRequirements(mrpOrders, bomParents, {
+      const { requirements, skipped, fgNettingSummary, wipNettingSummary } = buildRequirements(mrpOrders, bomParents, {
         today, horizonDays, includeUnconfirmed, applyWastage: true, excludeBeforeDate, supply,
         onHandBySku, netFgOnHand,
       });
@@ -1691,6 +1697,7 @@ async function executeAITool(name, input, context) {
           missingCostCount,
         },
         fgNettingSummary: fgNettingSummary || [],
+        wipNettingSummary: wipNettingSummary || [],
         suggestedPOs: inWindow.slice().sort(byCostDesc).slice(0, topN).map(trim),
         deferredPOs: deferred.slice().sort(byCostDesc).slice(0, topN).map(trim),
         atRiskOrders: atRiskOrders.slice(0, 30).map(trimAtRisk),
@@ -4354,12 +4361,24 @@ function normalizeSupplySettings(rawEntries, defaults) {
 // Recursively expand a BOM to leaf-RM requirements for a given parent + qty.
 // Returns { leaves: { sku: {qty, name, leafSku} }, intermediates: [{sku, qty, version, depth}] }
 // Cycles are detected via the visited set; a leaf is anything not in vf_boms.parents.
+//
+// opts.stopAtSkus (optional Set) — treat these SKUs as leaves even if they
+// have a BOM. Used by multi-level MRP netting so that when this MO's
+// expansion hits a WIP that is separately produced by another scheduled
+// MO in the planning window, we DON'T recurse into that WIP's own RMs
+// (they're already counted from the other MO's expansion). Without this,
+// two MOs where one produces a WIP the other consumes would double-count
+// every leaf RM in the WIP's recipe. If a stopped WIP has partial coverage
+// (planned production < gross consumption), the caller is responsible for
+// expanding the gap separately — this function just honors the cutoff.
 function expandBom(parents, parentSku, qty, opts) {
   opts = opts || {};
   const applyWastage = opts.applyWastage !== false; // default true
+  const stopAtSkus = opts.stopAtSkus || null;
   const visited = new Set();
   const leaves = {};
   const trail = [];
+  const stoppedAt = {}; // sku -> summed qty that hit a cutoff (for observability)
 
   function recurse(sku, needed, depth) {
     if (depth > 12) throw new Error(`BOM recursion too deep at ${sku}`);
@@ -4367,6 +4386,13 @@ function expandBom(parents, parentSku, qty, opts) {
       // cycle — log and treat as leaf to bail out gracefully
       if (!leaves[sku]) leaves[sku] = { sku, qty: 0, name: "(cycle detected)", isCycle: true };
       leaves[sku].qty += needed;
+      return;
+    }
+    // Multi-level MRP cutoff: treat this SKU as a leaf because another MO
+    // in the plan already produces it. Do NOT add to leaves (it's not a
+    // procurable RM) — just record the cutoff for the caller's observability.
+    if (stopAtSkus && stopAtSkus.has(sku) && depth > 0) {
+      stoppedAt[sku] = (stoppedAt[sku] || 0) + needed;
       return;
     }
     const versions = parents[sku];
@@ -4395,7 +4421,7 @@ function expandBom(parents, parentSku, qty, opts) {
   }
 
   recurse(parentSku, qty, 0);
-  return { leaves, intermediates: trail };
+  return { leaves, intermediates: trail, stoppedAt };
 }
 
 // POST /api/boms/import — admin-only, accepts raw CSV text in body { csv: "..." }
@@ -4768,6 +4794,38 @@ function buildRequirements(orders, bomParents, opts) {
     }
   }
 
+  // ── Multi-level MRP netting: prevent WIP double-count ────────────────────
+  // If MO-A produces WIP-X and MO-B consumes WIP-X in its BOM, gross expansion
+  // counts WIP-X's raw materials twice (once from MO-A's expansion, once from
+  // MO-B recursing through WIP-X). Fix: when expanding MO-B, treat WIP-X as a
+  // leaf so recursion stops there — MO-A's expansion already covers those RMs.
+  // Same principle as FG netting above, but for intermediate WIPs.
+  //
+  // We only cut off SKUs where planned production >= expected consumption
+  // (fully covered). For the "partial coverage" case (production < demand)
+  // we still cut off — but log the gap so the caller can surface it. The
+  // gap represents production that ops SHOULD schedule but hasn't, so the
+  // right behavior is to flag it, not to silently pad RM demand.
+  const inScopeOrders = orders.filter(o => {
+    if (!opts.includeUnconfirmed && o.confirmed === false && !o.__fromPipelineDraft) return false;
+    if (o.status === "complete") return false;
+    if (!o.start) return false;
+    if (o.start > horizonEnd) return false;
+    if (excludeBeforeDate && o.start < excludeBeforeDate) return false;
+    return true;
+  });
+  const plannedProducersBySku = new Map(); // sku -> total planned qty in scope
+  for (const o of inScopeOrders) {
+    if (!o.sku) continue;
+    const fg = extractBomSku(o.sku, bomParents);
+    if (!fg) continue;
+    const q = o.total || (o.qty || 0) * (o.batches || 1);
+    if (q <= 0) continue;
+    plannedProducersBySku.set(fg, (plannedProducersBySku.get(fg) || 0) + q);
+  }
+  const stopAtSkusGlobal = new Set(plannedProducersBySku.keys());
+  const wipCutoffSummary = new Map(); // wipSku -> {totalStoppedKg, sourceOrderIds:[]}
+
   for (const o of orders) {
     // Pipeline-draft synthetic orders bypass the "unconfirmed" filter —
     // they're inherently unconfirmed (no operator has booked them) and
@@ -4812,9 +4870,25 @@ function buildRequirements(orders, bomParents, opts) {
     const overrideKgPerUnit = (opts.supply && opts.supply.perSku && opts.supply.perSku[fgSku] && opts.supply.perSku[fgSku].kgPerUnit) || null;
     const expandQty = overrideKgPerUnit ? (netPlannedQty / overrideKgPerUnit) : netPlannedQty;
 
+    // Cutoff set for THIS order: every other planned producer. Excluding
+    // fgSku itself is critical — otherwise the top-level parent would be
+    // treated as its own leaf and produce zero requirements.
+    const stopSet = new Set(stopAtSkusGlobal);
+    stopSet.delete(fgSku);
+
     let expansion;
-    try { expansion = expandBom(bomParents, fgSku, expandQty, { applyWastage: opts.applyWastage }); }
+    try { expansion = expandBom(bomParents, fgSku, expandQty, { applyWastage: opts.applyWastage, stopAtSkus: stopSet }); }
     catch (e) { skipped.noBom++; continue; }
+
+    // Record cutoffs for observability. If any WIP was stopped, tally the
+    // consumption qty so we can compare against the WIP's planned production
+    // and warn about partial-coverage gaps.
+    for (const [wipSku, stoppedQty] of Object.entries(expansion.stoppedAt || {})) {
+      const summary = wipCutoffSummary.get(wipSku) || { totalStoppedKg: 0, sourceOrderIds: [] };
+      summary.totalStoppedKg += stoppedQty;
+      summary.sourceOrderIds.push(o.orderId || o.id);
+      wipCutoffSummary.set(wipSku, summary);
+    }
 
     const neededBy = o.start < opts.today ? opts.today : o.start;
     for (const leaf of Object.values(expansion.leaves || {})) {
@@ -4851,7 +4925,31 @@ function buildRequirements(orders, bomParents, opts) {
       }
     }
   }
-  return { requirements, skipped, noBomExamples, fgNettingSummary };
+
+  // Summary of WIP cutoffs applied — for each WIP that got treated as a leaf
+  // during downstream MO expansions, report:
+  //   plannedProductionKg — how much of this WIP is being made by other in-scope MOs
+  //   consumedKg          — how much downstream MOs' BOMs asked for
+  //   coverageGapKg       — max(0, consumed - planned - WIP on-hand); if > 0, ops
+  //                         has under-scheduled production of this WIP and the RM
+  //                         cost of the gap is NOT reflected in this MRP run
+  const wipNettingSummary = [];
+  const wipOnHandBySku = opts.onHandBySku || {};
+  for (const [wipSku, info] of wipCutoffSummary) {
+    const planned = plannedProducersBySku.get(wipSku) || 0;
+    const oh = wipOnHandBySku[wipSku];
+    const availableOnHand = oh ? Math.max(0, Number(oh.available || 0)) : 0;
+    const gap = Math.max(0, info.totalStoppedKg - planned - availableOnHand);
+    wipNettingSummary.push({
+      wipSku,
+      consumedKg: Math.round(info.totalStoppedKg * 1000) / 1000,
+      plannedProductionKg: Math.round(planned * 1000) / 1000,
+      onHandKg: Math.round(availableOnHand * 1000) / 1000,
+      coverageGapKg: Math.round(gap * 1000) / 1000,
+      downstreamOrderCount: new Set(info.sourceOrderIds).size,
+    });
+  }
+  return { requirements, skipped, noBomExamples, fgNettingSummary, wipNettingSummary };
 }
 
 // A BOM leaf is "procurable" if it looks like a real RM, packaging, or
@@ -5050,7 +5148,7 @@ app.get("/api/mrp/run", (req, res) => {
     }
 
     const netFgOnHandFlag = req.query.netFgOnHand !== "false"; // default true
-    const { requirements, skipped, noBomExamples, fgNettingSummary } = buildRequirements(mrpOrders, bomParents, {
+    const { requirements, skipped, noBomExamples, fgNettingSummary, wipNettingSummary } = buildRequirements(mrpOrders, bomParents, {
       today, horizonDays, includeUnconfirmed, applyWastage, excludeBeforeDate, supply,
       onHandBySku, netFgOnHand: netFgOnHandFlag,
     });
@@ -5112,6 +5210,7 @@ app.get("/api/mrp/run", (req, res) => {
       today,
       settings: { includeUnconfirmed, applyWastage, horizonDays, excludeBeforeDate, includeDrafts, draftsCount, poHorizonDays, poHorizonEndDate, netFgOnHand: netFgOnHandFlag },
       fgNettingSummary: fgNettingSummary || [],
+      wipNettingSummary: wipNettingSummary || [],
       summary: {
         ordersConsidered: mrpOrders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom + skipped.excludedByDate),
         ordersSkipped: skipped,
