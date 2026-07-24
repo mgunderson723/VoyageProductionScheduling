@@ -669,6 +669,7 @@ MRP & MATERIAL QUESTIONS:
 - run_mrp returns: summary (total $, PO counts, at-risk count), top suggested POs (in-window), deferred POs (beyond PO horizon), and at-risk MOs. Suggested POs are sorted by line cost desc — biggest commitments first.
 - Default to poHorizonDays=30 (what we'd actually order this month). If the user asks about longer-range commitments, increase or set to 0.
 - If the user mentions the pipeline tab or a forward look, set includeDrafts=true so pipeline opportunities count as demand.
+- includeCompanions=true adds synthetic companion-demand orders per the rules in MRP Setup → Companion demand (e.g. "when liquor is scheduled, generate a flavor-pack order at the same date"). These flow through normal BOM expansion and PO suggestions. Default OFF. Turn ON when the user asks about flavor procurement, air-freight companion products, or "what do I need to order that isn't in the liquor BOM?". Requirements from companion demand carry isCompanionDemand=true + companionDriverOrderId/companionDriverSku so you can attribute them.
 - run_mrp is READ-ONLY — it doesn't queue anything for approval. You can call it freely.
 
 DEMAND ATTRIBUTION (read this carefully — this is the #1 source of bot errors on this app):
@@ -957,6 +958,7 @@ const AI_TOOLS = [
         horizonDays:        { type: "number",  description: "Planning horizon (default 120) — mirror run_mrp" },
         includeUnconfirmed: { type: "boolean", description: "Default false" },
         includeDrafts:      { type: "boolean", description: "Default false — set true if you want pipeline drafts considered" },
+        includeCompanions:  { type: "boolean", description: "Default false — set true to include synthetic companion-demand orders (see run_mrp docs on companion rules)" },
         excludeBefore:      { type: "string",  description: "YYYY-MM-DD optional" },
       },
       required: ["sku"],
@@ -983,6 +985,7 @@ const AI_TOOLS = [
         horizonDays:        { type: "number",  description: "Planning horizon for demand — how far ahead MRP looks at orders. Default 120." },
         includeUnconfirmed: { type: "boolean", description: "Include tentative/unconfirmed orders. Default false." },
         includeDrafts:      { type: "boolean", description: "Include pipeline drafts as additional demand. Default false." },
+        includeCompanions:  { type: "boolean", description: "Include companion-demand rules: when a driver SKU (e.g., chocolate liquor) is scheduled, synthetic orders are generated for its configured companion SKUs (e.g., flavor packs) at the same need-date. Flow through the normal MRP pipeline — BOM expansion, FG netting, PO suggestions. Default false. Ask the user before enabling if they haven't mentioned it — this can materially change the PO $$ if rules exist. Companion-derived requirements are flagged isCompanionDemand=true with companionDriverOrderId/companionDriverSku so you can attribute them." },
         excludeBefore:      { type: "string",  description: "Skip orders with start date before this (YYYY-MM-DD). Useful for filtering stale TBD orders." },
         topN:               { type: "number",  description: "How many top-$ suggested POs to return. Default 20." },
         netFgOnHand:        { type: "boolean", description: "Net finished-good on-hand inventory against planned production before computing RM demand. Default true. If a scheduled MO or pipeline draft would produce FG that's already sitting in stock (on-hand minus SO allocations), MRP subtracts that qty from planned production first, then expands the BOM on the reduced qty. This is what real MRP does; only turn OFF (netFgOnHand=false) when you want a 'gross production plan' view that shows what a full run would require ignoring existing FG inventory." },
@@ -1073,6 +1076,7 @@ function buildMrpSettingsBanner(s) {
   if (isFinite(s.poHorizonDays)) parts.push(`PO horizon ${s.poHorizonDays}d`);
   if (s.includeUnconfirmed)      parts.push("includeUnconfirmed=true");
   if (s.includeDrafts)           parts.push("includeDrafts=true");
+  if (s.includeCompanions)       parts.push("includeCompanions=true");
   if (s.excludeBefore && /^\d{4}-\d{2}-\d{2}$/.test(String(s.excludeBefore).trim())) {
     parts.push(`excludeBefore=${String(s.excludeBefore).trim()}`);
   }
@@ -1490,6 +1494,7 @@ async function executeAITool(name, input, context) {
       const horizonDays        = Math.max(1, Math.min(365, pickNum(input.horizonDays, userSettings.horizonDays, 120)));
       const includeUnconfirmed = pickBool(input.includeUnconfirmed, userSettings.includeUnconfirmed, false);
       const includeDrafts      = pickBool(input.includeDrafts, userSettings.includeDrafts, false);
+      const includeCompanions  = pickBool(input.includeCompanions, userSettings.includeCompanions, false);
       const excludeBeforeRaw   = pickStr(input.excludeBefore, userSettings.excludeBefore);
       const excludeBeforeDate  = /^\d{4}-\d{2}-\d{2}$/.test(excludeBeforeRaw) ? excludeBeforeRaw : null;
       const today              = new Date().toISOString().slice(0, 10);
@@ -1501,6 +1506,11 @@ async function executeAITool(name, input, context) {
         const drafts = (pipelineBlob && pipelineBlob.drafts) || [];
         const synth = drafts.map(synthPipelineDraftAsOrder).filter(Boolean);
         mrpOrders = rawOrders.concat(synth);
+      }
+      if (includeCompanions) {
+        const cblob = _companionRulesBlob();
+        const synths = generateCompanionOrders(mrpOrders, cblob.rules || []);
+        if (synths.length) mrpOrders = mrpOrders.concat(synths);
       }
 
       const netFgOnHand = pickBool(input.netFgOnHand, userSettings.netFgOnHand, true);
@@ -1573,7 +1583,7 @@ async function executeAITool(name, input, context) {
         totalKgNeeded,
         sourceCount: sources.length,
         sources,
-        settings: { horizonDays, includeUnconfirmed, includeDrafts, excludeBeforeDate },
+        settings: { horizonDays, includeUnconfirmed, includeDrafts, includeCompanions, excludeBeforeDate },
         note: "Each entry is one source order/draft whose BOM expansion produced demand for this RM. If you expected an order to appear here and it isn't, that order does NOT actually use this RM (the BOM tree doesn't expand to it) — do NOT attribute demand to it.",
       };
     }
@@ -1621,6 +1631,7 @@ async function executeAITool(name, input, context) {
       const horizonDays        = Math.max(1, Math.min(365, pickNum(input.horizonDays, userSettings.horizonDays, 120)));
       const includeUnconfirmed = pickBool(input.includeUnconfirmed, userSettings.includeUnconfirmed, false);
       const includeDrafts      = pickBool(input.includeDrafts, userSettings.includeDrafts, false);
+      const includeCompanions  = pickBool(input.includeCompanions, userSettings.includeCompanions, false);
       const excludeBeforeRaw   = pickStr(input.excludeBefore, userSettings.excludeBefore);
       const excludeBeforeDate  = /^\d{4}-\d{2}-\d{2}$/.test(excludeBeforeRaw) ? excludeBeforeRaw : null;
       const topN               = Math.max(1, Math.min(100, isFinite(input.topN) ? input.topN : 20));
@@ -1639,6 +1650,13 @@ async function executeAITool(name, input, context) {
         const synth = drafts.map(synthPipelineDraftAsOrder).filter(Boolean);
         draftsCount = synth.length;
         mrpOrders = rawOrders.concat(synth);
+      }
+      let companionsCount = 0;
+      if (includeCompanions) {
+        const cblob = _companionRulesBlob();
+        const synths = generateCompanionOrders(mrpOrders, cblob.rules || []);
+        companionsCount = synths.length;
+        if (synths.length) mrpOrders = mrpOrders.concat(synths);
       }
 
       const netFgOnHand = pickBool(input.netFgOnHand, userSettings.netFgOnHand, true);
@@ -1692,7 +1710,7 @@ async function executeAITool(name, input, context) {
         ok: true,
         runAt: new Date().toISOString(),
         today,
-        settings: { poHorizonDays, horizonDays, includeUnconfirmed, includeDrafts, draftsCount, excludeBeforeDate, netFgOnHand },
+        settings: { poHorizonDays, horizonDays, includeUnconfirmed, includeDrafts, draftsCount, includeCompanions, companionsCount, excludeBeforeDate, netFgOnHand },
         summary: {
           ordersConsidered: mrpOrders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom + skipped.excludedByDate),
           requirementCount: requirements.length,
@@ -2406,6 +2424,149 @@ app.delete("/api/pipeline/drafts", requireAdmin, (req, res) => {
   writeData("vf_pipeline_drafts", { lastImport: null, source: null, drafts: [] });
   res.json({ ok: true });
 });
+
+// ── Companion demand rules ──────────────────────────────────────────────────
+//
+// Some Voyage products drive downstream demand that isn't physically in
+// their BOM. Chocolate liquor is the canonical case: when we ship a liquor
+// SKU by ocean, the customer usually needs flavor packs to arrive around
+// the same time (airfreight). The flavor is a separate FG with its own BOM;
+// it isn't a component of the liquor. Historically MRP had no way to see
+// this correlation, so flavor RM procurement was manual.
+//
+// A companion rule pairs a driver SKU with a companion SKU + a per-unit
+// ratio ("0.05 kg flavor per 1 kg liquor"). When MRP runs with the
+// includeCompanions toggle on, every in-scope driver order synthesizes a
+// companion order at the same need-date. The synthetic order flows through
+// the normal MRP pipeline — expands the companion's BOM, nets FG on-hand,
+// generates RM PO suggestions — with an __fromCompanionRule flag so the UI
+// can label it and buildRequirements can bypass the confirmed filter.
+//
+// Bounded scope for v1: single-level (a companion rule doesn't chain from
+// another companion), same need-date as the driver (no lead offset — the
+// companion's own production lead time handles the back-scheduling).
+
+function _companionRulesBlob() {
+  return readData("vf_companion_rules") || { lastUpdated: null, rules: [] };
+}
+
+function _newCompanionRuleId() {
+  return "cr_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+// GET /api/companion-rules — any authed user (needed to render MRP UI count)
+app.get("/api/companion-rules", (req, res) => {
+  const blob = _companionRulesBlob();
+  res.json({ ok: true, ...blob });
+});
+
+// POST /api/companion-rules — admin-only. Body is a single rule; upserts by id.
+app.post("/api/companion-rules", requireAdmin, (req, res) => {
+  const body = req.body || {};
+  const driverSku = String(body.driverSku || "").trim();
+  const companionSku = String(body.companionSku || "").trim();
+  const qtyPerDriver = Number(body.qtyPerDriver);
+  if (!driverSku || !companionSku) {
+    return res.status(400).json({ ok: false, error: "driverSku and companionSku required" });
+  }
+  if (driverSku === companionSku) {
+    return res.status(400).json({ ok: false, error: "driver and companion cannot be the same SKU" });
+  }
+  if (!isFinite(qtyPerDriver) || qtyPerDriver <= 0) {
+    return res.status(400).json({ ok: false, error: "qtyPerDriver must be a positive number" });
+  }
+  const blob = _companionRulesBlob();
+  const now = new Date().toISOString();
+  const existing = body.id ? blob.rules.find(r => r.id === body.id) : null;
+  if (existing) {
+    Object.assign(existing, {
+      driverSku,
+      driverName: String(body.driverName || existing.driverName || "").trim(),
+      companionSku,
+      companionName: String(body.companionName || existing.companionName || "").trim(),
+      qtyPerDriver,
+      unit: String(body.unit || existing.unit || "kg").trim(),
+      note: String(body.note || "").trim(),
+      active: body.active === false ? false : true,
+      updatedAt: now,
+    });
+  } else {
+    blob.rules.push({
+      id: _newCompanionRuleId(),
+      driverSku,
+      driverName: String(body.driverName || "").trim(),
+      companionSku,
+      companionName: String(body.companionName || "").trim(),
+      qtyPerDriver,
+      unit: String(body.unit || "kg").trim(),
+      note: String(body.note || "").trim(),
+      active: body.active === false ? false : true,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+  blob.lastUpdated = now;
+  writeData("vf_companion_rules", blob);
+  res.json({ ok: true, ...blob });
+});
+
+// DELETE /api/companion-rules/:id — admin-only
+app.delete("/api/companion-rules/:id", requireAdmin, (req, res) => {
+  const blob = _companionRulesBlob();
+  const before = blob.rules.length;
+  blob.rules = blob.rules.filter(r => r.id !== req.params.id);
+  if (blob.rules.length === before) return res.status(404).json({ ok: false, error: "rule not found" });
+  blob.lastUpdated = new Date().toISOString();
+  writeData("vf_companion_rules", blob);
+  res.json({ ok: true, ...blob });
+});
+
+// Synthesize one companion order per (in-scope driver order, active matching
+// rule). Returns [] when there are no rules or no matches. Bounded to a
+// single level — synthetic orders themselves are skipped so a companion
+// can't recursively trigger another companion.
+function generateCompanionOrders(baseOrders, rules) {
+  const active = (rules || []).filter(r => r && r.active !== false);
+  if (!active.length) return [];
+  const byDriver = {};
+  for (const r of active) {
+    if (!byDriver[r.driverSku]) byDriver[r.driverSku] = [];
+    byDriver[r.driverSku].push(r);
+  }
+  const out = [];
+  for (const o of baseOrders) {
+    if (!o || !o.sku) continue;
+    if (o.__fromCompanionRule) continue; // no chaining
+    const matches = byDriver[o.sku];
+    if (!matches) continue;
+    for (const rule of matches) {
+      const driverQty = Number(o.qty) || Number(o.total) || 0;
+      const companionQty = driverQty * Number(rule.qtyPerDriver);
+      if (!(companionQty > 0)) continue;
+      out.push({
+        id: "companion_" + o.id + "_" + rule.id,
+        orderId: "COMPANION-" + (o.orderId || o.id) + "-" + rule.companionSku,
+        sku: rule.companionSku,
+        machine: null, // let BOM expansion determine
+        start: o.start,
+        end: o.end,
+        due: o.due,
+        qty: companionQty,
+        batches: 1,
+        total: companionQty,
+        status: "queued",
+        confirmed: false,
+        __fromCompanionRule: true,
+        __driverOrderId: o.id,
+        __driverOrderRef: o.orderId,
+        __driverSku: o.sku,
+        __driverQty: driverQty,
+        __ruleId: rule.id,
+      });
+    }
+  }
+  return out;
+}
 
 // ── Cin7 Core sync ────────────────────────────────────────────────────────────
 // Field-name map — if the first run shows different keys in /api/sync-cin7/test,
@@ -5202,7 +5363,7 @@ function buildRequirements(orders, bomParents, opts) {
   // completed MO "consume" on-hand double-counts it and drains the netting
   // pool before real planned production gets a chance).
   const inScopeOrders = orders.filter(o => {
-    if (!opts.includeUnconfirmed && o.confirmed === false && !o.__fromPipelineDraft) return false;
+    if (!opts.includeUnconfirmed && o.confirmed === false && !o.__fromPipelineDraft && !o.__fromCompanionRule) return false;
     if (o.status === "complete") return false;
     if (!o.start) return false;
     if (o.start > horizonEnd) return false;
@@ -5260,6 +5421,7 @@ function buildRequirements(orders, bomParents, opts) {
           offsetKg: take,
           netPlannedKg: e.plannedQty - take,
           isPipelineDraft: !!e.order.__fromPipelineDraft,
+          isCompanionDemand: !!e.order.__fromCompanionRule,
         });
         available -= take;
         totalConsumed += take;
@@ -5311,7 +5473,7 @@ function buildRequirements(orders, bomParents, opts) {
     // Pipeline-draft synthetic orders bypass the "unconfirmed" filter —
     // they're inherently unconfirmed (no operator has booked them) and
     // including them in MRP is the whole point of the toggle.
-    if (!opts.includeUnconfirmed && o.confirmed === false && !o.__fromPipelineDraft) { skipped.unconfirmed++; continue; }
+    if (!opts.includeUnconfirmed && o.confirmed === false && !o.__fromPipelineDraft && !o.__fromCompanionRule) { skipped.unconfirmed++; continue; }
     if (o.status === "complete") { skipped.complete++; continue; }
     if (!o.start) { skipped.noStart++; continue; }
     if (o.start > horizonEnd) { skipped.outsideHorizon++; continue; }
@@ -5387,6 +5549,16 @@ function buildRequirements(orders, bomParents, opts) {
         sourceFgQty: netPlannedQty,           // qty this contribution is based on
         sourceFgGrossQty: grossPlannedQty,    // original planned qty pre-netting
         sourceFgOffsetKg: fgOffsetKg,         // kg absorbed by FG on-hand
+        // Companion-demand attribution: when this requirement traces to a
+        // synthetic order generated from a companion rule, carry the driver
+        // order's ID + SKU so trace_po_demand and the UI can render
+        // "Companion of Order XYZ (5000 kg FG-LIQUOR)" instead of the
+        // synthetic COMPANION-* id which reads as noise.
+        isCompanionDemand: !!o.__fromCompanionRule,
+        companionDriverOrderId: o.__driverOrderRef || null,
+        companionDriverSku: o.__driverSku || null,
+        companionDriverQty: o.__driverQty || null,
+        companionRuleId: o.__ruleId || null,
       });
     }
   }
@@ -5618,6 +5790,7 @@ app.get("/api/mrp/run", (req, res) => {
     const excludeBeforeRaw = String(req.query.excludeBefore || "").trim();
     const excludeBeforeDate = /^\d{4}-\d{2}-\d{2}$/.test(excludeBeforeRaw) ? excludeBeforeRaw : null;
     const includeDrafts = req.query.includeDrafts === "1" || req.query.includeDrafts === "true";
+    const includeCompanions = req.query.includeCompanions === "1" || req.query.includeCompanions === "true";
     // PO horizon — how far ahead the user is willing to commit purchase
     // orders. Suggested POs whose mustOrderByDate falls beyond this
     // window are deferred to a separate bucket (visible in the response
@@ -5642,6 +5815,17 @@ app.get("/api/mrp/run", (req, res) => {
       const synth = drafts.map(synthPipelineDraftAsOrder).filter(Boolean);
       draftsCount = synth.length;
       mrpOrders = orders.concat(synth);
+    }
+
+    // Companion-demand synthesizer runs AFTER draft synthesis so a pipeline
+    // draft for a liquor SKU can also trigger companion flavor demand. Skips
+    // if disabled or no rules configured.
+    let companionsCount = 0;
+    if (includeCompanions) {
+      const cblob = _companionRulesBlob();
+      const synths = generateCompanionOrders(mrpOrders, cblob.rules || []);
+      companionsCount = synths.length;
+      if (synths.length) mrpOrders = mrpOrders.concat(synths);
     }
 
     const netFgOnHandFlag = req.query.netFgOnHand !== "false"; // default true
@@ -5705,7 +5889,7 @@ app.get("/api/mrp/run", (req, res) => {
       ok: true,
       runAt: new Date().toISOString(),
       today,
-      settings: { includeUnconfirmed, applyWastage, horizonDays, excludeBeforeDate, includeDrafts, draftsCount, poHorizonDays, poHorizonEndDate, netFgOnHand: netFgOnHandFlag },
+      settings: { includeUnconfirmed, applyWastage, horizonDays, excludeBeforeDate, includeDrafts, draftsCount, includeCompanions, companionsCount, poHorizonDays, poHorizonEndDate, netFgOnHand: netFgOnHandFlag },
       fgNettingSummary: fgNettingSummary || [],
       wipNettingSummary: wipNettingSummary || [],
       summary: {

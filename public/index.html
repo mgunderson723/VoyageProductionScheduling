@@ -1341,6 +1341,10 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
           <input type="checkbox" id="mrp-include-drafts" style="margin:0;"/>
           Include pipeline drafts
         </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);" title="Add synthetic companion-demand orders for each in-scope driver order per MRP Setup → Companion demand rules (e.g. liquor → flavor packs). Runs the companion's BOM through normal expansion + PO suggestions.">
+          <input type="checkbox" id="mrp-include-companions" style="margin:0;"/>
+          Include companion demand
+        </label>
         <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);" title="How far MRP looks ahead for demand — affects what at-risk MOs surface.">
           Planning horizon (days):
           <input type="number" id="mrp-horizon-days" min="7" max="365" value="120" style="width:70px;padding:4px 8px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;">
@@ -1470,9 +1474,10 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
 
     <!-- Sub-section selector -->
     <div style="display:flex;gap:var(--vf-space-2);margin-bottom:var(--vf-space-4);border-bottom:1px solid var(--vf-border-default);">
-      <button class="btn btn-sm" id="mrp-tab-boms"     onclick="switchMrpSetupSection('boms')"     style="border-radius:0;border-bottom:2px solid var(--vf-brand-orange);">BOMs</button>
-      <button class="btn btn-sm" id="mrp-tab-supply"   onclick="switchMrpSetupSection('supply')"   style="border-radius:0;background:transparent;">Supply settings</button>
-      <button class="btn btn-sm" id="mrp-tab-expand"   onclick="switchMrpSetupSection('expand')"   style="border-radius:0;background:transparent;">Test expand</button>
+      <button class="btn btn-sm" id="mrp-tab-boms"      onclick="switchMrpSetupSection('boms')"      style="border-radius:0;border-bottom:2px solid var(--vf-brand-orange);">BOMs</button>
+      <button class="btn btn-sm" id="mrp-tab-supply"    onclick="switchMrpSetupSection('supply')"    style="border-radius:0;background:transparent;">Supply settings</button>
+      <button class="btn btn-sm" id="mrp-tab-companion" onclick="switchMrpSetupSection('companion')" style="border-radius:0;background:transparent;" title="Rules that add flavor / accessory demand when a driver SKU is scheduled (e.g. liquor → flavor).">Companion demand</button>
+      <button class="btn btn-sm" id="mrp-tab-expand"    onclick="switchMrpSetupSection('expand')"    style="border-radius:0;background:transparent;">Test expand</button>
     </div>
 
     <!-- BOMs sub-view -->
@@ -1570,6 +1575,80 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
           </thead>
           <tbody id="mrp-supply-tbody"></tbody>
         </table>
+      </div>
+    </div>
+
+    <!-- Companion demand sub-view -->
+    <div id="mrp-section-companion" style="display:none;">
+      <div style="margin-bottom:var(--vf-space-3);padding:var(--vf-space-3);background:var(--vf-surface-sunken);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
+        <strong style="color:var(--vf-text-primary);">What this does:</strong> Some products drive downstream demand that isn't in their BOM — e.g. when chocolate liquor is scheduled, the customer usually needs a flavor pack shipped separately. Each rule pairs a <em>driver SKU</em> with a <em>companion SKU</em> and a per-unit ratio. When MRP runs with the <strong>Include companion demand</strong> toggle on, every in-scope driver order generates a synthetic companion order at the same need-date. The companion's own BOM is expanded, FG on-hand is netted, and RM POs are suggested — same as any real order.
+      </div>
+      <div style="display:flex;gap:var(--vf-space-2);align-items:center;margin-bottom:var(--vf-space-3);">
+        <button class="btn btn-sm btn-primary" onclick="openCompanionRuleModal()">+ Add rule</button>
+        <span id="companion-rules-count" style="font-size:var(--vf-text-sm);color:var(--vf-text-tertiary);"></span>
+      </div>
+      <div style="overflow-x:auto;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);">
+        <table class="status-table" style="margin-top:0;">
+          <thead>
+            <tr>
+              <th>Driver SKU</th>
+              <th>Companion SKU</th>
+              <th style="text-align:right;">Ratio</th>
+              <th>Note</th>
+              <th>Active</th>
+              <th style="width:1%;"></th>
+            </tr>
+          </thead>
+          <tbody id="companion-rules-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Companion rule editor modal -->
+    <div id="companion-rule-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+      <div style="background:var(--vf-surface-raised);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-lg);padding:var(--vf-space-4);width:520px;max-width:90vw;max-height:85vh;overflow-y:auto;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:var(--vf-space-3);">
+          <h3 style="margin:0;color:var(--vf-text-primary);" id="companion-rule-modal-title">Add companion rule</h3>
+          <button class="btn btn-sm" onclick="closeCompanionRuleModal()" style="padding:2px 8px;">×</button>
+        </div>
+        <input type="hidden" id="companion-rule-id"/>
+        <div class="field" style="margin-bottom:var(--vf-space-3);">
+          <label style="display:block;color:var(--vf-text-secondary);font-size:var(--vf-text-sm);margin-bottom:4px;">Driver SKU <span style="color:var(--vf-danger-text);">*</span></label>
+          <input id="companion-rule-driver-sku" list="companion-sku-datalist" placeholder="e.g. FG-CL-XXXXX" style="width:100%;padding:6px 10px;font-size:13px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-sunken);color:var(--vf-text-primary);font-family:inherit;"/>
+          <div id="companion-rule-driver-name" style="font-size:11px;color:var(--vf-text-tertiary);margin-top:2px;min-height:14px;"></div>
+        </div>
+        <div class="field" style="margin-bottom:var(--vf-space-3);">
+          <label style="display:block;color:var(--vf-text-secondary);font-size:var(--vf-text-sm);margin-bottom:4px;">Companion SKU <span style="color:var(--vf-danger-text);">*</span></label>
+          <input id="companion-rule-companion-sku" list="companion-sku-datalist" placeholder="e.g. FG-FLV-YYYYY" style="width:100%;padding:6px 10px;font-size:13px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-sunken);color:var(--vf-text-primary);font-family:inherit;"/>
+          <div id="companion-rule-companion-name" style="font-size:11px;color:var(--vf-text-tertiary);margin-top:2px;min-height:14px;"></div>
+        </div>
+        <datalist id="companion-sku-datalist"></datalist>
+        <div class="field" style="margin-bottom:var(--vf-space-3);display:flex;gap:var(--vf-space-2);align-items:end;">
+          <div style="flex:1;">
+            <label style="display:block;color:var(--vf-text-secondary);font-size:var(--vf-text-sm);margin-bottom:4px;">Companion qty per 1 driver unit <span style="color:var(--vf-danger-text);">*</span></label>
+            <input id="companion-rule-qty" type="number" step="any" min="0" placeholder="e.g. 0.05" style="width:100%;padding:6px 10px;font-size:13px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-sunken);color:var(--vf-text-primary);font-family:inherit;"/>
+          </div>
+          <div style="width:100px;">
+            <label style="display:block;color:var(--vf-text-secondary);font-size:var(--vf-text-sm);margin-bottom:4px;">Unit</label>
+            <select id="companion-rule-unit" style="width:100%;padding:6px 10px;font-size:13px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-sunken);color:var(--vf-text-primary);font-family:inherit;">
+              <option value="kg">kg</option>
+              <option value="case">case</option>
+            </select>
+          </div>
+        </div>
+        <div class="field" style="margin-bottom:var(--vf-space-3);">
+          <label style="display:block;color:var(--vf-text-secondary);font-size:var(--vf-text-sm);margin-bottom:4px;">Note (optional)</label>
+          <input id="companion-rule-note" placeholder="e.g. Standard vanilla loading for XYZ liquor line" style="width:100%;padding:6px 10px;font-size:13px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-sunken);color:var(--vf-text-primary);font-family:inherit;"/>
+        </div>
+        <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);margin-bottom:var(--vf-space-3);">
+          <input type="checkbox" id="companion-rule-active" checked/>
+          Active (inactive rules are ignored by MRP)
+        </label>
+        <div id="companion-rule-error" style="display:none;color:var(--vf-danger-text);font-size:var(--vf-text-sm);margin-bottom:var(--vf-space-2);"></div>
+        <div style="display:flex;gap:var(--vf-space-2);justify-content:flex-end;">
+          <button class="btn btn-sm" onclick="closeCompanionRuleModal()">Cancel</button>
+          <button class="btn btn-sm btn-primary" onclick="saveCompanionRule()">Save rule</button>
+        </div>
       </div>
     </div>
 
@@ -3375,6 +3454,7 @@ async function runMrp() {
   const excludeBefore = (document.getElementById('mrp-exclude-before').value || '').trim();
   if (excludeBefore) params.set('excludeBefore', excludeBefore);
   if (document.getElementById('mrp-include-drafts').checked) params.set('includeDrafts', '1');
+  if (document.getElementById('mrp-include-companions').checked) params.set('includeCompanions', '1');
   const poHorizonRaw = parseInt(document.getElementById('mrp-po-horizon-days').value, 10);
   if (Number.isFinite(poHorizonRaw) && poHorizonRaw >= 0) params.set('poHorizonDays', String(poHorizonRaw));
   const tsEl = document.getElementById('mrp-run-ts');
@@ -3394,12 +3474,15 @@ async function runMrp() {
     const draftsNote = (j.settings && j.settings.includeDrafts)
       ? ` · ${j.settings.draftsCount || 0} pipeline draft${(j.settings.draftsCount || 0) === 1 ? '' : 's'} included`
       : '';
+    const companionsNote = (j.settings && j.settings.includeCompanions)
+      ? ` · ${j.settings.companionsCount || 0} companion order${(j.settings.companionsCount || 0) === 1 ? '' : 's'} added`
+      : '';
     const deferredCount = (j.summary && j.summary.deferredPoCount) || 0;
     const poHorizon = j.settings && j.settings.poHorizonDays;
     const poNote = (poHorizon > 0 && deferredCount > 0)
       ? ` · ${deferredCount} PO${deferredCount === 1 ? '' : 's'} deferred beyond ${poHorizon}d horizon`
       : '';
-    tsEl.textContent = `Last run ${d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} · today=${j.today}${filterNote}${draftsNote}${poNote}`;
+    tsEl.textContent = `Last run ${d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} · today=${j.today}${filterNote}${draftsNote}${companionsNote}${poNote}`;
     renderMrp();
   } catch (e) {
     tsEl.textContent = 'Failed: ' + e.message;
@@ -3839,12 +3922,179 @@ function renderMrpSetupKpis() {
 
 function switchMrpSetupSection(name) {
   mrpSetupSection = name;
-  ['boms','supply','expand'].forEach(k => {
+  ['boms','supply','companion','expand'].forEach(k => {
     document.getElementById('mrp-section-' + k).style.display = (k === name) ? '' : 'none';
     const btn = document.getElementById('mrp-tab-' + k);
     if (btn) btn.style.borderBottom = (k === name) ? '2px solid var(--vf-brand-orange)' : '2px solid transparent';
     if (btn) btn.style.background = (k === name) ? '' : 'transparent';
   });
+  if (name === 'companion') loadCompanionRules();
+}
+
+// ── Companion-demand rules (client) ─────────────────────────────────────────
+let companionRulesData = { rules: [] };
+
+async function loadCompanionRules() {
+  try {
+    const r = await fetch('/api/companion-rules');
+    const j = await r.json();
+    companionRulesData = j.ok ? j : { rules: [] };
+  } catch (_) {
+    companionRulesData = { rules: [] };
+  }
+  renderCompanionRules();
+  populateCompanionSkuDatalist();
+}
+
+function renderCompanionRules() {
+  const tbody = document.getElementById('companion-rules-tbody');
+  const countEl = document.getElementById('companion-rules-count');
+  if (!tbody) return;
+  const rules = (companionRulesData && companionRulesData.rules) || [];
+  if (countEl) {
+    const active = rules.filter(r => r.active !== false).length;
+    countEl.textContent = `${rules.length} rule${rules.length===1?'':'s'} · ${active} active`;
+  }
+  if (!rules.length) {
+    tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;padding:24px;color:var(--vf-text-tertiary);">No rules yet. Click "+ Add rule" to create one — e.g. FG-CL-XXXXX drives 0.05 kg of FG-FLV-YYYYY per kg.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rules
+    .slice()
+    .sort((a,b) => (a.driverSku||'').localeCompare(b.driverSku||''))
+    .map(r => `
+      <tr style="${r.active===false?'opacity:0.5;':''}">
+        <td><code>${escapeHtml(r.driverSku)}</code>${r.driverName?`<div style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(r.driverName)}</div>`:''}</td>
+        <td><code>${escapeHtml(r.companionSku)}</code>${r.companionName?`<div style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(r.companionName)}</div>`:''}</td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;">${(+r.qtyPerDriver).toLocaleString(undefined,{maximumFractionDigits:6})} ${escapeHtml(r.unit||'kg')}/unit</td>
+        <td style="font-size:12px;color:var(--vf-text-secondary);">${escapeHtml(r.note||'')}</td>
+        <td>${r.active===false?'<span style="color:var(--vf-text-tertiary);">off</span>':'<span style="color:var(--vf-success-text);">✓</span>'}</td>
+        <td style="white-space:nowrap;">
+          <button class="btn btn-sm" onclick="editCompanionRule('${escapeHtml(r.id)}')" style="padding:2px 8px;font-size:11px;">Edit</button>
+          <button class="btn btn-sm" onclick="deleteCompanionRule('${escapeHtml(r.id)}')" style="padding:2px 8px;font-size:11px;color:var(--vf-danger-text);">Delete</button>
+        </td>
+      </tr>
+    `).join('');
+}
+
+function populateCompanionSkuDatalist() {
+  const dl = document.getElementById('companion-sku-datalist');
+  if (!dl) return;
+  // Feed the datalist from the BOM catalog — every parent SKU is a valid
+  // candidate for either driver or companion. Users can still type SKUs not
+  // in the list (validation is server-side + happens at MRP time).
+  const parents = (mrpBomsData && mrpBomsData.parents) || {};
+  const opts = Object.keys(parents).sort().map(sku => {
+    const versions = parents[sku] || [];
+    const name = versions[0] && versions[0].parentName ? versions[0].parentName : '';
+    return `<option value="${escapeHtml(sku)}">${escapeHtml(sku)}${name?` · ${escapeHtml(name)}`:''}</option>`;
+  }).join('');
+  dl.innerHTML = opts;
+}
+
+function _companionResolveName(sku) {
+  const parents = (mrpBomsData && mrpBomsData.parents) || {};
+  const v = parents[sku];
+  return v && v[0] && v[0].parentName ? v[0].parentName : '';
+}
+
+function openCompanionRuleModal(rule) {
+  document.getElementById('companion-rule-modal-title').textContent = rule ? 'Edit companion rule' : 'Add companion rule';
+  document.getElementById('companion-rule-id').value = rule ? rule.id : '';
+  document.getElementById('companion-rule-driver-sku').value = rule ? rule.driverSku : '';
+  document.getElementById('companion-rule-companion-sku').value = rule ? rule.companionSku : '';
+  document.getElementById('companion-rule-qty').value = rule ? rule.qtyPerDriver : '';
+  document.getElementById('companion-rule-unit').value = (rule && rule.unit) || 'kg';
+  document.getElementById('companion-rule-note').value = rule ? (rule.note || '') : '';
+  document.getElementById('companion-rule-active').checked = rule ? (rule.active !== false) : true;
+  document.getElementById('companion-rule-error').style.display = 'none';
+  // Live SKU name lookup as the user types
+  const driverInput = document.getElementById('companion-rule-driver-sku');
+  const compInput = document.getElementById('companion-rule-companion-sku');
+  const updateName = (input, target) => {
+    const name = _companionResolveName(input.value.trim());
+    document.getElementById(target).textContent = name ? '→ ' + name : (input.value.trim() ? 'Not in BOM catalog (will still be saved)' : '');
+  };
+  driverInput.oninput = () => updateName(driverInput, 'companion-rule-driver-name');
+  compInput.oninput = () => updateName(compInput, 'companion-rule-companion-name');
+  updateName(driverInput, 'companion-rule-driver-name');
+  updateName(compInput, 'companion-rule-companion-name');
+  document.getElementById('companion-rule-modal').style.display = 'flex';
+  populateCompanionSkuDatalist();
+}
+
+function closeCompanionRuleModal() {
+  document.getElementById('companion-rule-modal').style.display = 'none';
+}
+
+function editCompanionRule(id) {
+  const r = (companionRulesData.rules || []).find(x => x.id === id);
+  if (!r) return;
+  openCompanionRuleModal(r);
+}
+
+async function deleteCompanionRule(id) {
+  const r = (companionRulesData.rules || []).find(x => x.id === id);
+  if (!r) return;
+  if (!confirm(`Delete companion rule?\n\n${r.driverSku} → ${r.companionSku} @ ${r.qtyPerDriver} ${r.unit||'kg'}/unit`)) return;
+  try {
+    const resp = await fetch('/api/companion-rules/' + encodeURIComponent(id), { method: 'DELETE' });
+    const j = await resp.json();
+    if (!resp.ok || !j.ok) throw new Error(j.error || ('HTTP ' + resp.status));
+    companionRulesData = j;
+    renderCompanionRules();
+  } catch (e) {
+    alert('Delete failed: ' + e.message);
+  }
+}
+
+async function saveCompanionRule() {
+  const errEl = document.getElementById('companion-rule-error');
+  errEl.style.display = 'none';
+  const driverSku = document.getElementById('companion-rule-driver-sku').value.trim();
+  const companionSku = document.getElementById('companion-rule-companion-sku').value.trim();
+  const qtyPerDriver = parseFloat(document.getElementById('companion-rule-qty').value);
+  if (!driverSku || !companionSku) {
+    errEl.textContent = 'Driver SKU and Companion SKU are required.';
+    errEl.style.display = 'block';
+    return;
+  }
+  if (driverSku === companionSku) {
+    errEl.textContent = 'Driver and companion cannot be the same SKU.';
+    errEl.style.display = 'block';
+    return;
+  }
+  if (!isFinite(qtyPerDriver) || qtyPerDriver <= 0) {
+    errEl.textContent = 'Companion qty per driver unit must be a positive number.';
+    errEl.style.display = 'block';
+    return;
+  }
+  const body = {
+    id: document.getElementById('companion-rule-id').value || undefined,
+    driverSku,
+    driverName: _companionResolveName(driverSku),
+    companionSku,
+    companionName: _companionResolveName(companionSku),
+    qtyPerDriver,
+    unit: document.getElementById('companion-rule-unit').value || 'kg',
+    note: document.getElementById('companion-rule-note').value.trim(),
+    active: document.getElementById('companion-rule-active').checked,
+  };
+  try {
+    const resp = await fetch('/api/companion-rules', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const j = await resp.json();
+    if (!resp.ok || !j.ok) throw new Error(j.error || ('HTTP ' + resp.status));
+    companionRulesData = j;
+    renderCompanionRules();
+    closeCompanionRuleModal();
+  } catch (e) {
+    errEl.textContent = 'Save failed: ' + e.message;
+    errEl.style.display = 'block';
+  }
 }
 
 function populateMrpMachineFilter() {
@@ -6569,6 +6819,7 @@ function readCurrentMrpSettings() {
     poHorizonDays:      numOr('mrp-po-horizon-days', 30),
     includeUnconfirmed: boolOr('mrp-include-unconfirmed', false),
     includeDrafts:      boolOr('mrp-include-drafts', false),
+    includeCompanions:  boolOr('mrp-include-companions', false),
     excludeBefore:      strOr('mrp-exclude-before', ''),
   };
 }
