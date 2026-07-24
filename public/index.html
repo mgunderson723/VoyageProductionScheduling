@@ -4363,7 +4363,13 @@ function _flattenTreeToCsv(node, depth, path, parentLot, rows, kind) {
   // For forward-trace nodes, add rows for downstream destinations too.
   if (kind === 'forward') {
     for (const s of (node.shipments || [])) {
-      rows.push({ depth: depth + 1, path: nodePath + ' > SHIPMENT', parent_lot: node.lot || '', lot: '', sku: '', category: 'SHIPMENT', qty: s.qty, unit: s.unit, note: `${s.ref} on ${(s.date || '').slice(0,10)}${s.location ? ' from ' + s.location : ''}` });
+      rows.push({
+        depth: depth + 1, path: nodePath + ' > SHIPMENT', parent_lot: node.lot || '',
+        lot: '', sku: '', category: 'SHIPMENT', qty: s.qty, unit: s.unit,
+        customer: s.customer || '', customer_reference: s.customer_reference || '',
+        so_ship_date: s.so_ship_date || '',
+        note: `${s.ref} on ${(s.date || '').slice(0,10)}${s.location ? ' from ' + s.location : ''}${s.customer ? ' → ' + s.customer : ''}`,
+      });
     }
     for (const t of (node.transfers_out || [])) {
       rows.push({ depth: depth + 1, path: nodePath + ' > TRANSFER', parent_lot: node.lot || '', lot: '', sku: '', category: 'TRANSFER', qty: t.qty, unit: t.unit, note: `${t.ref} on ${(t.date || '').slice(0,10)}${t.from ? ' from ' + t.from : ''}` });
@@ -4432,7 +4438,7 @@ function downloadTraceViewCsv() {
     rows = [];
     const roots = forward.kind === 'mo' ? (forward.outputs_produced || []) : (forward.forward ? [forward.forward] : []);
     for (const r of roots) _flattenTreeToCsv(r, 0, '', '', rows, 'forward');
-    headers = ['depth', 'path', 'parent_lot', 'lot', 'sku', 'product', 'category', 'unit', 'qty', 'still_on_hand', 'producing_mo', 'producing_date', 'note'];
+    headers = ['depth', 'path', 'parent_lot', 'lot', 'sku', 'product', 'category', 'unit', 'qty', 'still_on_hand', 'producing_mo', 'producing_date', 'customer', 'customer_reference', 'so_ship_date', 'note'];
     if (!rows.length) { alert('No forward-trace rows to export.'); return; }
   } else {
     alert('Unknown view: ' + view);
@@ -4834,13 +4840,26 @@ function renderForwardDestinations(node) {
   const fmt = n => Number(n || 0).toLocaleString(undefined, { maximumFractionDigits: 3 });
 
   if (shipments.length) {
-    const items = shipments.map(s => `<li>
-      <span class="trace-reftype-pill trace-reftype-SO">SO</span>
-      <b>${escapeHtml(s.ref)}</b> on ${escapeHtml((s.date || '').slice(0,10))} —
-      shipped <b>${fmt(s.qty)} ${escapeHtml(s.unit || '')}</b>
-      ${s.location ? ` from ${escapeHtml(s.location)}` : ''}
-      ${s.document_reference ? ` <span style="color:var(--vf-text-tertiary);font-size:11px;">(doc: ${escapeHtml(s.document_reference)})</span>` : ''}
-    </li>`).join('');
+    const items = shipments.map(s => {
+      // Customer name pulled from the SO via the nightly sales-orders sync.
+      // Ship date reflects Cin7's ShipDate on the SO (the promised/actual
+      // date logged there), which may differ from the movement_date shown
+      // above (movement_date = when the inventory decrement was posted).
+      const customer = s.customer
+        ? ` <span title="Customer from Cin7 SO${s.customer_reference ? ' — reference: ' + escapeHtml(s.customer_reference) : ''}" style="color:var(--vf-focus-ring);font-weight:500;">→ ${escapeHtml(s.customer)}</span>`
+        : '';
+      const shipDate = s.so_ship_date
+        ? ` <span style="color:var(--vf-text-tertiary);font-size:11px;">SO ship date: ${escapeHtml(s.so_ship_date)}</span>`
+        : '';
+      return `<li>
+        <span class="trace-reftype-pill trace-reftype-SO">SO</span>
+        <b>${escapeHtml(s.ref)}</b> on ${escapeHtml((s.date || '').slice(0,10))} —
+        shipped <b>${fmt(s.qty)} ${escapeHtml(s.unit || '')}</b>${customer}
+        ${s.location ? ` from ${escapeHtml(s.location)}` : ''}
+        ${shipDate}
+        ${s.document_reference ? ` <span style="color:var(--vf-text-tertiary);font-size:11px;">(doc: ${escapeHtml(s.document_reference)})</span>` : ''}
+      </li>`;
+    }).join('');
     parts.push(`<ul>${items}</ul>`);
   }
   if (transfers.length) {

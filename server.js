@@ -728,6 +728,8 @@ TRACEABILITY (SQF audit prep — Q3/Q4 2026):
 - When the user asks "what happened to lot X", "how was FG lot Y built", "trace this batch back to the raw materials" — call the trace_* tool. Do NOT reason from BOM structure or MRP data — the lot-level movement history is ground truth; BOM expansion is a plan of intent, movement history is what actually happened.
 - Reference-type prefixes in the response: PO (purchase order receipt), MO (production activity — 'MO-NNNNN/N' means batch N of the MO), ST (stock adjustment), TR (transfer between locations), SO (sales order shipment), FG (Cin7 'Assembly' — UOM conversion or lot consolidation, legacy at Voyage, paper-only movement).
 - Supplier attribution: trace_fg_lineage terminal RM/VC/PK leaves whose origin is a PO include a "supplier" field with {name, code, orderDate} pulled from the ACTUAL Cin7 PO (via the nightly purchase_orders sync). When surfacing a lot's chain, mention the supplier next to the origin PO — e.g. "RM-110000-00 lot 45131 came in via PO-00040 · supplier: Cargill Inc · PO ordered 2025-03-15". This is the actual supplier on the PO, not a SKU default, so no caveat needed. Lots with an ST-* origin (stock adjustment) have no supplier field — that's honest, ST lots didn't come in through a supplier receipt at all.
+- Customer attribution: trace_fg_lineage / trace_lot / trace_fg_lineage's downstream sections and the forward-trace endpoint now include per-shipment {customer, customer_reference, so_order_date, so_ship_date} on any Out row with ref_type=SO, pulled from the actual Cin7 sale via the nightly sales_orders sync. When surfacing where a FG lot ended up, name the customer — e.g. "FG-604-102-00 lot 0903174175 shipped 90 cases on 2026-06-27 via SO-00119 to Revolution Foods". Ship-date caveat: two dates can differ on a shipment — the movement_date is when the inventory decrement was posted in Cin7 (may lag the physical event), while so_ship_date is what the SO record shows as the promised or actual ship date. If they differ meaningfully, surface both. Lots that were transferred (TR) or adjusted-out (ST) rather than shipped will not have a customer.
+- Date fidelity caveat (applies broadly): every date in the trace reflects what ops entered into Cin7 at the time of the record. If a clerk logged a PO receipt three days after the physical goods arrived without back-dating the movement, the trace shows the entry date, not the actual receipt date. Our code faithfully reports what's in Cin7 — the fix for date-accuracy audit issues is upstream data hygiene (train ops to record actual event dates in Cin7, not just entry timestamps), not something we can correct downstream. If a user asks "why does this date look wrong" or auditor questions arise about date fidelity, surface this framing.
 
 Dates are always in YYYY-MM-DD format.`;
 
@@ -2980,6 +2982,95 @@ app.get("/api/cin7/purchase-orders", (req, res) => {
   res.json({ ok: true, ...blob });
 });
 
+// ── Sales-order customer sync ────────────────────────────────────────────────
+//
+// Mirror of the purchase-order sync but for outbound: pulls every SO from
+// Cin7's /saleList and indexes by SO reference number so the forward-trace
+// view can attribute FG-lot shipments to the actual customer. Same
+// "surface real data or nothing" audit stance — no defaults, no guesses.
+//
+// Auditor use case: "which customer received lot X, and when did it ship?"
+// The trace already knows the SO reference from the movement row; this just
+// hydrates the customer name.
+
+async function fetchCin7SalesOrders() {
+  if (!process.env.CIN7_ACCOUNT_ID || !process.env.CIN7_APPLICATION_KEY) {
+    throw new Error("CIN7_ACCOUNT_ID or CIN7_APPLICATION_KEY environment variable not set");
+  }
+  const all = [];
+  let page = 1;
+  const limit = 1000;
+  while (true) {
+    const url = `https://inventory.dearsystems.com/ExternalApi/v2/saleList?Page=${page}&Limit=${limit}`;
+    const resp = await fetch(url, { headers: cin7Headers(), redirect: "follow" });
+    const ct = resp.headers.get("content-type") || "";
+    const text = await resp.text().catch(() => "");
+    if (!resp.ok) throw new Error(`Cin7 sale list ${resp.status} [${ct}]: ${text.slice(0, 300)}`);
+    let data;
+    try { data = JSON.parse(text); }
+    catch (_) { throw new Error(`Cin7 sale list ${resp.status} non-JSON [${ct}]: ${text.slice(0, 300)}`); }
+    // Cin7's saleList response uses SaleList[]; guard against schema drift.
+    const batch = data.SaleList || data.Sales || data.Sale || [];
+    all.push(...batch);
+    if (batch.length < limit) break;
+    page++;
+    if (page > 30) throw new Error("Cin7 sale pagination exceeded 30 pages — aborting");
+  }
+  return all;
+}
+
+async function performCin7SalesOrdersSync() {
+  const sales = await fetchCin7SalesOrders();
+  const now = new Date().toISOString();
+  const byRef = {};
+  let withCustomer = 0;
+  for (const s of sales) {
+    // Cin7's saleList row includes OrderNumber (the "SO-XXXXX" that appears
+    // in inventory movements) and Customer (name). ShipDate / OrderDate are
+    // both present as separate fields.
+    const ref = String(s.OrderNumber || s.CombinedRef || s.ID || "").trim();
+    if (!ref) continue;
+    const customer = String(s.Customer || s.CustomerName || "").trim();
+    byRef[ref] = {
+      ref,
+      customer: customer || null,
+      customerReference: String(s.CustomerReference || "").trim() || null,
+      orderDate: s.OrderDate ? String(s.OrderDate).slice(0, 10) : null,
+      shipDate: s.ShipDate ? String(s.ShipDate).slice(0, 10) : null,
+      status: s.Status || null,
+      total: s.Total != null ? Number(s.Total) : null,
+      currency: s.CurrencyCode || null,
+    };
+    if (customer) withCustomer++;
+  }
+  const blob = {
+    lastSync: now,
+    saleCount: sales.length,
+    withCustomerCount: withCustomer,
+    byRef,
+  };
+  writeData("sales_orders", blob);
+  return { ok: true, lastSync: now, saleCount: sales.length, withCustomerCount: withCustomer };
+}
+
+// POST /api/cin7/sales-orders/sync — admin-triggered live pull
+app.post("/api/cin7/sales-orders/sync", requireAdmin, async (req, res) => {
+  try {
+    const status = await performCin7SalesOrdersSync();
+    res.json(status);
+  } catch (e) {
+    console.error("[Cin7 SOs] Sync error:", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/cin7/sales-orders — return the cached SO map (any authed user)
+app.get("/api/cin7/sales-orders", (req, res) => {
+  const blob = readData("sales_orders");
+  if (!blob) return res.json({ ok: true, lastSync: null, byRef: {} });
+  res.json({ ok: true, ...blob });
+});
+
 // ── Yield bucket config (powers the Yield + Yield Setup tabs) ───────────────
 //
 // Each completed Production Run is bucketed by its first Output SKU. The
@@ -4721,6 +4812,20 @@ if (process.env.CIN7_ACCOUNT_ID && process.env.CIN7_APPLICATION_KEY) {
   });
   console.log("[Cin7 POs] Nightly sync scheduled at 06:50 UTC");
 
+  // Sales-order customer sync — populates SO ref → customer name map for
+  // the forward-trace shipment attribution. Scheduled at 06:55 UTC, after
+  // POs (06:50) and before production-run (07:00).
+  cron.schedule("55 6 * * *", async () => {
+    console.log("[Cin7 SOs] Nightly sync starting…");
+    try {
+      const s = await performCin7SalesOrdersSync();
+      console.log(`[Cin7 SOs] Sync done — ${s.saleCount} SOs, ${s.withCustomerCount} with customer`);
+    } catch (e) {
+      console.error("[Cin7 SOs] Nightly sync failed:", e.message);
+    }
+  });
+  console.log("[Cin7 SOs] Nightly sync scheduled at 06:55 UTC");
+
   // Production-run error sync — flags BOM input lines with actual=0 across
   // completed runs in the trailing 7 days. Runs after on-hand + costs so we
   // don't compete with them for the 60/min Cin7 rate budget.
@@ -5784,7 +5889,11 @@ app.get("/api/traceability/fg-lineage/:lot", (req, res) => {
 //     movements: [ ... raw Out rows for reference ... ]
 //   }
 
-function buildForwardTree(idx, lot, depth, maxDepth, seen) {
+// sosByRef (optional): pass in the sales_orders.byRef map so SO shipments
+// get enriched with the customer name + ship date from the actual SO
+// (via nightly Cin7 sales-orders sync). Symmetric with buildLineageTree's
+// posByRef enrichment for PO receipts.
+function buildForwardTree(idx, lot, depth, maxDepth, seen, sosByRef) {
   if (depth > maxDepth) return { lot, note: "max depth reached", consumed_by_mos: [], shipments: [], transfers_out: [], adjustments_out: [], assemblies: [], still_on_hand: null };
   if (seen.has(lot)) return { lot, note: "cycle detected", consumed_by_mos: [], shipments: [], transfers_out: [], adjustments_out: [], assemblies: [], still_on_hand: null };
   seen.add(lot);
@@ -5811,9 +5920,16 @@ function buildForwardTree(idx, lot, depth, maxDepth, seen) {
       e.qty += Number(m.qty_out || 0);
       if (!e.date || m.movement_date < e.date) e.date = m.movement_date;
     } else if (m.ref_type === "SO") {
+      // Normalize the SO ref (strip any /N sub-line suffix) before lookup.
+      const soRef = String(m.reference || "").replace(/\/.*$/, "");
+      const so = sosByRef && (sosByRef[soRef] || sosByRef[m.reference]);
       shipments.push({
         ref: m.reference, date: m.movement_date, qty: Number(m.qty_out || 0), unit: m.unit,
         location: m.location, document_reference: m.document_reference,
+        customer: so && so.customer ? so.customer : null,
+        customer_reference: so && so.customerReference ? so.customerReference : null,
+        so_order_date: so && so.orderDate ? so.orderDate : null,
+        so_ship_date: so && so.shipDate ? so.shipDate : null,
       });
     } else if (m.ref_type === "TR") {
       transfersOut.push({
@@ -5846,7 +5962,7 @@ function buildForwardTree(idx, lot, depth, maxDepth, seen) {
           consumed_by_mos: [], shipments: [], transfers_out: [], adjustments_out: [], assemblies: [], still_on_hand: null,
         };
       }
-      const subtree = buildForwardTree(idx, out.batch, depth + 1, maxDepth, seen);
+      const subtree = buildForwardTree(idx, out.batch, depth + 1, maxDepth, seen, sosByRef);
       return {
         lot: out.batch, sku: out.sku, product: out.product, unit: out.unit,
         date: out.movement_date, qty_produced: Number(out.qty_in || 0),
@@ -5896,6 +6012,7 @@ app.get("/api/traceability/forward/:query", (req, res) => {
   if (!q) return res.status(400).json({ ok: false, error: "Empty query" });
   const maxDepth = Math.max(1, Math.min(10, parseInt(req.query.max_depth, 10) || 5));
   const idx = getMovementIndex();
+  const sosByRef = (readData("sales_orders") || { byRef: {} }).byRef || {};
 
   // Ambiguous case: a string like "MO-00XXX/190" could be either an MO
   // reference (MO-00XXX batch 190) or a lot code (where /190 is a Julian
@@ -5924,7 +6041,7 @@ app.get("/api/traceability/forward/:query", (req, res) => {
           consumed_by_mos: [], shipments: [], transfers_out: [], adjustments_out: [], assemblies: [], still_on_hand: null,
         };
       }
-      const subtree = buildForwardTree(idx, out.batch, 0, maxDepth, seen);
+      const subtree = buildForwardTree(idx, out.batch, 0, maxDepth, seen, sosByRef);
       return {
         lot: out.batch, sku: out.sku, product: out.product, unit: out.unit,
         date: out.movement_date, qty_produced: Number(out.qty_in || 0),
@@ -5943,7 +6060,7 @@ app.get("/api/traceability/forward/:query", (req, res) => {
   }
 
   // Lot code path.
-  const tree = buildForwardTree(idx, q, 0, maxDepth, new Set());
+  const tree = buildForwardTree(idx, q, 0, maxDepth, new Set(), sosByRef);
   const allMovements = collectMovementsFromForwardTree(tree);
   res.json({
     ok: true, query: q, kind: "lot", max_depth: maxDepth,
