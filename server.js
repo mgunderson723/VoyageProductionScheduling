@@ -5070,19 +5070,27 @@ app.get("/api/cin7/boms/sync-status", (req, res) => {
 // once to figure out which endpoint Cin7 exposes for this tenant, so the
 // sync can be rewritten as a bulk pull instead of per-product detail.
 app.get("/api/cin7/boms/debug-probe", requireAdmin, async (req, res) => {
+  // Round 2: try the /production/* namespace (mirrors production/orderList
+  // which we know works), per-product nested paths with a real BOM'd product
+  // ID, and report/export namespaces that sometimes hold what UI exports hit.
+  const knownBomProductId = "f222eab2-f731-45ac-9ba0-8153649e866b"; // from earlier debug-detail call
   const candidates = [
-    "/productionBOM?Page=1&Limit=5",
-    "/productionBOMList?Page=1&Limit=5",
-    "/productionBOMs?Page=1&Limit=5",
-    "/productionBOM/list?Page=1&Limit=5",
-    "/productionBom?Page=1&Limit=5",
-    "/productionBomList?Page=1&Limit=5",
-    "/manufacturing/bom?Page=1&Limit=5",
-    "/manufacturing/productionBOM?Page=1&Limit=5",
-    "/bom?Page=1&Limit=5",
-    "/bomList?Page=1&Limit=5",
-    "/ref/productionBOM",
-    "/ref/bom",
+    "/production/bom?Page=1&Limit=5",
+    "/production/bomList?Page=1&Limit=5",
+    "/production/BOM?Page=1&Limit=5",
+    "/production/productionBOM?Page=1&Limit=5",
+    "/production/productionBom?Page=1&Limit=5",
+    "/production/orderBom?Page=1&Limit=5",
+    `/product/bom?ID=${knownBomProductId}`,
+    `/product/BOM?ID=${knownBomProductId}`,
+    `/product/productionBOM?ID=${knownBomProductId}`,
+    `/product/bomList?ID=${knownBomProductId}`,
+    "/productBOM?Page=1&Limit=5",
+    "/productBOMList?Page=1&Limit=5",
+    "/report/productionBOM",
+    "/reports/productionBOM",
+    "/export/productionBOM",
+    "/productionOrderBOM?Page=1&Limit=5",
   ];
   const results = [];
   for (const path of candidates) {
