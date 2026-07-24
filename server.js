@@ -727,7 +727,6 @@ TRACEABILITY (SQF audit prep — Q3/Q4 2026):
     4. Full facility count (2026-04-01 → 2026-06-30): large ST corrections are inventory-count reconciliation, not shrinkage.
 - When the user asks "what happened to lot X", "how was FG lot Y built", "trace this batch back to the raw materials" — call the trace_* tool. Do NOT reason from BOM structure or MRP data — the lot-level movement history is ground truth; BOM expansion is a plan of intent, movement history is what actually happened.
 - Reference-type prefixes in the response: PO (purchase order receipt), MO (production activity — 'MO-NNNNN/N' means batch N of the MO), ST (stock adjustment), TR (transfer between locations), SO (sales order shipment), FG (Cin7 'Assembly' — UOM conversion or lot consolidation, legacy at Voyage, paper-only movement).
-- Supplier attribution: trace_fg_lineage terminal RM/VC/PK leaves now include a "supplier" field with {name, code} sourced from Cin7's product master PreferredSupplier. When surfacing a lot's chain, mention the supplier next to the origin PO — e.g. "RM-110000-00 lot 45131 came in via PO-00040 on 2025-03-28 · supplier: Cargill Inc". Add the caveat when relevant: this is the SKU's DEFAULT supplier, so if a SKU is multi-sourced the specific PO may have used a different one — verifiable in Cin7 if it matters for audit purposes.
 
 Dates are always in YYYY-MM-DD format.`;
 
@@ -1733,8 +1732,7 @@ async function executeAITool(name, input, context) {
       if (!lot) return { ok: false, error: "trace_fg_lineage requires a lot code." };
       const maxDepth = Math.max(1, Math.min(10, Number(input.max_depth) || 5));
       const idx = getMovementIndex();
-      const costsBySku = (readData("product_costs") || { bySku: {} }).bySku || {};
-      const upstream = buildLineageTree(idx, lot, 0, maxDepth, new Set(), costsBySku);
+      const upstream = buildLineageTree(idx, lot, 0, maxDepth, new Set());
       const downstream = findDownstream(idx, lot);
       const all = collectMovementsFromTree(upstream).concat(downstream);
       return {
@@ -2850,51 +2848,27 @@ async function performCin7ProductCostsSync() {
   const now = new Date().toISOString();
   const bySku = {};
   let withCost = 0;
-  let withSupplier = 0;
   for (const p of products) {
     if (!p.SKU) continue;
     const cost = Number(p.AverageCost) || 0;
-    // Supplier: Cin7 Core v2 exposes PreferredSupplier (string name) and
-    // PreferredSupplierCode (Cin7's internal supplier code). Older API
-    // variants sometimes populate .Supplier or a Suppliers array; capture
-    // defensively so we surface something even when the schema drifts.
-    // Caveat: this is the DEFAULT supplier per SKU. A specific PO may
-    // have used a different one if the SKU is multi-sourced — bright-line
-    // accuracy requires a PO-level sync, which we can add later.
-    const supplierName = String(
-      p.PreferredSupplier
-      || p.Supplier
-      || (Array.isArray(p.Suppliers) && p.Suppliers[0] && (p.Suppliers[0].SupplierName || p.Suppliers[0].Name))
-      || ""
-    ).trim();
-    const supplierCode = String(
-      p.PreferredSupplierCode
-      || p.SupplierCode
-      || (Array.isArray(p.Suppliers) && p.Suppliers[0] && p.Suppliers[0].SupplierCode)
-      || ""
-    ).trim();
     bySku[p.SKU] = {
       sku: p.SKU,
       name: p.Name || "",
       averageCost: cost,
       costingMethod: p.CostingMethod || "",
       category: p.Category || "",
-      preferredSupplier: supplierName || null,
-      preferredSupplierCode: supplierCode || null,
     };
     if (cost > 0) withCost++;
-    if (supplierName) withSupplier++;
   }
   const blob = {
     lastSync: now,
     productCount: products.length,
     withCostCount: withCost,
-    withSupplierCount: withSupplier,
     currency: "USD",
     bySku,
   };
   writeData("product_costs", blob);
-  return { ok: true, lastSync: now, productCount: products.length, withCostCount: withCost, withSupplierCount: withSupplier };
+  return { ok: true, lastSync: now, productCount: products.length, withCostCount: withCost };
 }
 
 // POST /api/cin7/product-costs/sync — admin-triggered live pull
@@ -5604,39 +5578,21 @@ function findDownstream(idx, lot) {
   return (idx.byBatch.get(lot) || []).filter(m => m.movement_type === "Out").slice().sort((a, b) => (a.movement_date || "").localeCompare(b.movement_date || ""));
 }
 
-// costsBySku (optional): pass in the product_costs.bySku map so terminal
-// RM/VC/PK leaves can be enriched with the SKU's default supplier name +
-// code. Cin7 v2's product endpoint gives us PreferredSupplier per SKU;
-// the traceability view uses it to answer "who did we source this lot
-// from" without needing per-PO API calls. Approximation: this is the
-// SKU's DEFAULT supplier, not necessarily the actual supplier on this
-// specific PO if the SKU is multi-sourced. UI/AI should surface the
-// caveat.
-function buildLineageTree(idx, lot, depth, maxDepth, seen, costsBySku) {
+function buildLineageTree(idx, lot, depth, maxDepth, seen) {
   if (depth > maxDepth) return { lot, sku: null, note: "max depth reached", inputs: [] };
   if (seen.has(lot)) return { lot, sku: null, note: "cycle detected", inputs: [] };
   seen.add(lot);
   const producing = findProducingMovement(idx, lot);
   if (!producing) {
     const origin = findOriginMovement(idx, lot);
-    const supplier = origin && costsBySku && costsBySku[origin.sku]
-      ? { name: costsBySku[origin.sku].preferredSupplier || null, code: costsBySku[origin.sku].preferredSupplierCode || null }
-      : null;
-    return {
-      lot,
-      sku: origin ? origin.sku : null,
-      product: origin ? origin.product : null,
-      origin: origin || null,
-      supplier: (supplier && supplier.name) ? supplier : null,
-      inputs: [],
-    };
+    return { lot, sku: origin ? origin.sku : null, product: origin ? origin.product : null, origin: origin || null, inputs: [] };
   }
   const inputMovements = findMoInputs(idx, producing.reference);
   const inputs = inputMovements.map(im => {
     if (!im.batch) {
       return { lot: null, sku: im.sku, product: im.product, category: skuCategory(im.sku), qty: im.qty_out, unit: im.unit, movement: im, inputs: [] };
     }
-    const subtree = buildLineageTree(idx, im.batch, depth + 1, maxDepth, seen, costsBySku);
+    const subtree = buildLineageTree(idx, im.batch, depth + 1, maxDepth, seen);
     return { lot: im.batch, sku: im.sku, product: im.product, category: skuCategory(im.sku), qty: im.qty_out, unit: im.unit, movement: im, ...subtree };
   });
   return { lot, sku: producing.sku, product: producing.product, producing_mo: producing.reference, producing_date: producing.movement_date, producing_qty: producing.qty_in, unit: producing.unit, origin: producing, inputs };
@@ -5661,8 +5617,7 @@ app.get("/api/traceability/fg-lineage/:lot", (req, res) => {
   if (!lot) return res.status(400).json({ ok: false, error: "Empty lot code" });
   const maxDepth = Math.max(1, Math.min(10, parseInt(req.query.max_depth, 10) || 5));
   const idx = getMovementIndex();
-  const costsBySku = (readData("product_costs") || { bySku: {} }).bySku || {};
-  const upstream = buildLineageTree(idx, lot, 0, maxDepth, new Set(), costsBySku);
+  const upstream = buildLineageTree(idx, lot, 0, maxDepth, new Set());
   const downstream = findDownstream(idx, lot);
   const all = collectMovementsFromTree(upstream).concat(downstream);
   res.json({
