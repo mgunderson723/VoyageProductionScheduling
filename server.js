@@ -727,6 +727,7 @@ TRACEABILITY (SQF audit prep — Q3/Q4 2026):
     4. Full facility count (2026-04-01 → 2026-06-30): large ST corrections are inventory-count reconciliation, not shrinkage.
 - When the user asks "what happened to lot X", "how was FG lot Y built", "trace this batch back to the raw materials" — call the trace_* tool. Do NOT reason from BOM structure or MRP data — the lot-level movement history is ground truth; BOM expansion is a plan of intent, movement history is what actually happened.
 - Reference-type prefixes in the response: PO (purchase order receipt), MO (production activity — 'MO-NNNNN/N' means batch N of the MO), ST (stock adjustment), TR (transfer between locations), SO (sales order shipment), FG (Cin7 'Assembly' — UOM conversion or lot consolidation, legacy at Voyage, paper-only movement).
+- Supplier attribution: trace_fg_lineage terminal RM/VC/PK leaves whose origin is a PO include a "supplier" field with {name, code, orderDate} pulled from the ACTUAL Cin7 PO (via the nightly purchase_orders sync). When surfacing a lot's chain, mention the supplier next to the origin PO — e.g. "RM-110000-00 lot 45131 came in via PO-00040 · supplier: Cargill Inc · PO ordered 2025-03-15". This is the actual supplier on the PO, not a SKU default, so no caveat needed. Lots with an ST-* origin (stock adjustment) have no supplier field — that's honest, ST lots didn't come in through a supplier receipt at all.
 
 Dates are always in YYYY-MM-DD format.`;
 
@@ -1732,7 +1733,8 @@ async function executeAITool(name, input, context) {
       if (!lot) return { ok: false, error: "trace_fg_lineage requires a lot code." };
       const maxDepth = Math.max(1, Math.min(10, Number(input.max_depth) || 5));
       const idx = getMovementIndex();
-      const upstream = buildLineageTree(idx, lot, 0, maxDepth, new Set());
+      const posByRef = (readData("purchase_orders") || { byRef: {} }).byRef || {};
+      const upstream = buildLineageTree(idx, lot, 0, maxDepth, new Set(), posByRef);
       const downstream = findDownstream(idx, lot);
       const all = collectMovementsFromTree(upstream).concat(downstream);
       return {
@@ -2886,6 +2888,95 @@ app.post("/api/cin7/product-costs/sync", requireAdmin, async (req, res) => {
 app.get("/api/cin7/product-costs", (req, res) => {
   const blob = readData("product_costs");
   if (!blob) return res.json({ ok: true, lastSync: null, bySku: {} });
+  res.json({ ok: true, ...blob });
+});
+
+// ── Purchase-order supplier sync ────────────────────────────────────────────
+//
+// Cin7's v2 /purchase endpoint returns every PO with the ACTUAL supplier.
+// We index by the PO reference number (the same "PO-00040" format that shows
+// up in every inventory-movement row's Reference field) so the traceability
+// lineage view can attribute each terminal RM/VC/PK lot to its real
+// supplier — not the SKU's default PreferredSupplier (which is stale at
+// Voyage and unsafe for audit narration).
+//
+// Auditors want "who did this lot come from?" — and the honest answer lives
+// on the PO, not on the product master.
+
+async function fetchCin7PurchaseOrders() {
+  if (!process.env.CIN7_ACCOUNT_ID || !process.env.CIN7_APPLICATION_KEY) {
+    throw new Error("CIN7_ACCOUNT_ID or CIN7_APPLICATION_KEY environment variable not set");
+  }
+  const all = [];
+  let page = 1;
+  const limit = 1000;
+  while (true) {
+    const url = `https://inventory.dearsystems.com/ExternalApi/v2/purchaseList?Page=${page}&Limit=${limit}`;
+    const resp = await fetch(url, { headers: cin7Headers(), redirect: "follow" });
+    const ct = resp.headers.get("content-type") || "";
+    const text = await resp.text().catch(() => "");
+    if (!resp.ok) throw new Error(`Cin7 purchase list ${resp.status} [${ct}]: ${text.slice(0, 300)}`);
+    let data;
+    try { data = JSON.parse(text); }
+    catch (_) { throw new Error(`Cin7 purchase list ${resp.status} non-JSON [${ct}]: ${text.slice(0, 300)}`); }
+    // Cin7's purchaseList response uses PurchaseList[]; guard against schema drift.
+    const batch = data.PurchaseList || data.Purchases || data.Purchase || [];
+    all.push(...batch);
+    if (batch.length < limit) break;
+    page++;
+    if (page > 30) throw new Error("Cin7 purchase pagination exceeded 30 pages — aborting");
+  }
+  return all;
+}
+
+async function performCin7PurchaseOrdersSync() {
+  const purchases = await fetchCin7PurchaseOrders();
+  const now = new Date().toISOString();
+  const byRef = {};
+  let withSupplier = 0;
+  for (const p of purchases) {
+    // Cin7's purchaseList row is a summary — the fields we need are all
+    // present here (no need to hit /purchase/{id} for each one, which
+    // would be N+1 hell for a nightly job).
+    const ref = String(p.OrderNumber || p.CombinedRef || p.ID || "").trim();
+    if (!ref) continue;
+    const supplier = String(p.Supplier || p.SupplierName || "").trim();
+    byRef[ref] = {
+      ref,
+      supplier: supplier || null,
+      supplierCode: String(p.SupplierReference || p.SupplierCode || "").trim() || null,
+      orderDate: p.OrderDate ? String(p.OrderDate).slice(0, 10) : null,
+      status: p.Status || null,
+      total: p.Total != null ? Number(p.Total) : null,
+      currency: p.CurrencyCode || null,
+    };
+    if (supplier) withSupplier++;
+  }
+  const blob = {
+    lastSync: now,
+    purchaseCount: purchases.length,
+    withSupplierCount: withSupplier,
+    byRef,
+  };
+  writeData("purchase_orders", blob);
+  return { ok: true, lastSync: now, purchaseCount: purchases.length, withSupplierCount: withSupplier };
+}
+
+// POST /api/cin7/purchase-orders/sync — admin-triggered live pull
+app.post("/api/cin7/purchase-orders/sync", requireAdmin, async (req, res) => {
+  try {
+    const status = await performCin7PurchaseOrdersSync();
+    res.json(status);
+  } catch (e) {
+    console.error("[Cin7 POs] Sync error:", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/cin7/purchase-orders — return the cached PO map (any authed user)
+app.get("/api/cin7/purchase-orders", (req, res) => {
+  const blob = readData("purchase_orders");
+  if (!blob) return res.json({ ok: true, lastSync: null, byRef: {} });
   res.json({ ok: true, ...blob });
 });
 
@@ -4614,6 +4705,22 @@ if (process.env.CIN7_ACCOUNT_ID && process.env.CIN7_APPLICATION_KEY) {
   });
   console.log("[Cin7 Costs] Nightly sync scheduled at 06:45 UTC");
 
+  // Purchase-order supplier sync — populates PO ref → actual supplier map
+  // for the traceability lineage view. Small payload (a few thousand POs
+  // for Voyage), single paginated API call. Scheduled at 06:50 UTC to sit
+  // after on-hand (06:30) and costs (06:45) so we don't compete with them
+  // for Cin7's 60/min rate budget, and still before production-run at 07:00.
+  cron.schedule("50 6 * * *", async () => {
+    console.log("[Cin7 POs] Nightly sync starting…");
+    try {
+      const s = await performCin7PurchaseOrdersSync();
+      console.log(`[Cin7 POs] Sync done — ${s.purchaseCount} POs, ${s.withSupplierCount} with supplier`);
+    } catch (e) {
+      console.error("[Cin7 POs] Nightly sync failed:", e.message);
+    }
+  });
+  console.log("[Cin7 POs] Nightly sync scheduled at 06:50 UTC");
+
   // Production-run error sync — flags BOM input lines with actual=0 across
   // completed runs in the trailing 7 days. Runs after on-hand + costs so we
   // don't compete with them for the 60/min Cin7 rate budget.
@@ -5578,21 +5685,43 @@ function findDownstream(idx, lot) {
   return (idx.byBatch.get(lot) || []).filter(m => m.movement_type === "Out").slice().sort((a, b) => (a.movement_date || "").localeCompare(b.movement_date || ""));
 }
 
-function buildLineageTree(idx, lot, depth, maxDepth, seen) {
+// posByRef (optional): pass in the purchase_orders.byRef map so terminal
+// RM/VC/PK leaves whose origin is a PO get enriched with the ACTUAL
+// supplier from that specific PO. Unlike a SKU-default lookup, this
+// reflects the real supplier on the specific PO — safe for audit
+// narration. Nothing is surfaced for ST-origin lots (stock adjustments
+// don't have a supplier by definition).
+function buildLineageTree(idx, lot, depth, maxDepth, seen, posByRef) {
   if (depth > maxDepth) return { lot, sku: null, note: "max depth reached", inputs: [] };
   if (seen.has(lot)) return { lot, sku: null, note: "cycle detected", inputs: [] };
   seen.add(lot);
   const producing = findProducingMovement(idx, lot);
   if (!producing) {
     const origin = findOriginMovement(idx, lot);
-    return { lot, sku: origin ? origin.sku : null, product: origin ? origin.product : null, origin: origin || null, inputs: [] };
+    let supplier = null;
+    if (origin && origin.ref_type === "PO" && posByRef) {
+      // Normalize ref: "PO-00040/1" or similar sub-batch suffix → base PO
+      const poRef = String(origin.reference || "").replace(/\/.*$/, "");
+      const po = posByRef[poRef] || posByRef[origin.reference];
+      if (po && po.supplier) {
+        supplier = { name: po.supplier, code: po.supplierCode || null, orderDate: po.orderDate || null };
+      }
+    }
+    return {
+      lot,
+      sku: origin ? origin.sku : null,
+      product: origin ? origin.product : null,
+      origin: origin || null,
+      supplier,
+      inputs: [],
+    };
   }
   const inputMovements = findMoInputs(idx, producing.reference);
   const inputs = inputMovements.map(im => {
     if (!im.batch) {
       return { lot: null, sku: im.sku, product: im.product, category: skuCategory(im.sku), qty: im.qty_out, unit: im.unit, movement: im, inputs: [] };
     }
-    const subtree = buildLineageTree(idx, im.batch, depth + 1, maxDepth, seen);
+    const subtree = buildLineageTree(idx, im.batch, depth + 1, maxDepth, seen, posByRef);
     return { lot: im.batch, sku: im.sku, product: im.product, category: skuCategory(im.sku), qty: im.qty_out, unit: im.unit, movement: im, ...subtree };
   });
   return { lot, sku: producing.sku, product: producing.product, producing_mo: producing.reference, producing_date: producing.movement_date, producing_qty: producing.qty_in, unit: producing.unit, origin: producing, inputs };
@@ -5617,7 +5746,8 @@ app.get("/api/traceability/fg-lineage/:lot", (req, res) => {
   if (!lot) return res.status(400).json({ ok: false, error: "Empty lot code" });
   const maxDepth = Math.max(1, Math.min(10, parseInt(req.query.max_depth, 10) || 5));
   const idx = getMovementIndex();
-  const upstream = buildLineageTree(idx, lot, 0, maxDepth, new Set());
+  const posByRef = (readData("purchase_orders") || { byRef: {} }).byRef || {};
+  const upstream = buildLineageTree(idx, lot, 0, maxDepth, new Set(), posByRef);
   const downstream = findDownstream(idx, lot);
   const all = collectMovementsFromTree(upstream).concat(downstream);
   res.json({

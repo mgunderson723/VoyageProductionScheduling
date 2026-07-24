@@ -4355,6 +4355,9 @@ function _flattenTreeToCsv(node, depth, path, parentLot, rows, kind) {
     producing_date: node.producing_date || '',
     origin_reference: node.origin ? node.origin.reference : '',
     origin_date: node.origin ? String(node.origin.movement_date || '').slice(0, 10) : '',
+    supplier: node.supplier ? (node.supplier.name || '') : '',
+    supplier_code: node.supplier ? (node.supplier.code || '') : '',
+    po_order_date: node.supplier ? (node.supplier.orderDate || '') : '',
     note: node.note || '',
   });
   // For forward-trace nodes, add rows for downstream destinations too.
@@ -4422,7 +4425,7 @@ function downloadTraceViewCsv() {
     if (!upstream) { alert('Lineage unavailable to export.'); return; }
     rows = [];
     _flattenTreeToCsv(upstream, 0, '', '', rows, 'lineage');
-    headers = ['depth', 'path', 'parent_lot', 'lot', 'sku', 'product', 'category', 'unit', 'qty', 'producing_mo', 'producing_date', 'origin_reference', 'origin_date', 'note'];
+    headers = ['depth', 'path', 'parent_lot', 'lot', 'sku', 'product', 'category', 'unit', 'qty', 'producing_mo', 'producing_date', 'origin_reference', 'origin_date', 'supplier', 'supplier_code', 'po_order_date', 'note'];
   } else if (view === 'forward') {
     const forward = extra.forward;
     if (!forward) { alert('Forward trace unavailable to export.'); return; }
@@ -4742,8 +4745,14 @@ function renderNodeLabel(node, isRoot) {
   const origin = node.origin && !node.producing_mo
     ? `<span class="trace-tree-node-origin">← ${escapeHtml(node.origin.reference || 'unknown')} on ${escapeHtml((node.origin.movement_date || '').slice(0,10))}</span>`
     : '';
+  // Supplier badge on terminal RM/VC/PK leaves — pulled from the actual PO
+  // that received this specific lot (via nightly Cin7 purchase_orders sync).
+  // Only shows when the origin is a real PO; ST-origin lots have no supplier.
+  const supplier = node.supplier && node.supplier.name
+    ? ` <span title="Supplier from PO ${escapeHtml(node.origin && node.origin.reference || '')}${node.supplier.orderDate ? ' (ordered ' + escapeHtml(node.supplier.orderDate) + ')' : ''}" style="color:var(--vf-focus-ring);font-size:11px;margin-left:4px;">🏭 ${escapeHtml(node.supplier.name)}${node.supplier.code ? ' · ' + escapeHtml(node.supplier.code) : ''}</span>`
+    : '';
   const catPill = cat ? `<span class="trace-tree-node-cat">${escapeHtml(cat)}</span>` : '';
-  return `${catPill}<span class="trace-tree-node-sku">${escapeHtml(sku)}</span> <span class="trace-tree-node-lot">${lot}</span> <span class="trace-tree-node-qty">${escapeHtml(qty)}</span> ${via}${origin}`;
+  return `${catPill}<span class="trace-tree-node-sku">${escapeHtml(sku)}</span> <span class="trace-tree-node-lot">${lot}</span> <span class="trace-tree-node-qty">${escapeHtml(qty)}</span> ${via}${origin}${supplier}`;
 }
 
 // Forward-trace view: recursive tree showing where a lot / MO's outputs
