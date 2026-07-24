@@ -689,7 +689,13 @@ PO-TOTAL ARITHMETIC (also mandatory):
 
 FG-LEVEL NETTING (default ON in run_mrp — behavior you must narrate accurately):
 - run_mrp now nets FG on-hand against planned production BEFORE expanding BOMs. If a scheduled MO or pipeline draft would produce FG-XXX and there is already FG-XXX.available in stock, the RM demand for that draft is expanded on the NET production qty (planned minus what stock covers), not the gross planned qty. This is real MRP behavior and matches how a scheduler would think.
-- run_mrp responses include an fgNettingSummary array — FG SKUs where on-hand stock offset planned production. When it is non-empty, SURFACE THIS in your reply: "FG-888-858 has 5,136 kg on hand available; that offset 5,136 kg of planned production across N drafts, so RM demand is net of that." Otherwise the user sees smaller RM numbers than the naive planned-FG-times-recipe-percent math would predict and gets confused.
+- run_mrp responses include an fgNettingSummary array — FG SKUs where on-hand stock offset planned production. When it is non-empty, SURFACE THIS in your reply. Each row has these distinct fields you MUST report correctly:
+    rawOnHandKg              — total physical inventory in Cin7
+    allocatedToSalesOrdersKg — qty already committed to open SOs (unavailable for netting)
+    startingAvailableKg      — rawOnHand minus allocated; THE POOL FOR FUTURE NETTING
+    totalConsumedKg          — how much of that pool FIFO consumed against planned production
+    availableRemainingKg     — startingAvailable minus totalConsumed
+  Sample narration: "FG-888-860 has 4,938 kg on hand, but 4,500 kg is already allocated to open SOs (SO-XXXXX). Only 438 kg is available for future netting — FIFO applied that to the Sep pipeline draft first, leaving 0 kg for Dec." NEVER report the raw on-hand as if it were available — that misleads the user into thinking netting is broken when it's actually working correctly against a smaller-than-expected pool. Ordering is FIFO by need-by-date across all planned orders (real MOs AND pipeline drafts) — earliest need consumes first.
 - trace_po_demand rows now include sourceFgGrossQty (pre-netting), sourceFgQty (net, drives RM), and sourceFgOffsetKg (FG on-hand absorbed). If gross does not equal net for a row, mention it in your attribution table: "PIPELINE-Cargill US-2026-12 · FG-888-858 · 15,000 kg planned → 5,136 kg offset by FG on-hand → 9,864 kg net → 3,156 kg RM contribution."
 - Only set netFgOnHand=false if the user explicitly asks for a "gross production plan" or "what would we need to buy if the FG shelf were empty" scenario. Never disable it silently.
 
@@ -4916,8 +4922,17 @@ function buildRequirements(orders, bomParents, opts) {
   if (netFgOnHand) {
     for (const [fgSku, info] of fgNetted) {
       if (info.totalConsumed > 0) {
+        const oh = (opts.onHandBySku || {})[fgSku] || {};
         fgNettingSummary.push({
           fgSku,
+          // Raw on-hand breakdown so the caller can distinguish "we have
+          // 5,000 kg physically" from "only 438 kg is free for netting
+          // because 4,562 kg is already promised to open SOs". Otherwise
+          // it looks like FIFO ordering is broken when it's actually
+          // working correctly against a smaller-than-expected pool.
+          rawOnHandKg: Math.round(Number(oh.onHand || 0) * 1000) / 1000,
+          allocatedToSalesOrdersKg: Math.round(Number(oh.allocated || 0) * 1000) / 1000,
+          startingAvailableKg: Math.round(Number(oh.available || 0) * 1000) / 1000,
           totalConsumedKg: Math.round(info.totalConsumed * 1000) / 1000,
           availableRemainingKg: Math.round(info.availableRemaining * 1000) / 1000,
           ordersOffset: info.consumedByOrder.size,
