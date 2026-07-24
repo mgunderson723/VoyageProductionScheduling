@@ -4734,6 +4734,22 @@ function buildRequirements(orders, bomParents, opts) {
   // already been produced. opts.excludeBeforeDate is a YYYY-MM-DD string.
   const excludeBeforeDate = opts.excludeBeforeDate || null;
 
+  // Compute the in-scope order set ONCE up front — reused by both the FG
+  // netting pre-pass and the WIP cutoff pre-pass below. Filters MUST match
+  // the main loop's per-order gate so pre-passes only see orders that will
+  // actually generate requirements. Critically: completed MOs are excluded
+  // (a completed MO's OUTPUT is what on-hand already reflects; letting a
+  // completed MO "consume" on-hand double-counts it and drains the netting
+  // pool before real planned production gets a chance).
+  const inScopeOrders = orders.filter(o => {
+    if (!opts.includeUnconfirmed && o.confirmed === false && !o.__fromPipelineDraft) return false;
+    if (o.status === "complete") return false;
+    if (!o.start) return false;
+    if (o.start > horizonEnd) return false;
+    if (excludeBeforeDate && o.start < excludeBeforeDate) return false;
+    return true;
+  });
+
   // ── FG-level netting (default ON for planning use) ────────────────────────
   // Real MRP nets on-hand at every BOM level, not just leaf RM. If we already
   // have 5,000 kg of a finished good on the shelf, a pipeline draft for
@@ -4749,11 +4765,10 @@ function buildRequirements(orders, bomParents, opts) {
   // first). Records the offset on each order so trace_po_demand can surface
   // the "netted by FG on-hand" note in attributions.
   const netFgOnHand = opts.netFgOnHand !== false && opts.onHandBySku && Object.keys(opts.onHandBySku).length > 0;
-  const fgNetted = new Map(); // fgSku -> {consumedByOrder: Map<orderId, kg>, totalConsumed}
+  const fgNetted = new Map(); // fgSku -> {consumedByOrder: Map<orderId, kg>, totalConsumed, offsetBreakdown}
   if (netFgOnHand) {
-    // Group orders by fgSku (after extractBomSku), sort each group by needBy.
     const byFg = new Map();
-    for (const o of orders) {
+    for (const o of inScopeOrders) {
       if (!o.sku) continue;
       const fg = extractBomSku(o.sku, bomParents);
       if (!fg) continue;
@@ -4770,20 +4785,28 @@ function buildRequirements(orders, bomParents, opts) {
       if (available <= 0) continue;
       entries.sort((a, b) => String(a.needBy || "").localeCompare(String(b.needBy || "")));
       const consumedByOrder = new Map();
+      const offsetBreakdown = []; // audit trail: which order got which slice
       let totalConsumed = 0;
       for (const e of entries) {
         if (available <= 0) break;
         const take = Math.min(available, e.plannedQty);
         if (take <= 0) continue;
         consumedByOrder.set(e.order.id || e.order.orderId || String(Math.random()), take);
+        offsetBreakdown.push({
+          orderId: e.order.orderId || e.order.id,
+          orderInternalId: e.order.id,
+          needBy: e.needBy,
+          grossPlannedKg: e.plannedQty,
+          offsetKg: take,
+          netPlannedKg: e.plannedQty - take,
+          isPipelineDraft: !!e.order.__fromPipelineDraft,
+        });
         available -= take;
         totalConsumed += take;
-        // Mutate a per-order shadow — DO NOT touch the input order object.
-        // We store the offset on the entry itself and consult it below.
         e.netPlannedQty = e.plannedQty - take;
         e.fgOffsetKg = take;
       }
-      fgNetted.set(fg, { totalConsumed, availableRemaining: available, consumedByOrder });
+      fgNetted.set(fg, { totalConsumed, availableRemaining: available, consumedByOrder, offsetBreakdown });
     }
     // Build a fast lookup: order.id → { netPlannedQty, fgOffsetKg }
     opts._perOrderNet = new Map();
@@ -4812,14 +4835,6 @@ function buildRequirements(orders, bomParents, opts) {
   // we still cut off — but log the gap so the caller can surface it. The
   // gap represents production that ops SHOULD schedule but hasn't, so the
   // right behavior is to flag it, not to silently pad RM demand.
-  const inScopeOrders = orders.filter(o => {
-    if (!opts.includeUnconfirmed && o.confirmed === false && !o.__fromPipelineDraft) return false;
-    if (o.status === "complete") return false;
-    if (!o.start) return false;
-    if (o.start > horizonEnd) return false;
-    if (excludeBeforeDate && o.start < excludeBeforeDate) return false;
-    return true;
-  });
   const plannedProducersBySku = new Map(); // sku -> total planned qty in scope
   for (const o of inScopeOrders) {
     if (!o.sku) continue;
@@ -4936,6 +4951,13 @@ function buildRequirements(orders, bomParents, opts) {
           totalConsumedKg: Math.round(info.totalConsumed * 1000) / 1000,
           availableRemainingKg: Math.round(info.availableRemaining * 1000) / 1000,
           ordersOffset: info.consumedByOrder.size,
+          // Per-order audit trail — for each order that absorbed some
+          // offset, in FIFO order. If ordersOffset shows a count higher
+          // than the caller expected, this array tells them WHICH orders
+          // grabbed the slack. Includes real MOs (isPipelineDraft=false)
+          // and pipeline synths (isPipelineDraft=true) so it's obvious
+          // when a real scheduled MO is competing for the pool.
+          offsetBreakdown: info.offsetBreakdown || [],
         });
       }
     }
