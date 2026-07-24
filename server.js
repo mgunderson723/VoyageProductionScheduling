@@ -687,6 +687,12 @@ PO-TOTAL ARITHMETIC (also mandatory):
 - If your computed gross demand is more than 10% different from run_mrp's qtyToOrder for the same SKU, your math is wrong. Re-call the tools with the correct filters; do NOT report the wrong number anyway.
 - When explaining a PO, show the gross→net story explicitly: "Gross BOM demand from these orders is X kg. On-hand + on-order covers Y kg. Net PO need (= MRP's suggested qtyToOrder) is Z kg." That makes the chain auditable.
 
+FG-LEVEL NETTING (default ON in run_mrp — behavior you must narrate accurately):
+- run_mrp now nets FG on-hand against planned production BEFORE expanding BOMs. If a scheduled MO or pipeline draft would produce FG-XXX and there is already FG-XXX.available in stock, the RM demand for that draft is expanded on the NET production qty (planned minus what stock covers), not the gross planned qty. This is real MRP behavior and matches how a scheduler would think.
+- run_mrp responses include an fgNettingSummary array — FG SKUs where on-hand stock offset planned production. When it is non-empty, SURFACE THIS in your reply: "FG-888-858 has 5,136 kg on hand available; that offset 5,136 kg of planned production across N drafts, so RM demand is net of that." Otherwise the user sees smaller RM numbers than the naive planned-FG-times-recipe-percent math would predict and gets confused.
+- trace_po_demand rows now include sourceFgGrossQty (pre-netting), sourceFgQty (net, drives RM), and sourceFgOffsetKg (FG on-hand absorbed). If gross does not equal net for a row, mention it in your attribution table: "PIPELINE-Cargill US-2026-12 · FG-888-858 · 15,000 kg planned → 5,136 kg offset by FG on-hand → 9,864 kg net → 3,156 kg RM contribution."
+- Only set netFgOnHand=false if the user explicitly asks for a "gross production plan" or "what would we need to buy if the FG shelf were empty" scenario. Never disable it silently.
+
 PER-ORDER ATTRIBUTION TABLE (always include when listing demand drivers):
 - When trace_po_demand returns multiple sources, show them as a table with these columns: source orderId, start date (for synthetic pipeline drafts this is the *computed production start* — ship month minus a channel-specific production lead time; label as "pipeline draft, prod start X (ships Y)" so the user can see both), FG SKU + qty, kg of the leaf RM contributed, % of total.
 - Stale orders that should have been filtered out are MOST visible in this table — their start dates will be before the user's excludeBefore cutoff and the user can immediately see the violation. Including this table is your built-in audit trail.
@@ -964,6 +970,7 @@ const AI_TOOLS = [
         includeDrafts:      { type: "boolean", description: "Include pipeline drafts as additional demand. Default false." },
         excludeBefore:      { type: "string",  description: "Skip orders with start date before this (YYYY-MM-DD). Useful for filtering stale TBD orders." },
         topN:               { type: "number",  description: "How many top-$ suggested POs to return. Default 20." },
+        netFgOnHand:        { type: "boolean", description: "Net finished-good on-hand inventory against planned production before computing RM demand. Default true. If a scheduled MO or pipeline draft would produce FG that's already sitting in stock (on-hand minus SO allocations), MRP subtracts that qty from planned production first, then expands the BOM on the reduced qty. This is what real MRP does; only turn OFF (netFgOnHand=false) when you want a 'gross production plan' view that shows what a full run would require ignoring existing FG inventory." },
       },
     },
   },
@@ -1472,7 +1479,7 @@ async function executeAITool(name, input, context) {
       const excludeBeforeDate  = /^\d{4}-\d{2}-\d{2}$/.test(excludeBeforeRaw) ? excludeBeforeRaw : null;
       const today              = new Date().toISOString().slice(0, 10);
 
-      const { orders: rawOrders, bomParents, supply } = getMrpInputs();
+      const { orders: rawOrders, bomParents, supply, onHandBySku } = getMrpInputs();
       let mrpOrders = rawOrders;
       if (includeDrafts) {
         const pipelineBlob = readData("vf_pipeline_drafts");
@@ -1481,8 +1488,10 @@ async function executeAITool(name, input, context) {
         mrpOrders = rawOrders.concat(synth);
       }
 
-      const { requirements } = buildRequirements(mrpOrders, bomParents, {
+      const netFgOnHand = pickBool(input.netFgOnHand, userSettings.netFgOnHand, true);
+      const { requirements, fgNettingSummary } = buildRequirements(mrpOrders, bomParents, {
         today, horizonDays, includeUnconfirmed, applyWastage: true, excludeBeforeDate, supply,
+        onHandBySku, netFgOnHand,
       });
 
       // Filter to entries that contributed to demand for the target SKU.
@@ -1519,7 +1528,9 @@ async function executeAITool(name, input, context) {
           bySource.set(key, {
             sourceOrderId: r.sourceOrderId,
             sourceFgSku: r.sourceFgSku,
-            sourceFgQty: 0,
+            sourceFgQty: 0,          // net qty (drives RM demand)
+            sourceFgGrossQty: 0,     // pre-netting planned qty
+            sourceFgOffsetKg: 0,     // FG on-hand that absorbed demand
             totalQtyKg: 0,
             neededByEarliest: null,
             contributionCount: 0,
@@ -1528,6 +1539,8 @@ async function executeAITool(name, input, context) {
         const entry = bySource.get(key);
         entry.totalQtyKg += r.qtyKg;
         entry.sourceFgQty += Number(r.sourceFgQty || 0);
+        entry.sourceFgGrossQty += Number(r.sourceFgGrossQty != null ? r.sourceFgGrossQty : r.sourceFgQty || 0);
+        entry.sourceFgOffsetKg += Number(r.sourceFgOffsetKg || 0);
         entry.contributionCount += 1;
         if (!entry.neededByEarliest || (r.neededByDate && r.neededByDate < entry.neededByEarliest)) {
           entry.neededByEarliest = r.neededByDate;
@@ -1613,8 +1626,10 @@ async function executeAITool(name, input, context) {
         mrpOrders = rawOrders.concat(synth);
       }
 
-      const { requirements, skipped } = buildRequirements(mrpOrders, bomParents, {
+      const netFgOnHand = pickBool(input.netFgOnHand, userSettings.netFgOnHand, true);
+      const { requirements, skipped, fgNettingSummary } = buildRequirements(mrpOrders, bomParents, {
         today, horizonDays, includeUnconfirmed, applyWastage: true, excludeBeforeDate, supply,
+        onHandBySku, netFgOnHand,
       });
       const { suggestedPOs, atRiskOrders } = allocateAndPlan(requirements, onHandBySku, supply, today, poHorizonEndDate);
 
@@ -1662,7 +1677,7 @@ async function executeAITool(name, input, context) {
         ok: true,
         runAt: new Date().toISOString(),
         today,
-        settings: { poHorizonDays, horizonDays, includeUnconfirmed, includeDrafts, draftsCount, excludeBeforeDate },
+        settings: { poHorizonDays, horizonDays, includeUnconfirmed, includeDrafts, draftsCount, excludeBeforeDate, netFgOnHand },
         summary: {
           ordersConsidered: mrpOrders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom + skipped.excludedByDate),
           requirementCount: requirements.length,
@@ -1675,10 +1690,11 @@ async function executeAITool(name, input, context) {
           deferredDollars: Math.round(deferredDollars * 100) / 100,
           missingCostCount,
         },
+        fgNettingSummary: fgNettingSummary || [],
         suggestedPOs: inWindow.slice().sort(byCostDesc).slice(0, topN).map(trim),
         deferredPOs: deferred.slice().sort(byCostDesc).slice(0, topN).map(trim),
         atRiskOrders: atRiskOrders.slice(0, 30).map(trimAtRisk),
-        note: "suggestedPOs = top-N by line cost (highest $ first). To trace why a PO looks off, call get_orders to see scheduled MOs, then bom_expand on the suspect FG/WIP SKUs to see how much of the RM they require — sum those against onHand for the same picture MRP saw.",
+        note: "suggestedPOs = top-N by line cost (highest $ first). fgNettingSummary lists FG SKUs where on-hand stock offset planned production (RM demand is net of that). If a demand number looks lower than expected, check fgNettingSummary — the FG might already be in inventory. To trace deeper, call trace_po_demand which shows per-order gross vs net qty.",
       };
     }
 
@@ -4686,6 +4702,72 @@ function buildRequirements(orders, bomParents, opts) {
   // already been produced. opts.excludeBeforeDate is a YYYY-MM-DD string.
   const excludeBeforeDate = opts.excludeBeforeDate || null;
 
+  // ── FG-level netting (default ON for planning use) ────────────────────────
+  // Real MRP nets on-hand at every BOM level, not just leaf RM. If we already
+  // have 5,000 kg of a finished good on the shelf, a pipeline draft for
+  // 15,000 kg of that same FG only needs 10,000 kg of NEW production — which
+  // means only 10,000 kg × recipe worth of raw materials. Without this step
+  // the RM demand is inflated by whatever FG stock we're carrying.
+  //
+  // Uses onHandBySku[fgSku].available (on-hand minus SO allocations) so we
+  // don't double-count FG that's already been committed to a customer
+  // shipment. Consumes FIFO by need-by-date so the earliest-scheduled order
+  // gets first crack at the free stock (matches how a scheduler would think
+  // about it — if the FG is on the shelf right now, cover the nearest need
+  // first). Records the offset on each order so trace_po_demand can surface
+  // the "netted by FG on-hand" note in attributions.
+  const netFgOnHand = opts.netFgOnHand !== false && opts.onHandBySku && Object.keys(opts.onHandBySku).length > 0;
+  const fgNetted = new Map(); // fgSku -> {consumedByOrder: Map<orderId, kg>, totalConsumed}
+  if (netFgOnHand) {
+    // Group orders by fgSku (after extractBomSku), sort each group by needBy.
+    const byFg = new Map();
+    for (const o of orders) {
+      if (!o.sku) continue;
+      const fg = extractBomSku(o.sku, bomParents);
+      if (!fg) continue;
+      const plannedQty = o.total || (o.qty || 0) * (o.batches || 1);
+      if (plannedQty <= 0) continue;
+      const needBy = o.start && o.start < opts.today ? opts.today : o.start;
+      if (!byFg.has(fg)) byFg.set(fg, []);
+      byFg.get(fg).push({ order: o, fgSku: fg, plannedQty, needBy });
+    }
+    for (const [fg, entries] of byFg) {
+      const oh = opts.onHandBySku[fg];
+      if (!oh) continue;
+      let available = Math.max(0, Number(oh.available || 0));
+      if (available <= 0) continue;
+      entries.sort((a, b) => String(a.needBy || "").localeCompare(String(b.needBy || "")));
+      const consumedByOrder = new Map();
+      let totalConsumed = 0;
+      for (const e of entries) {
+        if (available <= 0) break;
+        const take = Math.min(available, e.plannedQty);
+        if (take <= 0) continue;
+        consumedByOrder.set(e.order.id || e.order.orderId || String(Math.random()), take);
+        available -= take;
+        totalConsumed += take;
+        // Mutate a per-order shadow — DO NOT touch the input order object.
+        // We store the offset on the entry itself and consult it below.
+        e.netPlannedQty = e.plannedQty - take;
+        e.fgOffsetKg = take;
+      }
+      fgNetted.set(fg, { totalConsumed, availableRemaining: available, consumedByOrder });
+    }
+    // Build a fast lookup: order.id → { netPlannedQty, fgOffsetKg }
+    opts._perOrderNet = new Map();
+    for (const [, entries] of byFg) {
+      for (const e of entries) {
+        if (e.netPlannedQty != null) {
+          opts._perOrderNet.set(e.order.id || e.order.orderId, {
+            netPlannedQty: e.netPlannedQty,
+            fgOffsetKg: e.fgOffsetKg,
+            fgSku: e.fgSku,
+          });
+        }
+      }
+    }
+  }
+
   for (const o of orders) {
     // Pipeline-draft synthetic orders bypass the "unconfirmed" filter —
     // they're inherently unconfirmed (no operator has booked them) and
@@ -4696,13 +4778,28 @@ function buildRequirements(orders, bomParents, opts) {
     if (o.start > horizonEnd) { skipped.outsideHorizon++; continue; }
     if (excludeBeforeDate && o.start < excludeBeforeDate) { skipped.excludedByDate++; continue; }
 
-    const plannedQty = o.total || (o.qty || 0) * (o.batches || 1);
-    if (!o.sku || plannedQty <= 0) { skipped.noBom++; continue; }
+    const grossPlannedQty = o.total || (o.qty || 0) * (o.batches || 1);
+    if (!o.sku || grossPlannedQty <= 0) { skipped.noBom++; continue; }
 
     const fgSku = extractBomSku(o.sku, bomParents);
     if (!fgSku) {
       skipped.noBom++;
       if (noBomExamples.length < 5) noBomExamples.push({ orderId: o.orderId, sku: o.sku });
+      continue;
+    }
+
+    // Apply FG-level netting: if this order's FG has on-hand available and
+    // we consumed some of it earlier in the FIFO pass, expand at the net
+    // production qty (gross minus what FG on-hand covered). Requirements
+    // carry both grossFgQty and netFgQty so trace_po_demand can show the
+    // offset explicitly.
+    const netEntry = opts._perOrderNet && opts._perOrderNet.get(o.id || o.orderId);
+    const netPlannedQty = netEntry ? netEntry.netPlannedQty : grossPlannedQty;
+    const fgOffsetKg = netEntry ? netEntry.fgOffsetKg : 0;
+    if (netPlannedQty <= 0) {
+      // FG on-hand fully covers this order — no new production needed, no
+      // RM demand. Still record a zero-demand "requirement" so callers can
+      // see the order was considered and fully offset.
       continue;
     }
 
@@ -4713,7 +4810,7 @@ function buildRequirements(orders, bomParents, opts) {
     // qtyToProduce=1 BOM is misread as 1,050 cases and overstates
     // material need by ~case-weight (~8x for PFS).
     const overrideKgPerUnit = (opts.supply && opts.supply.perSku && opts.supply.perSku[fgSku] && opts.supply.perSku[fgSku].kgPerUnit) || null;
-    const expandQty = overrideKgPerUnit ? (plannedQty / overrideKgPerUnit) : plannedQty;
+    const expandQty = overrideKgPerUnit ? (netPlannedQty / overrideKgPerUnit) : netPlannedQty;
 
     let expansion;
     try { expansion = expandBom(bomParents, fgSku, expandQty, { applyWastage: opts.applyWastage }); }
@@ -4732,11 +4829,29 @@ function buildRequirements(orders, bomParents, opts) {
         neededByDate: neededBy,
         sourceOrderId: o.orderId || o.id,
         sourceFgSku: fgSku,
-        sourceFgQty: plannedQty,
+        sourceFgQty: netPlannedQty,           // qty this contribution is based on
+        sourceFgGrossQty: grossPlannedQty,    // original planned qty pre-netting
+        sourceFgOffsetKg: fgOffsetKg,         // kg absorbed by FG on-hand
       });
     }
   }
-  return { requirements, skipped, noBomExamples };
+  // Summary of FG offsets applied — attached to the return so run_mrp can
+  // surface "we skipped X kg of production because FG stock covered it" in
+  // its response, which explains the delta vs the pre-netting demand.
+  const fgNettingSummary = [];
+  if (netFgOnHand) {
+    for (const [fgSku, info] of fgNetted) {
+      if (info.totalConsumed > 0) {
+        fgNettingSummary.push({
+          fgSku,
+          totalConsumedKg: Math.round(info.totalConsumed * 1000) / 1000,
+          availableRemainingKg: Math.round(info.availableRemaining * 1000) / 1000,
+          ordersOffset: info.consumedByOrder.size,
+        });
+      }
+    }
+  }
+  return { requirements, skipped, noBomExamples, fgNettingSummary };
 }
 
 // A BOM leaf is "procurable" if it looks like a real RM, packaging, or
@@ -4934,8 +5049,10 @@ app.get("/api/mrp/run", (req, res) => {
       mrpOrders = orders.concat(synth);
     }
 
-    const { requirements, skipped, noBomExamples } = buildRequirements(mrpOrders, bomParents, {
+    const netFgOnHandFlag = req.query.netFgOnHand !== "false"; // default true
+    const { requirements, skipped, noBomExamples, fgNettingSummary } = buildRequirements(mrpOrders, bomParents, {
       today, horizonDays, includeUnconfirmed, applyWastage, excludeBeforeDate, supply,
+      onHandBySku, netFgOnHand: netFgOnHandFlag,
     });
     const { skuResults, suggestedPOs, atRiskOrders } = allocateAndPlan(requirements, onHandBySku, supply, today, poHorizonEndDate);
 
@@ -4993,7 +5110,8 @@ app.get("/api/mrp/run", (req, res) => {
       ok: true,
       runAt: new Date().toISOString(),
       today,
-      settings: { includeUnconfirmed, applyWastage, horizonDays, excludeBeforeDate, includeDrafts, draftsCount, poHorizonDays, poHorizonEndDate },
+      settings: { includeUnconfirmed, applyWastage, horizonDays, excludeBeforeDate, includeDrafts, draftsCount, poHorizonDays, poHorizonEndDate, netFgOnHand: netFgOnHandFlag },
+      fgNettingSummary: fgNettingSummary || [],
       summary: {
         ordersConsidered: mrpOrders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom + skipped.excludedByDate),
         ordersSkipped: skipped,
