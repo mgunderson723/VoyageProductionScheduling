@@ -1501,14 +1501,25 @@ async function executeAITool(name, input, context) {
         };
       }
 
+      // Group by (orderId, sourceFgSku) — NOT just orderId. Pipeline drafts
+      // for the same customer+month collapse to one orderId
+      // (PIPELINE-<customer>-YYYY-MM) but can span multiple SKUs (e.g.
+      // Cargill US Dec 2026 = FG-888-859 Inclusion + FG-888-858 Coating).
+      // Real MOs can also share an orderId across sub-batches (MO-00293/1,
+      // MO-00293/2 both have orderId "MO-00293"). Grouping on orderId alone
+      // sums totalQtyKg correctly across contributions but reports
+      // sourceFgQty from ONLY the first one seen, so the ratio displayed
+      // looks impossible (e.g. "6,000 kg FG needs 7,046 kg RM" when the
+      // reality is 4+ pipeline drafts totaling ~26,000 kg of FG). Keying on
+      // (orderId, sourceFgSku) sums both sides consistently.
       const bySource = new Map();
       for (const r of matching) {
-        const key = r.sourceOrderId || "(unknown)";
+        const key = (r.sourceOrderId || "(unknown)") + "|" + (r.sourceFgSku || "");
         if (!bySource.has(key)) {
           bySource.set(key, {
             sourceOrderId: r.sourceOrderId,
             sourceFgSku: r.sourceFgSku,
-            sourceFgQty: r.sourceFgQty,
+            sourceFgQty: 0,
             totalQtyKg: 0,
             neededByEarliest: null,
             contributionCount: 0,
@@ -1516,6 +1527,7 @@ async function executeAITool(name, input, context) {
         }
         const entry = bySource.get(key);
         entry.totalQtyKg += r.qtyKg;
+        entry.sourceFgQty += Number(r.sourceFgQty || 0);
         entry.contributionCount += 1;
         if (!entry.neededByEarliest || (r.neededByDate && r.neededByDate < entry.neededByEarliest)) {
           entry.neededByEarliest = r.neededByDate;
