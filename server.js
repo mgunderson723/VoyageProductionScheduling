@@ -5064,6 +5064,59 @@ app.get("/api/cin7/boms/sync-status", (req, res) => {
   });
 });
 
+// GET /api/cin7/boms/debug-probe — admin diagnostic. Probes a set of
+// candidate Cin7 endpoints that likely expose Production BOMs in bulk,
+// reports HTTP status + first ~400 chars of response body for each. Used
+// once to figure out which endpoint Cin7 exposes for this tenant, so the
+// sync can be rewritten as a bulk pull instead of per-product detail.
+app.get("/api/cin7/boms/debug-probe", requireAdmin, async (req, res) => {
+  const candidates = [
+    "/productionBOM?Page=1&Limit=5",
+    "/productionBOMList?Page=1&Limit=5",
+    "/productionBOMs?Page=1&Limit=5",
+    "/productionBOM/list?Page=1&Limit=5",
+    "/productionBom?Page=1&Limit=5",
+    "/productionBomList?Page=1&Limit=5",
+    "/manufacturing/bom?Page=1&Limit=5",
+    "/manufacturing/productionBOM?Page=1&Limit=5",
+    "/bom?Page=1&Limit=5",
+    "/bomList?Page=1&Limit=5",
+    "/ref/productionBOM",
+    "/ref/bom",
+  ];
+  const results = [];
+  for (const path of candidates) {
+    const url = `https://inventory.dearsystems.com/ExternalApi/v2${path}`;
+    try {
+      const resp = await fetch(url, { headers: cin7Headers(), redirect: "follow" });
+      const text = await resp.text().catch(() => "");
+      const trimmed = text.slice(0, 400);
+      // Try to detect success even if 200 (some Cin7 endpoints return {"Error":"..."} with 200)
+      let looksLikeSuccess = resp.ok && !/error|not found|invalid/i.test(trimmed.slice(0, 100));
+      results.push({
+        path,
+        status: resp.status,
+        ok: resp.ok,
+        looksLikeSuccess,
+        contentType: resp.headers.get("content-type") || "",
+        bodyPreview: trimmed,
+      });
+    } catch (e) {
+      results.push({ path, error: e.message });
+    }
+    // Small pause between probes to be polite to Cin7's rate limit
+    await new Promise(r => setTimeout(r, 300));
+  }
+  const winners = results.filter(r => r.looksLikeSuccess);
+  res.json({
+    ok: true,
+    checked: results.length,
+    winnerCount: winners.length,
+    winners: winners.map(w => w.path),
+    results,
+  });
+});
+
 // GET /api/cin7/boms/debug-detail?sku=FG-XXX — admin diagnostic. Fetches
 // the raw Cin7 product detail for one SKU and returns the top-level keys
 // plus the FULL response (truncated body up to ~50 kB). Used to figure out
