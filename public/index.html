@@ -1146,11 +1146,12 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
     <div id="trace-result" style="display:none;">
       <div id="trace-result-header" class="trace-result-header"></div>
       <div id="trace-dq-banner" class="trace-dq-banner" style="display:none;"></div>
-      <div class="trace-view-tabs" id="trace-view-tabs">
+      <div class="trace-view-tabs" id="trace-view-tabs" style="display:flex;align-items:center;">
         <button class="trace-view-tab active" data-view="timeline" onclick="setTraceView('timeline')">Timeline</button>
         <button class="trace-view-tab" data-view="lineage" onclick="setTraceView('lineage')">Lineage tree</button>
         <button class="trace-view-tab" data-view="forward" onclick="setTraceView('forward')">Forward trace</button>
         <button class="trace-view-tab" data-view="ledger" onclick="setTraceView('ledger')">Ledger + balance</button>
+        <button class="btn btn-sm btn-ghost" onclick="downloadTraceViewCsv()" title="Download current view as CSV (auditor-friendly, opens in Excel)" style="margin-left:auto;">⬇ Download CSV</button>
       </div>
       <div id="trace-view-body"></div>
     </div>
@@ -4072,6 +4073,17 @@ async function renderTraceability() {
     }
     await loadTraceabilitySummary();
   }
+  // URL-param support: ?trace=<lot> or ?trace_ref=<ref> or ?trace_sku=<sku>
+  // auto-runs the search on tab activation. Enables:
+  //   1. Right-click "Open in new tab" on drill-in links (native browser)
+  //   2. Deep links from Slack / email / bug reports
+  //   3. Browser back button working correctly across drill-ins
+  const params = new URLSearchParams(window.location.search);
+  const preload = params.get('trace') || params.get('trace_lot') || params.get('trace_ref') || params.get('trace_sku');
+  if (preload && preload !== _traceState.lastQuery) {
+    document.getElementById('trace-search-input').value = preload;
+    runTraceabilitySearch();
+  }
 }
 
 async function loadTraceabilitySummary() {
@@ -4189,12 +4201,16 @@ function renderStaleLotsTable(lots) {
     const balCls = l.running_balance < 0 ? 'color:var(--vf-danger-text);' : '';
     const cat = l.category || '—';
     const catCls = 'trace-tree-node-cat';
-    return `<tr onclick="jumpToLotFromStale('${esc(l.batch)}')" style="cursor:pointer;">
+    // Use an <a> on the lot cell so Cmd/Ctrl+click on the lot code opens a
+    // fresh Traceability search in a new tab. Plain row click still jumps
+    // in-place via the onclick handler.
+    const lotLink = `<a href="?trace=${encodeURIComponent(l.batch)}" onclick="event.stopPropagation();" title="Click to drill in · Cmd/Ctrl+click to open in a new tab" style="color:inherit;text-decoration:none;">${escapeHtml(l.batch)}</a>`;
+    return `<tr onclick="jumpToLotFromStale('${esc(l.batch)}', event)" style="cursor:pointer;">
       <td style="text-align:right;font-variant-numeric:tabular-nums;${idleCls}">${l.days_idle}d</td>
       <td><span class="${catCls}">${escapeHtml(cat)}</span></td>
       <td style="white-space:nowrap;">${escapeHtml(l.sku || '')}</td>
       <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(l.product || '')}">${escapeHtml((l.product || '').slice(0, 42))}</td>
-      <td style="font-family:var(--vf-font-mono, monospace);font-size:12px;">${escapeHtml(l.batch)}</td>
+      <td style="font-family:var(--vf-font-mono, monospace);font-size:12px;">${lotLink}</td>
       <td style="text-align:right;font-variant-numeric:tabular-nums;${balCls}">${bal} <span style="color:var(--vf-text-tertiary);font-size:11px;">${escapeHtml(l.unit || '')}</span></td>
       <td style="white-space:nowrap;">${escapeHtml(l.last_movement_date || '')}</td>
       <td style="white-space:nowrap;font-size:12px;color:var(--vf-text-secondary);">${escapeHtml(l.last_reference || '')} ${l.last_movement_type ? `<span style="color:var(--vf-text-tertiary);font-size:10px;">(${escapeHtml(l.last_movement_type)})</span>` : ''}</td>
@@ -4222,7 +4238,9 @@ function renderStaleLotsTable(lots) {
   </div>`;
 }
 
-function jumpToLotFromStale(lotCode) {
+function jumpToLotFromStale(lotCode, ev) {
+  // Cmd/Ctrl/Shift+click → let native anchor take over (opens new tab).
+  if (ev && (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.button === 1)) return true;
   document.getElementById('trace-search-input').value = lotCode;
   toggleStaleLotsView(); // close the panel
   runTraceabilitySearch();
@@ -4260,6 +4278,166 @@ function downloadStaleLotsCsv() {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+// ── CSV export for the four Traceability views ─────────────────────────────
+// One entry point that adapts to _traceState.view. Timeline / Ledger export
+// as flat movement rows; Lineage / Forward flatten the recursive tree with
+// hierarchy columns (depth, path, parent_lot) so an auditor opening it in
+// Excel can filter to a specific chain level or pivot on parent.
+
+function _csvEscape(v) {
+  if (v == null) return '';
+  const s = String(v);
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function _csvBuild(headers, rows, metaLines) {
+  const meta = (metaLines || []).map(l => `# ${l}`).join('\n');
+  const head = headers.join(',');
+  const body = rows.map(r => headers.map(h => _csvEscape(r[h])).join(',')).join('\n');
+  return (meta ? meta + '\n' : '') + head + '\n' + body + '\n';
+}
+
+function _csvDownload(csv, filename) {
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function _flattenMovementRow(m) {
+  // Common shape used by Timeline / Ledger exports.
+  return {
+    movement_date: (m.movement_date || '').slice(0, 10),
+    ref_type: m.ref_type || '',
+    reference: m.reference || '',
+    ref_number: m.ref_number || '',
+    movement_type: m.movement_type || '',
+    sku: m.sku || '',
+    product: m.product || '',
+    unit: m.unit || '',
+    qty_in: m.qty_in != null ? m.qty_in : '',
+    qty_out: m.qty_out != null ? m.qty_out : '',
+    running_balance: m.running_balance != null ? m.running_balance : '',
+    cost_in: m.cost_in != null ? m.cost_in : '',
+    cost_out: m.cost_out != null ? m.cost_out : '',
+    batch: m.batch || '',
+    location: m.location || '',
+    expiry_date: m.expiry_date || '',
+    document_reference: m.document_reference || '',
+    dq_notes: (m.dq_notes || []).map(n => n.id).join('; '),
+  };
+}
+
+// Walk a lineage/forward tree, emitting one CSV row per node with path +
+// depth so hierarchy is preserved. Root is depth 0.
+function _flattenTreeToCsv(node, depth, path, parentLot, rows, kind) {
+  if (!node) return;
+  const nodePath = path ? path + ' > ' + (node.sku || node.lot || '?') : (node.sku || node.lot || 'root');
+  rows.push({
+    depth,
+    path: nodePath,
+    parent_lot: parentLot || '',
+    lot: node.lot || '',
+    sku: node.sku || '',
+    product: node.product || '',
+    category: node.category || '',
+    unit: node.unit || '',
+    qty: node.qty != null ? node.qty : (node.qty_produced != null ? node.qty_produced : ''),
+    still_on_hand: node.still_on_hand != null ? node.still_on_hand : '',
+    producing_mo: node.producing_mo || '',
+    producing_date: node.producing_date || '',
+    origin_reference: node.origin ? node.origin.reference : '',
+    origin_date: node.origin ? String(node.origin.movement_date || '').slice(0, 10) : '',
+    note: node.note || '',
+  });
+  // For forward-trace nodes, add rows for downstream destinations too.
+  if (kind === 'forward') {
+    for (const s of (node.shipments || [])) {
+      rows.push({ depth: depth + 1, path: nodePath + ' > SHIPMENT', parent_lot: node.lot || '', lot: '', sku: '', category: 'SHIPMENT', qty: s.qty, unit: s.unit, note: `${s.ref} on ${(s.date || '').slice(0,10)}${s.location ? ' from ' + s.location : ''}` });
+    }
+    for (const t of (node.transfers_out || [])) {
+      rows.push({ depth: depth + 1, path: nodePath + ' > TRANSFER', parent_lot: node.lot || '', lot: '', sku: '', category: 'TRANSFER', qty: t.qty, unit: t.unit, note: `${t.ref} on ${(t.date || '').slice(0,10)}${t.from ? ' from ' + t.from : ''}` });
+    }
+    for (const a of (node.adjustments_out || [])) {
+      rows.push({ depth: depth + 1, path: nodePath + ' > ADJUSTMENT', parent_lot: node.lot || '', lot: '', sku: '', category: 'ADJUSTMENT', qty: a.qty, unit: a.unit, note: `${a.ref} on ${(a.date || '').slice(0,10)}${a.document_reference ? ' — ' + a.document_reference : ''}` });
+    }
+    for (const asm of (node.assemblies || [])) {
+      rows.push({ depth: depth + 1, path: nodePath + ' > ASSEMBLY', parent_lot: node.lot || '', lot: '', sku: '', category: 'ASSEMBLY', qty: asm.qty, unit: asm.unit, note: `${asm.ref} on ${(asm.date || '').slice(0,10)} — ${asm.note || ''}` });
+    }
+    for (const c of (node.consumed_by_mos || [])) {
+      const moLabel = `${c.mo} on ${(c.date || '').slice(0,10)} — consumed ${c.qty_consumed} ${c.unit || ''}`;
+      for (const o of (c.produced_outputs || [])) {
+        _flattenTreeToCsv(o, depth + 1, nodePath + ' > ' + c.mo, node.lot || '', rows, kind);
+      }
+      if (!(c.produced_outputs || []).length) {
+        rows.push({ depth: depth + 1, path: nodePath + ' > ' + c.mo, parent_lot: node.lot || '', lot: '', sku: '', category: 'MO (no outputs)', qty: c.qty_consumed, unit: c.unit, note: moLabel });
+      }
+    }
+  } else {
+    // Lineage tree (upstream): recurse on inputs
+    for (const inp of (node.inputs || [])) {
+      _flattenTreeToCsv(inp, depth + 1, nodePath, node.lot || '', rows, kind);
+    }
+  }
+}
+
+function downloadTraceViewCsv() {
+  const s = _traceState;
+  if (!s || !s.lastResult) { alert('Nothing to export — run a search first.'); return; }
+  const { primary, extra } = s.lastResult;
+  const view = s.view;
+  const q = (s.lastQuery || 'trace').replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 60);
+  const today = new Date().toISOString().slice(0, 10);
+  const filename = `traceability-${view}-${q}-${today}.csv`;
+  const meta = [
+    `Voyage Traceability export`,
+    `view: ${view}`,
+    `query: ${s.lastQuery}  (kind: ${s.lastKind})`,
+    `exported_at: ${new Date().toISOString()}`,
+  ];
+
+  let headers, rows;
+
+  if (view === 'timeline') {
+    const movements = primary.movements || primary.timeline || [];
+    rows = movements.map(_flattenMovementRow);
+    headers = ['movement_date', 'ref_type', 'reference', 'ref_number', 'movement_type', 'sku', 'product', 'unit', 'qty_in', 'qty_out', 'cost_in', 'cost_out', 'batch', 'location', 'expiry_date', 'document_reference', 'dq_notes'];
+    if (!rows.length) { alert('No movements to export.'); return; }
+  } else if (view === 'ledger') {
+    const rm = extra.rm;
+    if (!rm || !rm.timeline) { alert('Ledger unavailable to export.'); return; }
+    rows = rm.timeline.map(_flattenMovementRow);
+    headers = ['movement_date', 'ref_type', 'reference', 'ref_number', 'movement_type', 'sku', 'product', 'unit', 'qty_in', 'qty_out', 'running_balance', 'cost_in', 'cost_out', 'batch', 'location', 'expiry_date', 'document_reference', 'dq_notes'];
+    meta.push(`final_balance: ${rm.final_balance}`);
+    if (!rows.length) { alert('No ledger rows to export.'); return; }
+  } else if (view === 'lineage') {
+    const upstream = extra.lineage && extra.lineage.upstream;
+    if (!upstream) { alert('Lineage unavailable to export.'); return; }
+    rows = [];
+    _flattenTreeToCsv(upstream, 0, '', '', rows, 'lineage');
+    headers = ['depth', 'path', 'parent_lot', 'lot', 'sku', 'product', 'category', 'unit', 'qty', 'producing_mo', 'producing_date', 'origin_reference', 'origin_date', 'note'];
+  } else if (view === 'forward') {
+    const forward = extra.forward;
+    if (!forward) { alert('Forward trace unavailable to export.'); return; }
+    rows = [];
+    const roots = forward.kind === 'mo' ? (forward.outputs_produced || []) : (forward.forward ? [forward.forward] : []);
+    for (const r of roots) _flattenTreeToCsv(r, 0, '', '', rows, 'forward');
+    headers = ['depth', 'path', 'parent_lot', 'lot', 'sku', 'product', 'category', 'unit', 'qty', 'still_on_hand', 'producing_mo', 'producing_date', 'note'];
+    if (!rows.length) { alert('No forward-trace rows to export.'); return; }
+  } else {
+    alert('Unknown view: ' + view);
+    return;
+  }
+
+  const csv = _csvBuild(headers, rows, meta);
+  _csvDownload(csv, filename);
 }
 
 // Detect what the user typed: SKU / reference / lot code.
@@ -4348,10 +4526,40 @@ async function runTraceabilitySearch() {
   _traceState.lastKind = kind;
   _traceState.view = 'timeline';
 
+  // Push a browser history entry so ↩ Back returns to the previous trace
+  // (or to whatever URL the user came from). Enables Cmd+click on
+  // drill-in links to open in a new tab via the browser's native handling
+  // of <a href> — we just set the URL so a fresh page load knows what to
+  // preload. Uses pushState so we don't reload the page.
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.set('trace', q);
+    // Only push if the URL actually changed — otherwise repeated Enter
+    // clutters the history stack.
+    if (url.toString() !== window.location.href) {
+      window.history.pushState({ trace: q }, '', url.toString());
+    }
+  } catch (_) { /* URL API missing (very old browser) — no-op */ }
+
   renderTraceResultHeader(primary, kind, q, extra);
   updateTraceViewTabs(kind, primary, extra);
   renderTraceView();
 }
+
+// Handle browser Back / Forward — re-run the search from URL params.
+window.addEventListener('popstate', () => {
+  const params = new URLSearchParams(window.location.search);
+  const q = params.get('trace') || params.get('trace_lot') || params.get('trace_ref') || params.get('trace_sku');
+  const input = document.getElementById('trace-search-input');
+  if (!input) return;
+  if (q && q !== _traceState.lastQuery) {
+    input.value = q;
+    runTraceabilitySearch();
+  } else if (!q && _traceState.lastResult) {
+    // User backed out of a traced result — clear the view.
+    clearTraceabilityResult();
+  }
+});
 
 function renderTraceResultHeader(primary, kind, q, extra) {
   const hdr = document.getElementById('trace-result-header');
@@ -4600,7 +4808,10 @@ function renderForwardNodeLabel(node) {
   const soh = node.still_on_hand != null
     ? `<span style="color:${node.still_on_hand > 0 ? 'var(--vf-success-text)' : node.still_on_hand < 0 ? 'var(--vf-danger-text)' : 'var(--vf-text-tertiary)'};font-weight:500;">still ${Number(node.still_on_hand).toLocaleString(undefined,{maximumFractionDigits:2})} ${escapeHtml(node.unit || '')}</span>`
     : '';
-  const jump = node.lot ? ` <a href="#" onclick="jumpToLotFromForward('${esc(node.lot)}');return false;" style="font-size:11px;">↗ drill in</a>` : '';
+  // Real <a href> so Cmd/Ctrl+click opens in a new tab natively. Plain
+  // click still runs in-place via the onclick handler; the href is what
+  // the browser uses for "Open Link in New Tab" from the context menu.
+  const jump = node.lot ? ` <a href="?trace=${encodeURIComponent(node.lot)}" onclick="jumpToLotFromForward('${esc(node.lot)}', event);return false;" style="font-size:11px;" title="Click to drill in · Cmd/Ctrl+click to open in a new tab">↗ drill in</a>` : '';
   const noteBadge = node.note ? ` <span style="color:var(--vf-warning-text);font-size:11px;">⚠ ${escapeHtml(node.note)}</span>` : '';
   return `${catPill}<span class="trace-tree-node-sku">${sku}</span> <span class="trace-tree-node-lot">${lot}</span> <span class="trace-tree-node-qty">${escapeHtml(producedInfo)}</span> ${soh}${jump}${noteBadge}`;
 }
@@ -4652,7 +4863,11 @@ function renderForwardDestinations(node) {
   return parts.join('');
 }
 
-function jumpToLotFromForward(lotCode) {
+function jumpToLotFromForward(lotCode, ev) {
+  // If the user held Cmd/Ctrl (or middle-click / shift), let the browser
+  // handle the anchor natively — opens the ?trace=<lot> URL in a new tab.
+  // Otherwise take over: replace the search box and re-run inline.
+  if (ev && (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.button === 1)) return true;
   document.getElementById('trace-search-input').value = lotCode;
   runTraceabilitySearch();
 }
@@ -6097,6 +6312,23 @@ function aiJumpToDate(dateStr) {
   const monToday = getMon(today);
   const diffDays = Math.round((target - monToday) / 86400000);
   calOffset = Math.floor(diffDays / 7);
+  // Deep-link support: if the URL has ?trace=<lot> (or ?tab=<name>), boot
+  // into that tab instead of the default Calendar. Enables shareable trace
+  // URLs and Cmd/Ctrl+click "open in new tab" on drill-in links.
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('trace') || params.get('trace_lot') || params.get('trace_ref') || params.get('trace_sku')) {
+      switchTab('traceability');
+      renderCal();
+      return;
+    }
+    const forcedTab = params.get('tab');
+    if (forcedTab) {
+      switchTab(forcedTab);
+      renderCal();
+      return;
+    }
+  } catch (_) { /* fall through to default */ }
   switchTab('calendar');
   renderCal();
 }
