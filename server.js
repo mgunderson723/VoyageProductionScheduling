@@ -4815,7 +4815,11 @@ async function fetchCin7BomCandidates() {
     if (!p.SKU || !p.ID) return false;
     const t = String(p.Type || "").toLowerCase();
     const sku = String(p.SKU).toUpperCase();
-    return t.includes("assembl") || sku.startsWith("FG-") || sku.startsWith("WIP-");
+    // Match FG-* and any WIP variant (WIP-, WIP2-, WIP3-, ...). Original
+    // filter of startsWith("WIP-") missed the whole WIP2-* series because
+    // "WIP2-".startsWith("WIP-") is false — a subtle string-prefix bug that
+    // silently dropped the entire conching stage from the sync.
+    return t.includes("assembl") || sku.startsWith("FG-") || /^WIP\d*-/.test(sku);
   });
 }
 
