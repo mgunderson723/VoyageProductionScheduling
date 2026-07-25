@@ -4838,59 +4838,76 @@ async function fetchCin7ProductDetail(productID) {
   return data;
 }
 
-// Translate a single Cin7 BillOfMaterials entry into the vf_boms bucket shape.
-// Mirrors parseBomCsv's component projection so downstream code is agnostic.
-function translateCin7Bom(product, bomEntry) {
-  const version = String(bomEntry.Version != null ? bomEntry.Version : (bomEntry.VersionNo != null ? bomEntry.VersionNo : 1));
-  const rawComponents = Array.isArray(bomEntry.Components) ? bomEntry.Components
-                       : Array.isArray(bomEntry.Lines) ? bomEntry.Lines
-                       : [];
+// Hits the correct Cin7 Production BOM endpoint — confirmed via debug probe.
+// Response shape: { ProductID, ProductionBoms: [{ BomID, OutputQuantity,
+// Version, Name, IsDefault, ComponentProductionLeadTime, Operations: [{
+// Order, Name, WorkCenterName, Components: [{ ProductSku, ProductName,
+// Quantity, WastagePercent, ... }] }] }] }
+async function fetchCin7ProductionBom(productID) {
+  const url = `https://inventory.dearsystems.com/ExternalApi/v2/production/productionBOM?ProductID=${encodeURIComponent(productID)}`;
+  const resp = await fetch(url, { headers: cin7Headers(), redirect: "follow" });
+  const ct = resp.headers.get("content-type") || "";
+  const text = await resp.text().catch(() => "");
+  if (resp.status === 429) {
+    const err = new Error("Cin7 rate limit hit (429)");
+    err.retryable = true;
+    throw err;
+  }
+  // 404 = no BOM for this product — return empty, not an error.
+  if (resp.status === 404) return { ProductID: productID, ProductionBoms: [] };
+  if (!resp.ok) throw new Error(`Cin7 productionBOM ${resp.status} [${ct}]: ${text.slice(0, 300)}`);
+  let data;
+  try { data = JSON.parse(text); }
+  catch (_) { throw new Error(`Cin7 productionBOM ${resp.status} non-JSON [${ct}]: ${text.slice(0, 300)}`); }
+  return data || { ProductID: productID, ProductionBoms: [] };
+}
+
+// Translate one Cin7 ProductionBom entry into the vf_boms bucket shape.
+// Cin7's response nests components inside Operations[], so we flatten
+// operations into a single component list while carrying operation-level
+// metadata (Order → op, Name → opName, WorkCenterName → workCentre).
+// Mirrors parseBomCsv's projection so downstream MRP/expansion code is
+// agnostic to whether the data came from CSV or the API.
+function translateCin7ProductionBom(product, bomEntry) {
+  const version = String(bomEntry.Version != null ? bomEntry.Version : 1);
   const components = [];
-  for (const c of rawComponents) {
-    if (!c) continue;
-    // Cin7 detail rows carry an ItemType similar to the CSV; if present, skip
-    // Output/Resource just like parseBomCsv does. Otherwise assume component.
-    const itemType = String(c.ItemType || "Component");
-    if (itemType === "Output" || itemType === "Resource") continue;
-    const sku = c.SKU || c.ComponentSKU || c.ProductSKU || c.ComponentSKU_ResourceCode;
-    if (!sku) continue;
-    components.push({
-      sku,
-      name: c.Name || c.ProductName || c.ComponentName || "",
-      qty: Number(c.Quantity) || 0,
-      wastagePct: Number(c.Wastage != null ? c.Wastage : (c.WastagePercent != null ? c.WastagePercent : 0)) || 0,
-      op: parseInt(c.OperationSequence || c.OperationOrder || c.Sequence || 1, 10) || 1,
-      opName: c.OperationName || "",
-      workCentre: c.WorkCentreName || c.WorkCentre || "",
-    });
+  const operations = Array.isArray(bomEntry.Operations) ? bomEntry.Operations : [];
+  for (const op of operations) {
+    const opRows = Array.isArray(op.Components) ? op.Components : [];
+    const opSeq = parseInt(op.Order, 10) || 1;
+    const opName = op.Name || "";
+    // Cin7 spells this WorkCenterName (US); parseBomCsv reads WorkCentreName
+    // (UK). Both feed deriveMachineFromBom via the same string, so we just
+    // pass whatever Cin7 hands us.
+    const workCentre = op.WorkCenterName || op.WorkCentreName || "";
+    for (const c of opRows) {
+      if (!c || !c.ProductSku) continue;
+      components.push({
+        sku: c.ProductSku,
+        name: c.ProductName || "",
+        qty: Number(c.Quantity) || 0,
+        wastagePct: Number(c.WastagePercent) || 0,
+        op: opSeq,
+        opName,
+        workCentre,
+      });
+    }
   }
   return {
     parent: product.SKU,
     parentName: product.Name || "",
     version,
-    versionName: bomEntry.VersionName || "",
-    isDefault: !!(bomEntry.IsDefault || bomEntry.Default || bomEntry.VersionDefault === "Yes"),
-    qtyToProduce: Number(bomEntry.QuantityToProduce) || 1,
+    // Cin7's ProductionBom "Name" is what the CSV calls VersionName
+    // (e.g. "Drums", "25kg boxes").
+    versionName: bomEntry.Name || "",
+    isDefault: !!bomEntry.IsDefault,
+    qtyToProduce: Number(bomEntry.OutputQuantity) || 1,
     runSize: Number(bomEntry.RunSize) || 0,
     minQty: Number(bomEntry.MinQuantity) || 0,
     maxQty: Number(bomEntry.MaxQuantity) || 0,
-    productionLeadTimeRaw: parseInt(bomEntry.ProductionLeadTime, 10) || 0,
+    productionLeadTimeRaw: parseInt(bomEntry.ComponentProductionLeadTime, 10) || 0,
     components,
   };
-}
-
-// Cin7 wraps BOM data under slightly different field names across tenants and
-// API versions — try them in order of likelihood. Returns the first non-empty
-// array found, or [] if none match.
-function _extractCin7Boms(detail) {
-  if (!detail) return { boms: [], fieldUsed: null, topLevelKeys: [] };
-  const candidates = ["BillOfMaterials", "BOM", "Boms", "BOMs", "AssemblyBOM", "AssemblyBoms", "ProductBOM", "Assembly", "AssemblyLines", "Components"];
-  for (const k of candidates) {
-    if (Array.isArray(detail[k]) && detail[k].length) {
-      return { boms: detail[k], fieldUsed: k, topLevelKeys: Object.keys(detail) };
-    }
-  }
-  return { boms: [], fieldUsed: null, topLevelKeys: Object.keys(detail) };
 }
 
 async function performCin7BomsSync() {
@@ -4899,13 +4916,12 @@ async function performCin7BomsSync() {
   const failures = [];
   let detailFetched = 0;
   let withBoms = 0;
-  let firstResponseSample = null; // stashed on first success for diagnostics
 
   for (let i = 0; i < candidates.length; i++) {
     const p = candidates[i];
-    let detail;
+    let response;
     try {
-      detail = await fetchCin7ProductDetail(p.ID);
+      response = await fetchCin7ProductionBom(p.ID);
       detailFetched++;
     } catch (e) {
       failures.push({ sku: p.SKU, error: e.message });
@@ -4913,23 +4929,12 @@ async function performCin7BomsSync() {
       await _bomSleep(e.retryable ? 5000 : 1100);
       continue;
     }
-    // Sample the first successful response so we can inspect the shape when a
-    // sync returns zero BOMs across the board — that means we're reading the
-    // wrong field. Logged + kept on the sync-state blob for the UI to surface.
-    if (!firstResponseSample) {
-      firstResponseSample = { sku: p.SKU, topLevelKeys: Object.keys(detail || {}) };
-      console.log(`[Cin7 BOMs] First detail response for ${p.SKU} — top-level keys: ${firstResponseSample.topLevelKeys.join(", ")}`);
-    }
-    const { boms, fieldUsed } = _extractCin7Boms(detail);
+    const boms = response && Array.isArray(response.ProductionBoms) ? response.ProductionBoms : [];
     if (boms.length) {
-      if (!firstResponseSample.fieldUsed) {
-        firstResponseSample.fieldUsed = fieldUsed;
-        console.log(`[Cin7 BOMs] Using response field '${fieldUsed}' for BOM extraction`);
-      }
       withBoms++;
       for (const b of boms) {
-        const entry = translateCin7Bom(p, b);
-        if (!entry.components.length) continue; // skip empty definitions
+        const entry = translateCin7ProductionBom(p, b);
+        if (!entry.components.length) continue; // skip BOM versions with no components
         const key = entry.parent + "|" + entry.version;
         bucket[key] = entry;
       }
@@ -4967,19 +4972,15 @@ async function performCin7BomsSync() {
   }
 
   // Zero-BOM guardrail: if we successfully fetched a meaningful number of
-  // product detail records and NONE of them had a recognizable BOM field,
-  // the API shape has changed (or the field-name candidates are wrong).
-  // Overwriting the prior BOMs with an empty result would silently kill
-  // MRP downstream, so refuse the write and surface what Cin7 actually
-  // returned so we can extend _extractCin7Boms.
+  // product detail records and NONE returned ProductionBoms, the API shape
+  // has changed (or Cin7 renamed the endpoint again). Overwriting the prior
+  // BOMs with an empty result would silently kill MRP downstream, so refuse
+  // the write and surface a clear error.
   if (detailFetched >= 10 && withBoms === 0) {
-    const keys = (firstResponseSample && firstResponseSample.topLevelKeys) || [];
     const err = new Error(
-      `${detailFetched} products checked, 0 had a recognizable BOM field — keeping prior BOMs. ` +
-      `First response top-level keys: [${keys.join(", ")}]. ` +
-      `If you see a BOM-related key here that isn't in _extractCin7Boms, add it to the candidates list.`
+      `${detailFetched} products checked, 0 returned a Production BOM — keeping prior BOMs. ` +
+      `Verify /production/productionBOM still works via /api/cin7/boms/debug-production-bom?sku=<any BOM'd SKU>.`
     );
-    err.firstResponseSample = firstResponseSample;
     err.detailFetched = detailFetched;
     throw err;
   }
@@ -5186,8 +5187,6 @@ app.get("/api/cin7/boms/debug-detail", requireAdmin, async (req, res) => {
     productID = match.ID;
     productName = match.Name;
     const detail = await fetchCin7ProductDetail(productID);
-    const extraction = _extractCin7Boms(detail);
-    // Return the raw response but cap the size so browsers don't choke.
     const rawJson = JSON.stringify(detail);
     const truncated = rawJson.length > 50000;
     res.json({
@@ -5195,17 +5194,10 @@ app.get("/api/cin7/boms/debug-detail", requireAdmin, async (req, res) => {
       sku,
       productID,
       productName,
-      topLevelKeys: extraction.topLevelKeys,
-      bomFieldUsed: extraction.fieldUsed,
-      bomsFound: extraction.boms.length,
-      firstBomSample: extraction.boms[0] ? Object.keys(extraction.boms[0]) : null,
-      firstComponentSample: (extraction.boms[0] && Array.isArray(extraction.boms[0].Components) && extraction.boms[0].Components[0])
-        ? Object.keys(extraction.boms[0].Components[0])
-        : null,
+      topLevelKeys: detail && typeof detail === "object" ? Object.keys(detail) : null,
       rawResponseBytes: rawJson.length,
       rawResponseTruncated: truncated,
-      raw: truncated ? JSON.parse(rawJson.slice(0, 50000) + '"}') : detail,
-      // Also include the full raw as a string field so the UI can copy it
+      raw: detail,
       rawString: truncated ? rawJson.slice(0, 50000) + "…[truncated]" : rawJson,
     });
   } catch (e) {
