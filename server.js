@@ -5125,6 +5125,42 @@ app.get("/api/cin7/boms/debug-probe", requireAdmin, async (req, res) => {
   });
 });
 
+// GET /api/cin7/boms/debug-production-bom?sku=FG-XXX — admin diagnostic.
+// Hits the confirmed Cin7 endpoint /production/productionBOM?ProductID=<id>
+// for one SKU and returns the raw response so we can wire the sync against
+// the actual shape (field names for components, wastage, etc.).
+app.get("/api/cin7/boms/debug-production-bom", requireAdmin, async (req, res) => {
+  try {
+    const sku = String(req.query.sku || "").trim();
+    if (!sku) return res.status(400).json({ ok: false, error: "sku query param required" });
+    const products = await fetchCin7ProductCosts();
+    const match = products.find(p => String(p.SKU || "").toUpperCase() === sku.toUpperCase());
+    if (!match) return res.status(404).json({ ok: false, error: `SKU ${sku} not found` });
+    const url = `https://inventory.dearsystems.com/ExternalApi/v2/production/productionBOM?ProductID=${encodeURIComponent(match.ID)}`;
+    const resp = await fetch(url, { headers: cin7Headers(), redirect: "follow" });
+    const ct = resp.headers.get("content-type") || "";
+    const text = await resp.text().catch(() => "");
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch (_) {}
+    res.json({
+      ok: true,
+      sku,
+      productID: match.ID,
+      productName: match.Name,
+      status: resp.status,
+      contentType: ct,
+      topLevelKeys: parsed && typeof parsed === "object" ? Object.keys(parsed) : null,
+      // If the response is a wrapper like { ProductionBOMs: [...] } or bare array
+      isArray: Array.isArray(parsed),
+      firstEntry: Array.isArray(parsed) ? parsed[0] : (parsed && parsed.ProductionBOMs ? parsed.ProductionBOMs[0] : (parsed && parsed.BillOfMaterials ? parsed.BillOfMaterials[0] : parsed)),
+      raw: parsed,
+      rawString: text.length > 15000 ? text.slice(0, 15000) + "…[truncated]" : text,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // GET /api/cin7/boms/debug-detail?sku=FG-XXX — admin diagnostic. Fetches
 // the raw Cin7 product detail for one SKU and returns the top-level keys
 // plus the FULL response (truncated body up to ~50 kB). Used to figure out
