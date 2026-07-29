@@ -3513,6 +3513,28 @@ function fmtUsd(v, opts) {
   return '$' + (Math.round(v * 100) / 100).toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 }
 
+// Format a qty with the SKU's Cin7 native UOM appended (e.g. "500 g",
+// "50 kg", "25 Each"). Prefer the uom passed inline (server enriches PO
+// suggestions with it); fall back to mrpCostsData if not present. Renders
+// bare qty when UOM is unknown so nothing breaks pre-cost-sync.
+function fmtQtyUom(qty, sku, uom) {
+  const q = (qty == null || !isFinite(qty)) ? 0 : qty;
+  const qStr = q.toLocaleString(undefined, { maximumFractionDigits: q < 1 ? 4 : 2 });
+  let u = uom;
+  if (!u && sku && mrpCostsData && mrpCostsData.bySku) {
+    const c = mrpCostsData.bySku[sku];
+    if (c && c.uom) u = c.uom;
+  }
+  if (!u) return qStr;
+  // Grams get emphasized visually — they're the highest-risk misread unit
+  // (1000× ordering hazard vs kg). Everything else renders muted.
+  const isGrams = /^g(rams?)?$/i.test(u);
+  const style = isGrams
+    ? 'color:var(--vf-warning-text);font-weight:600;'
+    : 'color:var(--vf-text-tertiary);';
+  return `${qStr} <span style="${style}font-size:11px;">${escapeHtml(u)}</span>`;
+}
+
 function renderMrp() {
   if (!mrpData) return;
   const s = mrpData.summary || {};
@@ -3561,7 +3583,7 @@ function renderMrpPos() {
       return `<tr>
         <td><span class="mo-id">${escapeHtml(p.sku)}</span></td>
         <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--vf-text-secondary);" title="${escapeHtml(p.name||'')}">${escapeHtml(p.name||'—')}</td>
-        <td style="text-align:right;font-variant-numeric:tabular-nums;">${(p.qtyToOrder||0).toLocaleString()}</td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;">${fmtQtyUom(p.qtyToOrder, p.sku, p.uom)}</td>
         <td style="text-align:right;">${unitCell}</td>
         <td style="text-align:right;">${lineCell}</td>
         <td>${p.leadTimeDays != null ? p.leadTimeDays + 'd' : '—'}<div style="font-size:10px;color:var(--vf-text-tertiary);">${escapeHtml(p.leadTimeSource||'')}</div></td>
@@ -3624,7 +3646,7 @@ function renderMrpSummary() {
       top.map(p => `<tr>
         <td><span class="mo-id">${escapeHtml(p.sku)}</span></td>
         <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--vf-text-secondary);" title="${escapeHtml(p.name||'')}">${escapeHtml(p.name||'—')}</td>
-        <td style="text-align:right;font-variant-numeric:tabular-nums;">${(p.qtyToOrder||0).toLocaleString()}</td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;">${fmtQtyUom(p.qtyToOrder, p.sku, p.uom)}</td>
         <td style="text-align:right;font-variant-numeric:tabular-nums;">${fmtUsd(p.unitCost, { full: true })}</td>
         <td style="text-align:right;font-variant-numeric:tabular-nums;font-weight:500;">${fmtUsd(p.lineCost, { full: true })}</td>
         <td style="white-space:nowrap;font-size:12px;${p.isOverdue?'color:var(--vf-danger-text);font-weight:600;':''}">${p.mustOrderByDate || '—'}</td>
@@ -3677,11 +3699,11 @@ function renderMrpSkus() {
   tbody.innerHTML = rows.length === 0 ? `<tr><td colspan="7" class="empty">No SKUs match.</td></tr>` :
     rows.map(r => `<tr>
       <td><span class="mo-id">${escapeHtml(r.sku)}</span><div style="font-size:10px;color:var(--vf-text-tertiary);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(r.name||'')}</div></td>
-      <td style="text-align:right;font-variant-numeric:tabular-nums;">${Math.round(r.onHand||0).toLocaleString()}</td>
-      <td style="text-align:right;font-variant-numeric:tabular-nums;color:${r.onOrder>0?'var(--vf-info-text)':'var(--vf-text-tertiary)'};">${Math.round(r.onOrder||0).toLocaleString()}</td>
-      <td style="text-align:right;font-variant-numeric:tabular-nums;color:${r.inTransit>0?'var(--vf-info-text)':'var(--vf-text-tertiary)'};">${Math.round(r.inTransit||0).toLocaleString()}</td>
-      <td style="text-align:right;font-variant-numeric:tabular-nums;font-weight:500;">${Math.round(r.totalDemand||0).toLocaleString()}</td>
-      <td style="text-align:right;font-variant-numeric:tabular-nums;color:${r.totalShort>0?'var(--vf-danger-text)':'var(--vf-success-text)'};font-weight:500;">${r.totalShort > 0 ? Math.round(r.totalShort).toLocaleString() : '—'}</td>
+      <td style="text-align:right;font-variant-numeric:tabular-nums;">${fmtQtyUom(r.onHand||0, r.sku)}</td>
+      <td style="text-align:right;font-variant-numeric:tabular-nums;color:${r.onOrder>0?'var(--vf-info-text)':'var(--vf-text-tertiary)'};">${fmtQtyUom(r.onOrder||0, r.sku)}</td>
+      <td style="text-align:right;font-variant-numeric:tabular-nums;color:${r.inTransit>0?'var(--vf-info-text)':'var(--vf-text-tertiary)'};">${fmtQtyUom(r.inTransit||0, r.sku)}</td>
+      <td style="text-align:right;font-variant-numeric:tabular-nums;font-weight:500;">${fmtQtyUom(r.totalDemand||0, r.sku)}</td>
+      <td style="text-align:right;font-variant-numeric:tabular-nums;color:${r.totalShort>0?'var(--vf-danger-text)':'var(--vf-success-text)'};font-weight:500;">${r.totalShort > 0 ? fmtQtyUom(r.totalShort, r.sku) : '—'}</td>
       <td style="font-size:11px;">${r.isContract ? '<span class="badge badge-on-hold">contract</span>' : (r.leadTimeDays + 'd')}</td>
     </tr>`).join('');
 }
@@ -3691,9 +3713,10 @@ function exportMrpCsv() {
     alert('No POs to export. Run MRP first.');
     return;
   }
-  const headers = ['SKU','Name','QtyToOrder','UnitCostUSD','LineCostUSD','LeadTimeDays','LeadTimeSource','MustOrderBy','EarliestNeed','ProjectedReceipt','Overdue'];
+  const headers = ['SKU','Name','QtyToOrder','UOM','UnitCostUSD','LineCostUSD','LeadTimeDays','LeadTimeSource','MustOrderBy','EarliestNeed','ProjectedReceipt','Overdue'];
   const rows = mrpData.suggestedPOs.map(p => [
     p.sku, p.name || '', p.qtyToOrder,
+    p.uom || (mrpCostsData && mrpCostsData.bySku && mrpCostsData.bySku[p.sku] && mrpCostsData.bySku[p.sku].uom) || '',
     p.unitCost != null ? p.unitCost : '',
     p.lineCost != null ? Math.round(p.lineCost * 100) / 100 : '',
     p.leadTimeDays != null ? p.leadTimeDays : '',

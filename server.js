@@ -688,6 +688,11 @@ PO-TOTAL ARITHMETIC (also mandatory):
 - If your computed gross demand is more than 10% different from run_mrp's qtyToOrder for the same SKU, your math is wrong. Re-call the tools with the correct filters; do NOT report the wrong number anyway.
 - When explaining a PO, show the gross→net story explicitly: "Gross BOM demand from these orders is X kg. On-hand + on-order covers Y kg. Net PO need (= MRP's suggested qtyToOrder) is Z kg." That makes the chain auditable.
 
+UOM AWARENESS (critical for VC-* and other non-kg SKUs):
+- Every suggestedPO includes a "uom" field with Cin7's native unit of measure (Kg, g, Each, case, etc.). ALWAYS include the UOM when quoting qtyToOrder. "Order 500 g of VC-XYZ" not "order 500 of VC-XYZ" — the difference between grams and kg is a 1000× ordering hazard.
+- Flavor concentrates (VC-*) are stored in Cin7 as GRAMS, not kg. Don't mentally convert unless the user asks — the qtyToOrder value IS the number they'll enter in Cin7's PO screen, so trust the qty + its uom label.
+- If uom is null/missing, note that in your response ("UOM not synced yet — verify against Cin7 before ordering") rather than assuming kg.
+
 FG-LEVEL NETTING (default ON in run_mrp — behavior you must narrate accurately):
 - run_mrp now nets FG on-hand against planned production BEFORE expanding BOMs. If a scheduled MO or pipeline draft would produce FG-XXX and there is already FG-XXX.available in stock, the RM demand for that draft is expanded on the NET production qty (planned minus what stock covers), not the gross planned qty. This is real MRP behavior and matches how a scheduler would think.
 - run_mrp responses include an fgNettingSummary array — FG SKUs where on-hand stock offset planned production. When it is non-empty, SURFACE THIS in your reply. Each row has these distinct fields you MUST report correctly:
@@ -977,7 +982,7 @@ const AI_TOOLS = [
   },
   {
     name: "run_mrp",
-    description: "Read-only. Runs the MRP engine against the current schedule + BOMs + on-hand inventory and returns a COMPACT summary: total $ committed, suggested POs (top by line cost), deferred POs, at-risk MOs. Use this when the user asks ANY question involving materials, ordering, capital commitment, supplier orders, raw material shortages, or 'why is this PO/order looking off'. The response also lets you spot anomalies (oversized POs, unexpected demand, at-risk MOs). To dig deeper into a suspicious PO, follow up with get_orders to see what's scheduled and bom_expand on those orders to trace the demand chain. Default settings mirror the UI: poHorizonDays=30 (only suggest POs that must be ordered within 30 days), horizonDays=120 (demand window), includeUnconfirmed=false. Pipeline drafts are NOT included unless includeDrafts=true.",
+    description: "Read-only. Runs the MRP engine against the current schedule + BOMs + on-hand inventory and returns a COMPACT summary: total $ committed, suggested POs (top by line cost), deferred POs, at-risk MOs. Use this when the user asks ANY question involving materials, ordering, capital commitment, supplier orders, raw material shortages, or 'why is this PO/order looking off'. The response also lets you spot anomalies (oversized POs, unexpected demand, at-risk MOs). To dig deeper into a suspicious PO, follow up with get_orders to see what's scheduled and bom_expand on those orders to trace the demand chain. Default settings mirror the UI: poHorizonDays=30 (only suggest POs that must be ordered within 30 days), horizonDays=120 (demand window), includeUnconfirmed=false. Pipeline drafts are NOT included unless includeDrafts=true. Each suggestedPO carries a `uom` field (Cin7 native unit — Kg/g/Each/case); ALWAYS include the UOM when quoting qtyToOrder to the user, because VC-* flavor SKUs are stored in grams and misreading grams as kg is a 1000× ordering hazard.",
     input_schema: {
       type: "object",
       properties: {
@@ -1675,6 +1680,9 @@ async function executeAITool(name, input, context) {
         po.unitCost = unitCost;
         po.lineCost = unitCost != null ? unitCost * po.qtyToOrder : null;
         po.costMissing = unitCost == null;
+        // Cin7 native UOM (Kg, g, Each, case, etc.) — surfaced so callers
+        // don't have to reason about whether qtyToOrder is in kg or grams.
+        po.uom = (c && c.uom) || null;
         const isDeferred = poHorizonEndDate && po.mustOrderByDate && po.mustOrderByDate > poHorizonEndDate;
         if (isDeferred) {
           deferred.push(po);
@@ -3022,6 +3030,11 @@ async function performCin7ProductCostsSync() {
       averageCost: cost,
       costingMethod: p.CostingMethod || "",
       category: p.Category || "",
+      // Cin7's native UOM (Kg, g, Each, case, etc.). Used by MRP to render
+      // "500 g" vs "50 kg" alongside qtyToOrder so operators don't misread
+      // grams-UOM SKUs like VC-* flavor concentrates as kg — a silent 1000×
+      // ordering hazard we hit when auto-syncing BOMs from Cin7.
+      uom: p.UOM || "",
     };
     if (cost > 0) withCost++;
   }
@@ -6046,6 +6059,7 @@ app.get("/api/mrp/run", (req, res) => {
       po.unitCost = unitCost;
       po.lineCost = unitCost != null ? unitCost * po.qtyToOrder : null;
       po.costMissing = unitCost == null;
+      po.uom = (c && c.uom) || null;
       const deferred = poHorizonEndDate && po.mustOrderByDate && po.mustOrderByDate > poHorizonEndDate;
       po.deferredByHorizon = !!deferred;
       if (deferred) {
