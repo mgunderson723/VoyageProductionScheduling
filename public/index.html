@@ -1184,18 +1184,12 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
           <option value="365">1 year</option>
         </select>
       </label>
-      <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
-        Category:
-        <select id="expiring-lots-category" onchange="loadExpiringLots()" style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;height:32px;">
-          <option value="">All</option>
-          <option value="RM">RM (raw material)</option>
-          <option value="VC">VC (flavor concentrate)</option>
-          <option value="PK">PK (packaging)</option>
-          <option value="WIP">WIP</option>
-          <option value="FG">FG (finished good)</option>
-          <option value="OTHER">Other</option>
-        </select>
-      </label>
+      <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">
+        <span style="font-size:var(--vf-text-sm);color:var(--vf-text-secondary);margin-right:4px;">Categories:</span>
+        <div id="expiring-lots-category-chips" style="display:flex;gap:4px;flex-wrap:wrap;">
+          <!-- Rendered by renderExpiringLotsCategoryChips() -->
+        </div>
+      </div>
       <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
         <input type="checkbox" id="expiring-lots-include-expired" checked onchange="loadExpiringLots()" style="margin:0;"/>
         Include already-expired
@@ -4790,8 +4784,41 @@ function downloadStaleLotsCsv() {
 // server does the bucket math + filtering; client just renders and lets the
 // user re-tune the days_ahead / category filters or fuzzy-search by SKU/batch.
 let _expiringLotsCache = null;
+// Set of selected category codes. Empty set = "all categories" (no filter
+// sent to the server). Rendered as toggle chips by
+// renderExpiringLotsCategoryChips; loadExpiringLots reads it into the URL.
+const EXPIRING_LOTS_CATEGORIES = ['RM', 'VC', 'PK', 'WIP', 'FG', 'OTHER'];
+const _expiringLotsSelectedCategories = new Set();
+
+function renderExpiringLotsCategoryChips() {
+  const container = document.getElementById('expiring-lots-category-chips');
+  if (!container) return;
+  const allChip = _expiringLotsSelectedCategories.size === 0;
+  const chip = (label, code, active) => {
+    const bg = active ? 'var(--vf-cat-purple-base)' : 'var(--vf-surface-raised)';
+    const fg = active ? 'white' : 'var(--vf-text-secondary)';
+    const border = active ? 'var(--vf-cat-purple-base)' : 'var(--vf-border-default)';
+    return `<button type="button" onclick="toggleExpiringLotsCategory('${code}')" style="padding:4px 10px;font-size:11px;border:1px solid ${border};border-radius:12px;background:${bg};color:${fg};font-family:inherit;cursor:pointer;font-weight:${active?'600':'400'};">${label}</button>`;
+  };
+  container.innerHTML =
+    chip('All', '__all__', allChip) +
+    EXPIRING_LOTS_CATEGORIES.map(c => chip(c, c, _expiringLotsSelectedCategories.has(c))).join('');
+}
+
+function toggleExpiringLotsCategory(code) {
+  if (code === '__all__') {
+    _expiringLotsSelectedCategories.clear();
+  } else if (_expiringLotsSelectedCategories.has(code)) {
+    _expiringLotsSelectedCategories.delete(code);
+  } else {
+    _expiringLotsSelectedCategories.add(code);
+  }
+  renderExpiringLotsCategoryChips();
+  loadExpiringLots();
+}
 
 async function loadExpiringLots() {
+  renderExpiringLotsCategoryChips();
   const tbody = document.getElementById('expiring-lots-tbody');
   const emptyEl = document.getElementById('expiring-lots-empty');
   const tsEl = document.getElementById('expiring-lots-ts');
@@ -4802,8 +4829,9 @@ async function loadExpiringLots() {
       days_ahead: document.getElementById('expiring-lots-window').value,
       include_expired: document.getElementById('expiring-lots-include-expired').checked ? 'true' : 'false',
     });
-    const cat = document.getElementById('expiring-lots-category').value;
-    if (cat) params.set('category', cat);
+    if (_expiringLotsSelectedCategories.size > 0) {
+      params.set('category', Array.from(_expiringLotsSelectedCategories).join(','));
+    }
     const resp = await fetch('/api/traceability/expiring-lots?' + params.toString());
     const j = await resp.json();
     if (!j.ok) throw new Error(j.error || ('HTTP ' + resp.status));
