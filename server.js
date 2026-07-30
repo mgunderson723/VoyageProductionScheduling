@@ -688,6 +688,10 @@ PO-TOTAL ARITHMETIC (also mandatory):
 - If your computed gross demand is more than 10% different from run_mrp's qtyToOrder for the same SKU, your math is wrong. Re-call the tools with the correct filters; do NOT report the wrong number anyway.
 - When explaining a PO, show the gross→net story explicitly: "Gross BOM demand from these orders is X kg. On-hand + on-order covers Y kg. Net PO need (= MRP's suggested qtyToOrder) is Z kg." That makes the chain auditable.
 
+PACKOUT-SCHEDULING GUARD (respect it):
+- MRP silently skips MOs scheduled on a packout machine (depositing, pouching, mac_packout) unless their SKU starts with FG-. Only FG-* SKUs carry the packaging BOM (box + bag + intermediate). A packout MO coded against a WIP-, WIP2-, WIP3-, or RM- SKU is a scheduling error and would expand the wrong BOM.
+- run_mrp response includes packoutSkipped.count and packoutSkipped.examples. When count > 0, surface it in your reply and list the affected MOs so ops can re-code them. Do NOT silently ignore — this is a signal that some real demand is missing from the current MRP output because those MOs got skipped.
+
 UOM AWARENESS (critical for VC-* and other non-kg SKUs):
 - Every suggestedPO includes a "uom" field with Cin7's native unit of measure (Kg, g, Each, case, etc.). ALWAYS include the UOM when quoting qtyToOrder. "Order 500 g of VC-XYZ" not "order 500 of VC-XYZ" — the difference between grams and kg is a 1000× ordering hazard.
 - Flavor concentrates (VC-*) are stored in Cin7 as GRAMS, not kg. Don't mentally convert unless the user asks — the qtyToOrder value IS the number they'll enter in Cin7's PO screen, so trust the qty + its uom label.
@@ -1720,7 +1724,7 @@ async function executeAITool(name, input, context) {
         today,
         settings: { poHorizonDays, horizonDays, includeUnconfirmed, includeDrafts, draftsCount, includeCompanions, companionsCount, excludeBeforeDate, netFgOnHand },
         summary: {
-          ordersConsidered: mrpOrders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom + skipped.excludedByDate),
+          ordersConsidered: mrpOrders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom + skipped.excludedByDate + (skipped.packoutFormulaOnly || 0)),
           requirementCount: requirements.length,
           atRiskOrderCount: atRiskOrders.length,
           suggestedPoCount: inWindow.length,
@@ -1733,10 +1737,14 @@ async function executeAITool(name, input, context) {
         },
         fgNettingSummary: fgNettingSummary || [],
         wipNettingSummary: wipNettingSummary || [],
+        packoutSkipped: {
+          count: skipped.packoutFormulaOnly || 0,
+          examples: packoutSkippedExamples || [],
+        },
         suggestedPOs: inWindow.slice().sort(byCostDesc).slice(0, topN).map(trim),
         deferredPOs: deferred.slice().sort(byCostDesc).slice(0, topN).map(trim),
         atRiskOrders: atRiskOrders.slice(0, 30).map(trimAtRisk),
-        note: "suggestedPOs = top-N by line cost (highest $ first). fgNettingSummary lists FG SKUs where on-hand stock offset planned production (RM demand is net of that). If a demand number looks lower than expected, check fgNettingSummary — the FG might already be in inventory. To trace deeper, call trace_po_demand which shows per-order gross vs net qty.",
+        note: "suggestedPOs = top-N by line cost (highest $ first). fgNettingSummary lists FG SKUs where on-hand stock offset planned production (RM demand is net of that). If a demand number looks lower than expected, check fgNettingSummary — the FG might already be in inventory. packoutSkipped.count is MOs on packout machines (depositing/pouching/mac_packout) that were skipped because their SKU is not FG-* — these are scheduling errors (formula SKU on a packout op) and their BOM demand is intentionally excluded. To trace deeper, call trace_po_demand which shows per-order gross vs net qty.",
       };
     }
 
@@ -4518,6 +4526,18 @@ const WC_TO_MACHINE = {
   "Testing work center":  null,
 };
 
+// Machines where the operation is packaging/finishing — the only BOM shape
+// that includes box/bag/packaging inputs is the finished-good (FG-*) BOM.
+// WIP tiers (WIP-, WIP2-, WIP3-, ...) hold formula or intermediate recipes
+// with raw ingredients, not packaging. If a scheduler drops a packout MO
+// against any WIP or RM SKU, expanding that BOM would produce spurious
+// demand (cocoa/sugar for WIP1, or nothing usable for WIP2/3). MRP skips
+// such orders and surfaces them for scheduling cleanup.
+const PACKOUT_MACHINES = new Set(["mac_packout", "depositing", "pouching"]);
+
+// Only FG-* SKUs carry the packaging BOM shape MRP needs on packout machines.
+const PACKOUT_VALID_SKU_RE = /^FG-/i;
+
 // Production lead time per machine, in days (sourced from Capacity & Ops tab)
 const MACHINE_LEAD_DAYS = {
   seed_clean:  1,
@@ -5550,7 +5570,8 @@ function extractBomSku(orderSku, bomParents) {
 function buildRequirements(orders, bomParents, opts) {
   const horizonEnd = mrpAddDays(opts.today, opts.horizonDays);
   const requirements = [];
-  const skipped = { unconfirmed: 0, complete: 0, noStart: 0, outsideHorizon: 0, noBom: 0, excludedByDate: 0 };
+  const skipped = { unconfirmed: 0, complete: 0, noStart: 0, outsideHorizon: 0, noBom: 0, excludedByDate: 0, packoutFormulaOnly: 0 };
+  const packoutSkippedExamples = [];
   const noBomExamples = [];
   // "Exclude before" filter — solves the lingering-TBD problem where
   // uncleared old orders inflate MRP demand for material that's actually
@@ -5683,6 +5704,26 @@ function buildRequirements(orders, bomParents, opts) {
 
     const grossPlannedQty = o.total || (o.qty || 0) * (o.batches || 1);
     if (!o.sku || grossPlannedQty <= 0) { skipped.noBom++; continue; }
+
+    // Packout-scheduling guard: MOs scheduled on a packout machine but coded
+    // against a WIP1 formula SKU (or an RM/PK/VC) would expand the wrong BOM
+    // and generate spurious raw-ingredient demand. The correct code is a
+    // FG-* or a numbered-WIP tier (WIP2-, WIP3-, ...). Skip these entirely
+    // so bad scheduling doesn't pollute PO suggestions, and surface a few
+    // examples so ops can fix the affected MOs.
+    if (PACKOUT_MACHINES.has(o.machine) && !PACKOUT_VALID_SKU_RE.test(o.sku)) {
+      skipped.packoutFormulaOnly++;
+      if (packoutSkippedExamples.length < 15) {
+        packoutSkippedExamples.push({
+          orderId: o.orderId || o.id,
+          sku: o.sku,
+          machine: o.machine,
+          start: o.start,
+          qty: grossPlannedQty,
+        });
+      }
+      continue;
+    }
 
     const fgSku = extractBomSku(o.sku, bomParents);
     if (!fgSku) {
@@ -5820,7 +5861,7 @@ function buildRequirements(orders, bomParents, opts) {
       downstreamOrderCount: new Set(info.sourceOrderIds).size,
     });
   }
-  return { requirements, skipped, noBomExamples, fgNettingSummary, wipNettingSummary };
+  return { requirements, skipped, noBomExamples, packoutSkippedExamples, fgNettingSummary, wipNettingSummary };
 }
 
 // A BOM leaf is "procurable" if it looks like a real RM, packaging, or
@@ -6031,7 +6072,7 @@ app.get("/api/mrp/run", (req, res) => {
     }
 
     const netFgOnHandFlag = req.query.netFgOnHand !== "false"; // default true
-    const { requirements, skipped, noBomExamples, fgNettingSummary, wipNettingSummary } = buildRequirements(mrpOrders, bomParents, {
+    const { requirements, skipped, noBomExamples, packoutSkippedExamples, fgNettingSummary, wipNettingSummary } = buildRequirements(mrpOrders, bomParents, {
       today, horizonDays, includeUnconfirmed, applyWastage, excludeBeforeDate, supply,
       onHandBySku, netFgOnHand: netFgOnHandFlag,
     });
@@ -6096,9 +6137,10 @@ app.get("/api/mrp/run", (req, res) => {
       fgNettingSummary: fgNettingSummary || [],
       wipNettingSummary: wipNettingSummary || [],
       summary: {
-        ordersConsidered: mrpOrders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom + skipped.excludedByDate),
+        ordersConsidered: mrpOrders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom + skipped.excludedByDate + (skipped.packoutFormulaOnly || 0)),
         ordersSkipped: skipped,
         noBomExamples,
+        packoutSkippedExamples,
         requirementCount: requirements.length,
         skuCount: skuResults.length,
         atRiskOrderCount: atRiskOrders.length,

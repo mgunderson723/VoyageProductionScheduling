@@ -1363,6 +1363,8 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
 
     <div class="status-summary" id="mrp-kpis"></div>
 
+    <div id="mrp-packout-skipped-banner" style="display:none;margin-bottom:var(--vf-space-3);padding:var(--vf-space-3);background:var(--vf-surface-sunken);border:1px solid var(--vf-warning-border,var(--vf-border-default));border-left:3px solid var(--vf-warning-base);border-radius:var(--vf-radius-md);"></div>
+
     <div id="mrp-empty" class="no-inv-note" style="display:none;">
       No MRP run yet. Click "↻ Run MRP" above to compute requirements against the current production plan, BOMs, and on-hand inventory.
     </div>
@@ -3556,10 +3558,46 @@ function renderMrp() {
     `<div class="metric" style="${x.accent?'border-left:3px solid '+x.accent+';':''}"><div class="metric-label">${x.label}</div><div class="metric-value">${x.val}</div></div>`
   ).join('');
 
+  renderMrpPackoutSkippedBanner();
   renderMrpPos();
   renderMrpSummary();
   renderMrpRisk();
   renderMrpSkus();
+}
+
+// Surface packout MOs that MRP skipped due to non-FG SKUs. These are
+// scheduling errors — the operator coded the packout op against a
+// formula/WIP SKU instead of the FG SKU that carries the packaging BOM.
+// Their BOM demand is intentionally excluded from the MRP output, so the
+// operator needs to fix the scheduling before those materials will show
+// up in PO suggestions.
+function renderMrpPackoutSkippedBanner() {
+  const el = document.getElementById('mrp-packout-skipped-banner');
+  if (!el) return;
+  const s = mrpData && mrpData.summary;
+  const examples = (s && s.packoutSkippedExamples) || [];
+  const count = (s && s.ordersSkipped && s.ordersSkipped.packoutFormulaOnly) || 0;
+  if (!count) { el.style.display = 'none'; return; }
+  el.style.display = 'block';
+  const rows = examples.map(x =>
+    `<li style="margin-bottom:2px;"><code>${escapeHtml(x.orderId || '?')}</code> — <code>${escapeHtml(x.sku || '?')}</code> on <b>${escapeHtml(x.machine || '?')}</b>${x.start ? ' · start ' + x.start : ''}</li>`
+  ).join('');
+  const moreNote = count > examples.length ? `<div style="margin-top:6px;font-size:11px;color:var(--vf-text-tertiary);">…and ${count - examples.length} more.</div>` : '';
+  el.innerHTML = `
+    <div style="display:flex;align-items:flex-start;gap:8px;">
+      <span style="color:var(--vf-warning-text);font-weight:600;font-size:14px;">⚠</span>
+      <div style="flex:1;">
+        <div style="font-weight:600;color:var(--vf-warning-text);margin-bottom:4px;">
+          ${count} packout MO${count === 1 ? '' : 's'} skipped — non-FG SKU
+        </div>
+        <div style="font-size:12px;color:var(--vf-text-secondary);margin-bottom:6px;">
+          Packout machines (depositing / pouching / mac_packout) only expand correctly against FG-* SKUs — those carry the packaging BOM (box + bag + intermediate). MOs coded against a WIP or RM SKU are excluded from MRP so their formula demand doesn't pollute PO suggestions. Fix by re-coding the MO to its FG SKU.
+        </div>
+        <ul style="margin:0;padding-left:20px;font-size:11px;color:var(--vf-text-secondary);">${rows}</ul>
+        ${moreNote}
+      </div>
+    </div>
+  `;
 }
 
 function renderMrpPos() {
