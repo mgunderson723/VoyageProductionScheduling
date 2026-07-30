@@ -932,6 +932,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
     <button class="tab" onclick="switchTab('pipeline')" id="tab-pipeline-btn" style="display:none;">Pipeline</button>
     <button class="tab" onclick="switchTab('capacity')">Capacity &amp; ops</button>
     <button class="tab" onclick="switchTab('traceability')">Traceability</button>
+    <button class="tab" onclick="switchTab('expiring-lots')">Expiring lots</button>
     <button class="tab" onclick="switchTab('mo-status')">MO Status</button>
     <button class="tab" onclick="switchTab('live-inv')">Live Inventory</button>
     <button class="tab" onclick="switchTab('error-reporting')">Error reporting</button>
@@ -1155,6 +1156,74 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       </div>
       <div id="trace-view-body"></div>
     </div>
+  </div>
+
+  <!-- EXPIRING LOTS -->
+  <div id="tab-expiring-lots" style="display:none;">
+    <div class="header">
+      <div>
+        <h2>Expiring lots</h2>
+        <span style="font-size:var(--vf-text-sm);color:var(--vf-text-tertiary);">Per-lot paper balance vs Cin7-recorded expiry date. Sourced from the traceability movement uploads.</span>
+      </div>
+      <div style="display:flex;gap:var(--vf-space-2);align-items:center;">
+        <span id="expiring-lots-ts" style="font-size:var(--vf-text-xs);color:var(--vf-text-tertiary);"></span>
+        <button class="btn btn-sm" onclick="downloadExpiringLotsCsv()">↓ CSV</button>
+      </div>
+    </div>
+
+    <div class="status-summary" id="expiring-lots-buckets"></div>
+
+    <div style="display:flex;gap:var(--vf-space-2);align-items:center;margin-bottom:var(--vf-space-3);flex-wrap:wrap;">
+      <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
+        Look ahead:
+        <select id="expiring-lots-window" onchange="loadExpiringLots()" style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;height:32px;">
+          <option value="30">30 days</option>
+          <option value="60">60 days</option>
+          <option value="90" selected>90 days</option>
+          <option value="180">180 days</option>
+          <option value="365">1 year</option>
+        </select>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
+        Category:
+        <select id="expiring-lots-category" onchange="loadExpiringLots()" style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;height:32px;">
+          <option value="">All</option>
+          <option value="RM">RM (raw material)</option>
+          <option value="VC">VC (flavor concentrate)</option>
+          <option value="PK">PK (packaging)</option>
+          <option value="WIP">WIP</option>
+          <option value="FG">FG (finished good)</option>
+          <option value="OTHER">Other</option>
+        </select>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
+        <input type="checkbox" id="expiring-lots-include-expired" checked onchange="loadExpiringLots()" style="margin:0;"/>
+        Include already-expired
+      </label>
+      <input id="expiring-lots-search" placeholder="Search SKU or batch…" oninput="renderExpiringLots()" style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;width:220px;height:32px;">
+    </div>
+
+    <div style="margin-bottom:var(--vf-space-3);padding:var(--vf-space-2) var(--vf-space-3);background:var(--vf-surface-sunken);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);font-size:11px;color:var(--vf-text-tertiary);">
+      ℹ On-hand qty is the <b>paper balance</b> from movement history (sum in − sum out per batch). For high-stakes decisions verify against a physical count or Cin7's ProductAvailability. Lots without an expiry date in Cin7 don't appear here.
+    </div>
+
+    <div style="overflow-x:auto;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);">
+      <table class="status-table" id="expiring-lots-table" style="margin-top:0;">
+        <thead style="position:sticky;top:0;background:var(--vf-surface-sunken);z-index:1;">
+          <tr>
+            <th>SKU</th>
+            <th>Batch</th>
+            <th style="text-align:right;">Paper on-hand</th>
+            <th>Expiry</th>
+            <th style="text-align:right;">Days until</th>
+            <th>Last location</th>
+            <th>Category</th>
+          </tr>
+        </thead>
+        <tbody id="expiring-lots-tbody"></tbody>
+      </table>
+    </div>
+    <div id="expiring-lots-empty" class="no-inv-note" style="display:none;">No lots match the current filters.</div>
   </div>
 
   <!-- MO STATUS -->
@@ -2808,16 +2877,17 @@ function switchTab(t){
   if(t==='yield-setup'&&(!currentUser||currentUser.role!=='admin'))return;
   if(t==='pipeline'&&(!currentUser||currentUser.role!=='admin'))return;
   if(t==='mrp'&&(!currentUser||currentUser.role==='viewer'))return;
-  ['calendar','orders','pipeline','capacity','traceability','mo-status','live-inv','error-reporting','production-output','yield','mrp','mrp-setup','yield-setup','admin'].forEach(k=>{document.getElementById('tab-'+k).style.display=k===t?'':'none';});
+  ['calendar','orders','pipeline','capacity','traceability','expiring-lots','mo-status','live-inv','error-reporting','production-output','yield','mrp','mrp-setup','yield-setup','admin'].forEach(k=>{document.getElementById('tab-'+k).style.display=k===t?'':'none';});
   document.querySelectorAll('.tab').forEach(el=>{
     const tabName=el.textContent.trim().toLowerCase();
-    const map={'calendar':'calendar','work orders':'orders','pipeline':'pipeline','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','mo status':'mo-status','live inventory':'live-inv','error reporting':'error-reporting','production output':'production-output','yield':'yield','mrp':'mrp','mrp setup':'mrp-setup','yield setup':'yield-setup','admin console':'admin'};
+    const map={'calendar':'calendar','work orders':'orders','pipeline':'pipeline','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','expiring lots':'expiring-lots','mo status':'mo-status','live inventory':'live-inv','error reporting':'error-reporting','production output':'production-output','yield':'yield','mrp':'mrp','mrp setup':'mrp-setup','yield setup':'yield-setup','admin console':'admin'};
     el.classList.toggle('active',map[tabName]===t);
   });
   if(t==='calendar')renderCal();
   if(t==='orders')render();
   if(t==='admin'){renderUsers();loadAuditLog();loadBugReports();}
   if(t==='traceability'){ renderTraceability(); }
+  if(t==='expiring-lots'){ loadExpiringLots(); }
   if(t==='mo-status'){populateMOStatusMachineFilter();renderMOStatus();loadSyncStatus();}
   if(t==='live-inv')loadLiveInventory();
   if(t==='error-reporting')loadErrorReporting();
@@ -4709,6 +4779,139 @@ function downloadStaleLotsCsv() {
   const a = document.createElement('a');
   a.href = url;
   a.download = `stale-lots-${_staleLotsCache.as_of}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// ── Expiring lots tab ────────────────────────────────────────────────────────
+// Queries /api/traceability/expiring-lots with the current filter set. The
+// server does the bucket math + filtering; client just renders and lets the
+// user re-tune the days_ahead / category filters or fuzzy-search by SKU/batch.
+let _expiringLotsCache = null;
+
+async function loadExpiringLots() {
+  const tbody = document.getElementById('expiring-lots-tbody');
+  const emptyEl = document.getElementById('expiring-lots-empty');
+  const tsEl = document.getElementById('expiring-lots-ts');
+  if (tbody) tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:24px;color:var(--vf-text-tertiary);">Loading…</td></tr>';
+  if (emptyEl) emptyEl.style.display = 'none';
+  try {
+    const params = new URLSearchParams({
+      days_ahead: document.getElementById('expiring-lots-window').value,
+      include_expired: document.getElementById('expiring-lots-include-expired').checked ? 'true' : 'false',
+    });
+    const cat = document.getElementById('expiring-lots-category').value;
+    if (cat) params.set('category', cat);
+    const resp = await fetch('/api/traceability/expiring-lots?' + params.toString());
+    const j = await resp.json();
+    if (!j.ok) throw new Error(j.error || ('HTTP ' + resp.status));
+    _expiringLotsCache = j;
+    if (tsEl) tsEl.textContent = `as of ${j.as_of} · ${j.total_matches.toLocaleString()} match${j.total_matches === 1 ? '' : 'es'}`;
+    renderExpiringLotsBuckets();
+    renderExpiringLots();
+  } catch (e) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;padding:24px;color:var(--vf-danger-text);">Failed to load: ${escapeHtml(e.message)}</td></tr>`;
+  }
+}
+
+function renderExpiringLotsBuckets() {
+  const el = document.getElementById('expiring-lots-buckets');
+  if (!el || !_expiringLotsCache) return;
+  const b = _expiringLotsCache.buckets || {};
+  const kpis = [
+    { label: 'Expired',        val: (b.expired || 0).toLocaleString(),      accent: b.expired > 0 ? 'var(--vf-danger-base)' : 'var(--vf-success-base)' },
+    { label: '≤ 30 days',      val: (b.within_30d || 0).toLocaleString(),   accent: b.within_30d > 0 ? 'var(--vf-warning-base)' : '' },
+    { label: '31–90 days',     val: (b.within_90d || 0).toLocaleString(),   accent: 'var(--vf-info-base)' },
+    { label: 'Total w/ expiry',val: (b.total_with_expiry || 0).toLocaleString(), accent: 'var(--vf-cat-purple-base)' },
+  ];
+  el.innerHTML = kpis.map(x =>
+    `<div class="metric" style="${x.accent ? 'border-left:3px solid ' + x.accent + ';' : ''}"><div class="metric-label">${x.label}</div><div class="metric-value">${x.val}</div></div>`
+  ).join('');
+}
+
+function renderExpiringLots() {
+  const tbody = document.getElementById('expiring-lots-tbody');
+  const emptyEl = document.getElementById('expiring-lots-empty');
+  if (!tbody || !_expiringLotsCache) return;
+  const search = (document.getElementById('expiring-lots-search').value || '').toLowerCase();
+  const rows = (_expiringLotsCache.lots || []).filter(l => {
+    if (!search) return true;
+    return (l.sku || '').toLowerCase().includes(search) ||
+           (l.batch || '').toLowerCase().includes(search) ||
+           (l.product || '').toLowerCase().includes(search);
+  });
+  if (!rows.length) {
+    tbody.innerHTML = '';
+    if (emptyEl) emptyEl.style.display = '';
+    return;
+  }
+  if (emptyEl) emptyEl.style.display = 'none';
+  tbody.innerHTML = rows.map(l => {
+    const d = l.days_until_expiry;
+    let rowColor = '';
+    let dLabel;
+    if (d == null) { dLabel = '—'; }
+    else if (d < 0) {
+      rowColor = 'background:rgba(220,38,38,0.08);';
+      dLabel = `<span style="color:var(--vf-danger-text);font-weight:600;">expired ${Math.abs(d)}d ago</span>`;
+    } else if (d <= 30) {
+      rowColor = 'background:rgba(234,179,8,0.08);';
+      dLabel = `<span style="color:var(--vf-warning-text);font-weight:600;">${d}d</span>`;
+    } else {
+      dLabel = `<span style="color:var(--vf-text-secondary);">${d}d</span>`;
+    }
+    // Encode trace deep-link so the auditor can jump into the timeline
+    const traceHref = `?trace=${encodeURIComponent(l.batch || '')}`;
+    return `<tr style="${rowColor}">
+      <td><span class="mo-id">${escapeHtml(l.sku || '—')}</span><div style="font-size:10px;color:var(--vf-text-tertiary);max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(l.product || '')}</div></td>
+      <td><a href="${escapeHtml(traceHref)}" onclick="event.preventDefault();switchTab('traceability');setTimeout(()=>runTraceabilitySearchWith('${escapeHtml(l.batch || '')}'),50);" style="color:var(--vf-info-text);text-decoration:none;">${escapeHtml(l.batch || '—')}</a></td>
+      <td style="text-align:right;font-variant-numeric:tabular-nums;">${(l.running_balance || 0).toLocaleString(undefined, {maximumFractionDigits: 3})} <span style="color:var(--vf-text-tertiary);font-size:11px;">${escapeHtml(l.unit || '')}</span></td>
+      <td style="white-space:nowrap;font-variant-numeric:tabular-nums;">${escapeHtml(l.expiry_date || '—')}</td>
+      <td style="text-align:right;">${dLabel}</td>
+      <td style="font-size:11px;color:var(--vf-text-secondary);">${escapeHtml(l.last_location || '—')}</td>
+      <td><span class="badge" style="font-size:10px;">${escapeHtml(l.category || 'OTHER')}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+// Shim: some other tabs already own a "trace search" helper; if it's not
+// defined here (older builds), fall back to setting URL param + reload.
+function runTraceabilitySearchWith(batch) {
+  const input = document.getElementById('trace-query');
+  if (input && typeof runTraceabilitySearch === 'function') {
+    input.value = batch;
+    runTraceabilitySearch();
+  } else {
+    location.href = '?trace=' + encodeURIComponent(batch);
+  }
+}
+
+function downloadExpiringLotsCsv() {
+  if (!_expiringLotsCache || !_expiringLotsCache.lots || !_expiringLotsCache.lots.length) {
+    alert('No lots loaded to export. Adjust filters and try again.');
+    return;
+  }
+  const headers = ['expiry_date', 'days_until_expiry', 'category', 'sku', 'product', 'lot_code', 'paper_on_hand', 'unit', 'last_location', 'last_movement_date', 'last_reference'];
+  const rows = _expiringLotsCache.lots.map(l => headers.map(h => {
+    let v;
+    switch (h) {
+      case 'lot_code': v = l.batch; break;
+      case 'paper_on_hand': v = l.running_balance; break;
+      default: v = l[h];
+    }
+    v = v == null ? '' : String(v);
+    return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+  }).join(','));
+  const f = _expiringLotsCache.filters || {};
+  const meta = `# Expiring lots export from Voyage Production Scheduling\n# as_of=${_expiringLotsCache.as_of}, days_ahead=${f.days_ahead}, include_expired=${f.include_expired}, categories=${(f.categories||[]).join('|')}\n# total_matches=${_expiringLotsCache.total_matches}, in_export=${_expiringLotsCache.lots.length}\n`;
+  const csv = meta + headers.join(',') + '\n' + rows.join('\n') + '\n';
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `expiring-lots-${_expiringLotsCache.as_of}.csv`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);

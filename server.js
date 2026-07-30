@@ -6356,6 +6356,11 @@ function computeLotIdleStats(idx, opts) {
         last_reference: m.reference || null,
         last_ref_type: m.ref_type || null,
         last_movement_type: m.movement_type || null,
+        // Earliest non-null expiry across all rows for this lot. All rows
+        // for one batch SHOULD carry the same expiry_date, but we take min
+        // defensively so a downstream data-quality mismatch never causes us
+        // to under-warn (i.e., report a later date than reality).
+        expiry_date: m.expiry_date || null,
         total_in: 0,
         total_out: 0,
         movement_count: 0,
@@ -6375,6 +6380,9 @@ function computeLotIdleStats(idx, opts) {
         stat.last_reference = m.reference || null;
         stat.last_ref_type = m.ref_type || null;
         stat.last_movement_type = m.movement_type || null;
+      }
+      if (m.expiry_date && (!stat.expiry_date || m.expiry_date < stat.expiry_date)) {
+        stat.expiry_date = m.expiry_date;
       }
     }
     stat.total_in += Number(m.qty_in || 0);
@@ -6433,6 +6441,86 @@ app.get("/api/traceability/stale-lots", (req, res) => {
     ok: true,
     as_of: asOf || new Date().toISOString().slice(0, 10),
     filters: { min_days_idle: minDaysIdle, min_balance: minBalance, include_negative: includeNegative, categories, sort },
+    total_matches: filtered.length,
+    count: Math.min(filtered.length, limit),
+    lots: filtered.slice(0, limit),
+  });
+});
+
+// GET /api/traceability/expiring-lots — lots approaching (or past) expiry.
+//
+// Same paper-balance machinery as stale-lots, filtered by expiry_date
+// instead of days_idle. Reuses computeLotIdleStats which now carries the
+// per-lot expiry_date (earliest across all rows for that batch).
+//
+// Filters (all optional):
+//   days_ahead     Look for lots expiring within this many days. Default 90.
+//                  Also includes anything already expired.
+//   min_balance    Only lots with running_balance >= this. Default 0.1 to
+//                  filter numeric noise / depleted lots.
+//   category       Comma-separated (RM,VC,PK,WIP,FG,OTHER). Default: all.
+//   include_expired  Include already-expired lots. Default true.
+//   limit          Cap result size. Default 500, max 5000.
+//   sort           "expiry_asc" (default), "expiry_desc", "balance_desc".
+app.get("/api/traceability/expiring-lots", (req, res) => {
+  const asOfRaw = String(req.query.as_of || "");
+  const asOf = /^\d{4}-\d{2}-\d{2}$/.test(asOfRaw) ? asOfRaw : null;
+  const today = asOf || new Date().toISOString().slice(0, 10);
+  const daysAhead = Math.max(0, parseInt(req.query.days_ahead, 10) || 90);
+  const minBalance = Math.max(0, parseFloat(req.query.min_balance || 0.1));
+  const categories = (req.query.category || "").split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+  const includeExpired = req.query.include_expired !== "false";
+  const limit = Math.min(parseInt(req.query.limit, 10) || 500, 5000);
+  const sort = String(req.query.sort || "expiry_asc");
+
+  const cutoff = mrpAddDays(today, daysAhead);
+
+  const idx = getMovementIndex();
+  const stats = computeLotIdleStats(idx, { asOf });
+
+  // Bucket counters — computed pre-filter within the "has expiry + positive
+  // balance" universe so the UI can surface "you have N expired lots" even
+  // when the user has a specific category filter active.
+  let bucketExpired = 0, bucket30 = 0, bucket90 = 0, bucketTotal = 0;
+
+  const filtered = [];
+  for (const s of stats) {
+    if (!s.expiry_date) continue;
+    if (s.running_balance < minBalance) continue;
+    // days_until_expiry: negative = already expired
+    s.days_until_expiry = daysBetween(today, s.expiry_date) != null
+      ? Math.floor((new Date(s.expiry_date + "T00:00:00Z").getTime() - new Date(today + "T00:00:00Z").getTime()) / 86400000)
+      : null;
+    bucketTotal++;
+    if (s.days_until_expiry < 0) bucketExpired++;
+    else if (s.days_until_expiry <= 30) bucket30++;
+    else if (s.days_until_expiry <= 90) bucket90++;
+
+    if (!includeExpired && s.days_until_expiry < 0) continue;
+    if (s.expiry_date > cutoff) continue;
+    if (categories.length && !categories.includes(s.category)) continue;
+    filtered.push(s);
+  }
+
+  filtered.sort((a, b) => {
+    switch (sort) {
+      case "expiry_desc":  return (b.expiry_date || "").localeCompare(a.expiry_date || "");
+      case "balance_desc": return b.running_balance - a.running_balance;
+      case "expiry_asc":
+      default:             return (a.expiry_date || "").localeCompare(b.expiry_date || "");
+    }
+  });
+
+  res.json({
+    ok: true,
+    as_of: today,
+    filters: { days_ahead: daysAhead, min_balance: minBalance, categories, include_expired: includeExpired, sort },
+    buckets: {
+      expired: bucketExpired,
+      within_30d: bucket30,
+      within_90d: bucket90,
+      total_with_expiry: bucketTotal,
+    },
     total_matches: filtered.length,
     count: Math.min(filtered.length, limit),
     lots: filtered.slice(0, limit),
