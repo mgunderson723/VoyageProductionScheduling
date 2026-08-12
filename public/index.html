@@ -1251,10 +1251,14 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
         <select id="lot-report-filter" onchange="loadLotReport()" style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;height:32px;">
           <option value="activity" selected>Any production/sale activity (default)</option>
           <option value="adjustments">Only lots with net adjustments</option>
-          <option value="high_adjustment_pct">Adjustments &gt; 20% of received (audit triage)</option>
+          <option value="high_adjustment_pct">Adjustments &gt; threshold% of received (audit triage)</option>
           <option value="delta">Only lots with reconciliation delta</option>
           <option value="all">All lots (any movement)</option>
         </select>
+      </label>
+      <label id="lot-report-adj-threshold-wrap" style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);" title="Threshold for the 'Adjustments > threshold% of received' filter. Only applies when that filter mode is selected.">
+        Adj. %:
+        <input id="lot-report-adj-threshold" type="number" min="0" max="100" step="0.5" value="20" oninput="_debouncedLoadLotReport()" style="width:60px;padding:5px 8px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;height:32px;">
       </label>
       <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
         SKU contains:
@@ -5082,6 +5086,17 @@ async function loadLotReport() {
     if (_lotReportSelectedCategories.size > 0) {
       params.set('category', Array.from(_lotReportSelectedCategories).join(','));
     }
+    // Threshold only affects the high_adjustment_pct filter; harmless to
+    // send for other modes but skip it to keep the URL clean.
+    const filter = document.getElementById('lot-report-filter').value;
+    if (filter === 'high_adjustment_pct') {
+      const raw = parseFloat(document.getElementById('lot-report-adj-threshold').value);
+      if (isFinite(raw) && raw >= 0) params.set('min_adjustment_pct', String(raw));
+    }
+    // Grey out the threshold input when the filter doesn't use it, so it
+    // reads as "N/A" rather than "misconfigured".
+    const wrap = document.getElementById('lot-report-adj-threshold-wrap');
+    if (wrap) wrap.style.opacity = filter === 'high_adjustment_pct' ? '1' : '0.4';
     const resp = await fetch('/api/traceability/lot-balance-report?' + params.toString());
     const j = await resp.json();
     if (!j.ok) throw new Error(j.error || 'HTTP ' + resp.status);
