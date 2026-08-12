@@ -1669,7 +1669,7 @@ async function executeAITool(name, input, context) {
       }
 
       const netFgOnHand = pickBool(input.netFgOnHand, userSettings.netFgOnHand, true);
-      const { requirements, skipped, fgNettingSummary, wipNettingSummary } = buildRequirements(mrpOrders, bomParents, {
+      const { requirements, skipped, packoutSkippedExamples, fgNettingSummary, wipNettingSummary } = buildRequirements(mrpOrders, bomParents, {
         today, horizonDays, includeUnconfirmed, applyWastage: true, excludeBeforeDate, supply,
         onHandBySku, netFgOnHand,
       });

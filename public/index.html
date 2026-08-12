@@ -3665,6 +3665,31 @@ function fmtUsd(v, opts) {
   return '$' + (Math.round(v * 100) / 100).toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 }
 
+// Table-column formatters — keep every value in a column shaped the same
+// so the eye can scan a numeric column vertically. fmtUsd's mix of "k"
+// notation and dollars.cents in the same PO column made rows hard to
+// compare (e.g. $989.05 next to $221.7k). Reserve fmtUsd for headline
+// KPI tiles where compactness matters more than column alignment.
+function fmtCurrencyLine(v) {
+  // Whole-dollar comma-separated. Used for PO line costs — dollars are
+  // the planning unit; cents don't inform an ordering decision at this
+  // scale and the shape "$X,XXX" scans cleanly across rows.
+  if (v == null || !isFinite(v)) return '—';
+  return '$' + Math.round(v).toLocaleString();
+}
+function fmtCurrencyUnit(v) {
+  // Precision-aware unit-cost display. VC- SKUs run around $0.008/g;
+  // rounding those to $0 (as fmtUsd + full:true did) loses signal. Fats
+  // like Coberine are $8/kg where 2 decimals is enough. The step-down
+  // gives 4 decimals only when needed, 2 decimals otherwise.
+  if (v == null || !isFinite(v)) return '—';
+  const abs = Math.abs(v);
+  if (abs === 0) return '$0.00';
+  if (abs < 0.01) return '$' + v.toFixed(4);
+  if (abs < 1)    return '$' + v.toFixed(3);
+  return '$' + v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
 // Format a qty with the SKU's Cin7 native UOM appended (e.g. "500 g",
 // "50 kg", "25 Each"). Prefer the uom passed inline (server enriches PO
 // suggestions with it); fall back to mrpCostsData if not present. Renders
@@ -3764,10 +3789,10 @@ function renderMrpPos() {
     filtered.map(p => {
       const unitCell = p.costMissing
         ? `<span style="color:var(--vf-warning-text);font-size:11px;" title="No cost in Cin7 product cache">—</span>`
-        : `<span style="font-variant-numeric:tabular-nums;">${fmtUsd(p.unitCost, { full: true })}</span>`;
+        : `<span style="font-variant-numeric:tabular-nums;">${fmtCurrencyUnit(p.unitCost)}</span>`;
       const lineCell = p.costMissing
         ? `<span style="color:var(--vf-warning-text);font-size:11px;">—</span>`
-        : `<span style="font-variant-numeric:tabular-nums;font-weight:500;">${fmtUsd(p.lineCost)}</span>`;
+        : `<span style="font-variant-numeric:tabular-nums;font-weight:500;">${fmtCurrencyLine(p.lineCost)}</span>`;
       return `<tr>
         <td><span class="mo-id">${escapeHtml(p.sku)}</span></td>
         <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--vf-text-secondary);" title="${escapeHtml(p.name||'')}">${escapeHtml(p.name||'—')}</td>
@@ -3835,8 +3860,8 @@ function renderMrpSummary() {
         <td><span class="mo-id">${escapeHtml(p.sku)}</span></td>
         <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--vf-text-secondary);" title="${escapeHtml(p.name||'')}">${escapeHtml(p.name||'—')}</td>
         <td style="text-align:right;font-variant-numeric:tabular-nums;">${fmtQtyUom(p.qtyToOrder, p.sku, p.uom)}</td>
-        <td style="text-align:right;font-variant-numeric:tabular-nums;">${fmtUsd(p.unitCost, { full: true })}</td>
-        <td style="text-align:right;font-variant-numeric:tabular-nums;font-weight:500;">${fmtUsd(p.lineCost, { full: true })}</td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;">${fmtCurrencyUnit(p.unitCost)}</td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;font-weight:500;">${fmtCurrencyLine(p.lineCost)}</td>
         <td style="white-space:nowrap;font-size:12px;${p.isOverdue?'color:var(--vf-danger-text);font-weight:600;':''}">${p.mustOrderByDate || '—'}</td>
       </tr>`).join('');
   }
