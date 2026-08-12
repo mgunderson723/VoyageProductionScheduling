@@ -1256,9 +1256,9 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
           <option value="all">All lots (any movement)</option>
         </select>
       </label>
-      <label id="lot-report-adj-threshold-wrap" style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);" title="Threshold for the 'Adjustments > threshold% of received' filter. Only applies when that filter mode is selected.">
+      <label id="lot-report-adj-threshold-wrap" style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);" title="Adjustment threshold. Typing here auto-switches the Filter to 'Adjustments > threshold%' so the number takes effect immediately.">
         Adj. %:
-        <input id="lot-report-adj-threshold" type="number" min="0" max="100" step="0.5" value="20" oninput="_debouncedLoadLotReport()" style="width:60px;padding:5px 8px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;height:32px;">
+        <input id="lot-report-adj-threshold" type="number" min="0" max="100" step="0.5" value="20" oninput="_onAdjThresholdChanged()" style="width:60px;padding:5px 8px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;height:32px;">
       </label>
       <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
         SKU contains:
@@ -5042,6 +5042,16 @@ let _lotReportDebounce = null;
 function _debouncedLoadLotReport() {
   clearTimeout(_lotReportDebounce);
   _lotReportDebounce = setTimeout(loadLotReport, 300);
+}
+
+// The threshold input is only meaningful when the filter is
+// 'high_adjustment_pct'. If the user changes the number while the filter
+// is on any other mode, they're implicitly asking for the percentage
+// filter — auto-flip the dropdown so the number actually takes effect.
+function _onAdjThresholdChanged() {
+  const filter = document.getElementById('lot-report-filter');
+  if (filter && filter.value !== 'high_adjustment_pct') filter.value = 'high_adjustment_pct';
+  _debouncedLoadLotReport();
 }
 
 function renderLotReportCategoryChips() {
