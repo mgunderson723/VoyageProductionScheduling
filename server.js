@@ -6589,15 +6589,22 @@ function computeLotBalance(rows) {
     if (!b.expiry_date && m.expiry_date) b.expiry_date = m.expiry_date;
     const rt = String(m.ref_type || "").toUpperCase();
     if (rt === "PO") {
-      b.received_qty += qi;         // POs are always inbound
+      b.received_qty += qi;         // POs are always inbound — the "birth" of an RM lot
       b.other_out += qo;            // rare, but preserve
     } else if (rt === "MO") {
-      b.received_qty += qi;         // MO outputs (WIP/FG creation) count as received
+      b.received_qty += qi;         // MO outputs are the "birth" of a WIP/FG lot
       b.used_in_mfg += qo;
     } else if (rt === "TR") {
+      // Location transfers are NOT new inventory — the same lot moved from
+      // one bin/location to another. A well-formed lot has paired TR-out +
+      // TR-in for each move, netting to zero. Excluding them from
+      // received_qty prevents 6× double-counting when a lot moves through
+      // 5–6 locations over its lifetime (spot-caught by matt on lot
+      // RRC4290225SPSP: 19,000 kg PO → 128,000 kg reported "received"
+      // because each TR-in added another 19k). net_transferred still tracks
+      // the imbalance for audit visibility.
       b.tr_in += qi;
       b.tr_out += qo;
-      b.received_qty += qi;         // TR-in adds to the lot's total received
     } else if (rt === "SO" || rt === "FG") {
       b.sold_to_customers += qo;
       b.other_in += qi;             // returns, rare
@@ -6611,8 +6618,15 @@ function computeLotBalance(rows) {
   }
   b.net_transferred = round4(b.tr_in - b.tr_out);
   b.net_adjusted_out = round4(b.st_out - b.st_in);
+  // Accounting identity (derives from Σ qty_in − Σ qty_out = balance):
+  //   remaining = received − used − sold − net_adjusted_out + net_transferred
+  // Adding net_transferred (not subtracting) is correct because TR-in adds
+  // to the paper balance and TR-out subtracts; for paired moves the net is
+  // zero and the term drops out. For unpaired TR-out (rare, indicates
+  // ledger error), net_transferred is negative and remaining decreases —
+  // matching the physical intuition that material left the tracked system.
   b.remaining_paper = round4(
-    b.received_qty - b.used_in_mfg - b.sold_to_customers - b.net_transferred - b.net_adjusted_out
+    b.received_qty - b.used_in_mfg - b.sold_to_customers - b.net_adjusted_out + b.net_transferred
   );
   // Round the aggregation buckets so ledger arithmetic is exact for audit
   b.received_qty      = round4(b.received_qty);

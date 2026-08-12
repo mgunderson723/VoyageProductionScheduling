@@ -5647,12 +5647,12 @@ function renderBalanceView(balance) {
       </div>
       <table style="width:100%;border-collapse:collapse;">
         <tbody>
-          ${row('1', 'Initially received', balance.received_qty, 'PO receipts + MO outputs + TR-in', null)}
+          ${row('1', 'Initially received', balance.received_qty, 'PO receipts + MO outputs only (TRs are location moves, not new inventory — tracked separately in row 4)', null)}
           ${row('2', 'Used in manufacturing', balance.used_in_mfg, 'MO consumption (qty_out on MO refs)', null)}
           ${row('3', 'Sold to customers', balance.sold_to_customers, 'SO shipments + non-SO dispatch (FG refs)', null)}
           ${row('4', 'Net transferred', balance.net_transferred, `TR-in (${fmt(balance.tr_in)}) − TR-out (${fmt(balance.tr_out)}); should be ~0 for paired location moves`, null)}
           ${row('5', 'Net stock-adjusted out', balance.net_adjusted_out, `ST-out (${fmt(balance.st_out)}) − ST-in (${fmt(balance.st_in)}); undocumented adjustments show here`, adjColor)}
-          ${row('6', 'Remaining (paper)', balance.remaining_paper, '(1) − (2) − (3) − (4) − (5)', remColor)}
+          ${row('6', 'Remaining (paper)', balance.remaining_paper, '(1) − (2) − (3) − (5) + (4)', remColor)}
         </tbody>
       </table>
       ${reconHtml}
