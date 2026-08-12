@@ -6618,6 +6618,14 @@ function computeLotBalance(rows) {
   }
   b.net_transferred = round4(b.tr_in - b.tr_out);
   b.net_adjusted_out = round4(b.st_out - b.st_in);
+  // Ratio of |net adjustments| to received. Primary triage signal for the
+  // SQF audit: a lot with 21% of its receipt stock-adjusted out (i.e. gone
+  // without documented consumption or shipment) needs an explanation. Null
+  // when received is 0 so downstream sort/filter can distinguish "no
+  // receipt data" from "0% adjusted".
+  b.adjustment_pct_of_received = (b.received_qty > 0)
+    ? round4(Math.abs(b.net_adjusted_out) / b.received_qty * 100)
+    : null;
   // Accounting identity (derives from Σ qty_in − Σ qty_out = balance):
   //   remaining = received − used − sold − net_adjusted_out + net_transferred
   // Adding net_transferred (not subtracting) is correct because TR-in adds
@@ -6711,13 +6719,19 @@ app.get("/api/traceability/lot-balance/:code", (req, res) => {
 //   sku                Substring match on SKU. Default: none.
 //   filter             "activity" (default, matches audit scope),
 //                      "adjustments" (only lots with |net_adjusted_out| > 0),
+//                      "high_adjustment_pct" (only lots where the adjustment
+//                      is a large fraction of the receipt — see
+//                      min_adjustment_pct; the "point the team at problem
+//                      lots" filter),
 //                      "delta" (only lots where reconciliation_delta != 0),
 //                      "all" (every lot with any movement).
+//   min_adjustment_pct Threshold for high_adjustment_pct filter. Default 20,
+//                      matches the "more than 20%" audit call-out.
 //   min_activity_qty   Minimum qty_out during window to qualify as "activity".
 //                      Default 0.01 so numeric-noise lots don't dominate.
 //   limit              Cap result size. Default 500, max 5000.
-//   sort               "adjusted_desc" (default), "delta_desc", "received_desc",
-//                      "last_movement_desc".
+//   sort               "adjusted_desc" (default), "adjustment_pct_desc",
+//                      "delta_desc", "received_desc", "last_movement_desc".
 app.get("/api/traceability/lot-balance-report", (req, res) => {
   const days = Math.max(1, Math.min(3650, parseInt(req.query.days, 10) || 90));
   const today = new Date().toISOString().slice(0, 10);
@@ -6728,6 +6742,8 @@ app.get("/api/traceability/lot-balance-report", (req, res) => {
   const skuFilter = String(req.query.sku || "").trim().toUpperCase();
   const filterMode = String(req.query.filter || "activity").toLowerCase();
   const minActivity = parseFloat(req.query.min_activity_qty) || 0.01;
+  const minAdjPct = parseFloat(req.query.min_adjustment_pct);
+  const minAdjPctThreshold = isFinite(minAdjPct) && minAdjPct >= 0 ? minAdjPct : 20;
   const limit = Math.max(1, Math.min(5000, parseInt(req.query.limit, 10) || 500));
   const sort = String(req.query.sort || "adjusted_desc").toLowerCase();
 
@@ -6757,6 +6773,10 @@ app.get("/api/traceability/lot-balance-report", (req, res) => {
 
     // Filter-mode zoom-ins
     if (filterMode === "adjustments" && Math.abs(balance.net_adjusted_out) < minActivity) continue;
+    if (filterMode === "high_adjustment_pct") {
+      if (balance.adjustment_pct_of_received == null) continue;
+      if (balance.adjustment_pct_of_received < minAdjPctThreshold) continue;
+    }
     if (filterMode === "delta") {
       if (balance.reconciliation_delta == null) continue;
       if (Math.abs(balance.reconciliation_delta) < minActivity) continue;
@@ -6765,10 +6785,11 @@ app.get("/api/traceability/lot-balance-report", (req, res) => {
   }
   // Sort
   const cmp = {
-    adjusted_desc:      (a, b) => Math.abs(b.net_adjusted_out) - Math.abs(a.net_adjusted_out),
-    delta_desc:         (a, b) => Math.abs(b.reconciliation_delta || 0) - Math.abs(a.reconciliation_delta || 0),
-    received_desc:      (a, b) => (b.received_qty || 0) - (a.received_qty || 0),
-    last_movement_desc: (a, b) => (b.last_movement_date || "").localeCompare(a.last_movement_date || ""),
+    adjusted_desc:        (a, b) => Math.abs(b.net_adjusted_out) - Math.abs(a.net_adjusted_out),
+    adjustment_pct_desc:  (a, b) => (b.adjustment_pct_of_received || 0) - (a.adjustment_pct_of_received || 0),
+    delta_desc:           (a, b) => Math.abs(b.reconciliation_delta || 0) - Math.abs(a.reconciliation_delta || 0),
+    received_desc:        (a, b) => (b.received_qty || 0) - (a.received_qty || 0),
+    last_movement_desc:   (a, b) => (b.last_movement_date || "").localeCompare(a.last_movement_date || ""),
   }[sort] || ((a, b) => Math.abs(b.net_adjusted_out) - Math.abs(a.net_adjusted_out));
   out.sort(cmp);
   res.json({

@@ -1251,6 +1251,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
         <select id="lot-report-filter" onchange="loadLotReport()" style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;height:32px;">
           <option value="activity" selected>Any production/sale activity (default)</option>
           <option value="adjustments">Only lots with net adjustments</option>
+          <option value="high_adjustment_pct">Adjustments &gt; 20% of received (audit triage)</option>
           <option value="delta">Only lots with reconciliation delta</option>
           <option value="all">All lots (any movement)</option>
         </select>
@@ -1262,7 +1263,8 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
         Sort:
         <select id="lot-report-sort" onchange="loadLotReport()" style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;height:32px;">
-          <option value="adjusted_desc" selected>Largest adjustments first</option>
+          <option value="adjusted_desc" selected>Largest adjustments first (abs qty)</option>
+          <option value="adjustment_pct_desc">Largest adjustments first (% of received)</option>
           <option value="delta_desc">Largest reconciliation delta first</option>
           <option value="received_desc">Largest received qty first</option>
           <option value="last_movement_desc">Most recent movement first</option>
@@ -1286,6 +1288,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
             <th style="text-align:right;" title="Σ qty_out for SO / FG refs">Sold</th>
             <th style="text-align:right;" title="TR-in − TR-out">Net xfer</th>
             <th style="text-align:right;" title="ST-out − ST-in (the audit-flagged bucket)">Net adjusted</th>
+            <th style="text-align:right;" title="|Net adjusted| / Received — the primary audit triage signal">% adjusted</th>
             <th style="text-align:right;" title="Received − Used − Sold − Net xfer − Net adjusted">Remaining (paper)</th>
             <th style="text-align:right;" title="Cin7 actual on-hand for this lot">Cin7 OH</th>
             <th style="text-align:right;" title="Cin7 OH − Remaining paper (≠ 0 = reconciliation issue)">Δ</th>
@@ -5066,7 +5069,7 @@ async function loadLotReport() {
   const tbody = document.getElementById('lot-report-tbody');
   const emptyEl = document.getElementById('lot-report-empty');
   const tsEl = document.getElementById('lot-report-ts');
-  if (tbody) tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:24px;color:var(--vf-text-tertiary);">Loading…</td></tr>';
+  if (tbody) tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;padding:24px;color:var(--vf-text-tertiary);">Loading…</td></tr>';
   if (emptyEl) emptyEl.style.display = 'none';
   try {
     const params = new URLSearchParams({
@@ -5087,7 +5090,7 @@ async function loadLotReport() {
     renderLotReportTable();
     renderLotReportKpis();
   } catch (e) {
-    if (tbody) tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:24px;color:var(--vf-danger-text);">Failed: ${escapeHtml(e.message)}</td></tr>`;
+    if (tbody) tbody.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:24px;color:var(--vf-danger-text);">Failed: ${escapeHtml(e.message)}</td></tr>`;
   }
 }
 
@@ -5134,6 +5137,7 @@ function renderLotReportTable() {
       ${cell(l.sold_to_customers)}
       ${cell(l.net_transferred)}
       ${cell(l.net_adjusted_out, adjColor)}
+      <td style="text-align:right;font-variant-numeric:tabular-nums;${(l.adjustment_pct_of_received != null && l.adjustment_pct_of_received >= 20) ? 'color:var(--vf-danger-text);font-weight:600;' : ((l.adjustment_pct_of_received != null && l.adjustment_pct_of_received >= 10) ? 'color:var(--vf-warning-text);font-weight:600;' : '')}">${l.adjustment_pct_of_received == null ? '—' : l.adjustment_pct_of_received.toLocaleString(undefined,{maximumFractionDigits:1}) + '%'}</td>
       ${cell(l.remaining_paper, remColor)}
       ${cell(l.actual_onhand)}
       ${cell(l.reconciliation_delta, deltaColor)}
@@ -5149,7 +5153,7 @@ function downloadLotReportCsv() {
   }
   const headers = ['batch','sku','product','unit','category','movement_count','first_movement_date','last_movement_date',
     'received_qty','used_in_mfg','sold_to_customers','tr_in','tr_out','net_transferred',
-    'st_in','st_out','net_adjusted_out','remaining_paper',
+    'st_in','st_out','net_adjusted_out','adjustment_pct_of_received','remaining_paper',
     'actual_onhand','actual_allocated','actual_available','actual_locations','reconciliation_delta'];
   const rows = _lotReportCache.lots.map(l => headers.map(h => {
     let v;
@@ -5651,7 +5655,7 @@ function renderBalanceView(balance) {
           ${row('2', 'Used in manufacturing', balance.used_in_mfg, 'MO consumption (qty_out on MO refs)', null)}
           ${row('3', 'Sold to customers', balance.sold_to_customers, 'SO shipments + non-SO dispatch (FG refs)', null)}
           ${row('4', 'Net transferred', balance.net_transferred, `TR-in (${fmt(balance.tr_in)}) − TR-out (${fmt(balance.tr_out)}); should be ~0 for paired location moves`, null)}
-          ${row('5', 'Net stock-adjusted out', balance.net_adjusted_out, `ST-out (${fmt(balance.st_out)}) − ST-in (${fmt(balance.st_in)}); undocumented adjustments show here`, adjColor)}
+          ${row('5', 'Net stock-adjusted out', balance.net_adjusted_out, `ST-out (${fmt(balance.st_out)}) − ST-in (${fmt(balance.st_in)}); ${balance.adjustment_pct_of_received != null ? '<b>' + balance.adjustment_pct_of_received.toLocaleString(undefined,{maximumFractionDigits:1}) + '%</b> of receipt — ' : ''}undocumented adjustments show here`, adjColor)}
           ${row('6', 'Remaining (paper)', balance.remaining_paper, '(1) − (2) − (3) − (5) + (4)', remColor)}
         </tbody>
       </table>
