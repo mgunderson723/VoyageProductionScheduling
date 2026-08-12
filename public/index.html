@@ -5152,9 +5152,13 @@ function renderLotReportTable() {
     const deltaColor = (l.reconciliation_delta != null && Math.abs(l.reconciliation_delta) > 0.01)
       ? (Math.abs(l.reconciliation_delta) > 1 ? 'var(--vf-danger-text)' : 'var(--vf-warning-text)')
       : null;
+    const subLotCount = (l.sub_lot_codes && l.sub_lot_codes.length) || 0;
+    const subLotBadge = subLotCount > 0
+      ? `<span title="Aggregated ${subLotCount} sub-lot${subLotCount===1?'':'s'}: ${(l.sub_lot_codes||[]).join(', ')}" style="display:inline-block;margin-left:6px;padding:1px 5px;font-size:9px;background:var(--vf-cat-purple-base);color:white;border-radius:8px;vertical-align:middle;">+${subLotCount} sub-lot${subLotCount===1?'':'s'}</span>`
+      : '';
     return `<tr>
       <td>
-        <a href="?trace=${encodeURIComponent(l.batch)}" onclick="event.preventDefault();switchTab('traceability');document.getElementById('trace-search-input').value='${escapeHtml(l.batch)}';runTraceabilitySearch();" style="color:var(--vf-info-text);text-decoration:none;font-family:monospace;font-size:12px;">${escapeHtml(l.batch)}</a>
+        <a href="?trace=${encodeURIComponent(l.batch)}" onclick="event.preventDefault();switchTab('traceability');document.getElementById('trace-search-input').value='${escapeHtml(l.batch)}';runTraceabilitySearch();" style="color:var(--vf-info-text);text-decoration:none;font-family:monospace;font-size:12px;">${escapeHtml(l.batch)}</a>${subLotBadge}
         <div style="font-size:10px;color:var(--vf-text-tertiary);">${escapeHtml(l.sku || '')} · ${escapeHtml(l.category || '')}</div>
       </td>
       ${cell(l.received_qty)}
@@ -5176,13 +5180,14 @@ function downloadLotReportCsv() {
     alert('No lots loaded to export. Adjust filters and try again.');
     return;
   }
-  const headers = ['batch','sku','product','unit','category','movement_count','first_movement_date','last_movement_date',
+  const headers = ['batch','sub_lot_codes','sku','product','unit','category','movement_count','first_movement_date','last_movement_date',
     'received_qty','used_in_mfg','sold_to_customers','tr_in','tr_out','net_transferred',
     'st_in','st_out','net_adjusted_out','adjustment_pct_of_received','remaining_paper',
     'actual_onhand','actual_allocated','actual_available','actual_locations','reconciliation_delta'];
   const rows = _lotReportCache.lots.map(l => headers.map(h => {
     let v;
     if (h === 'actual_locations') v = (l.actual_locations || []).join('; ');
+    else if (h === 'sub_lot_codes') v = (l.sub_lot_codes || []).join('; ');
     else v = l[h];
     v = v == null ? '' : String(v);
     return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;

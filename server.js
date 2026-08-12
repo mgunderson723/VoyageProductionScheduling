@@ -6709,6 +6709,35 @@ function findRelatedSubLots(parent, idx) {
   return out.sort();
 }
 
+// Build a parent→children map across the whole movement index.
+// A child code is one that matches "PARENT_..." where PARENT itself
+// exists as a batch code. Handles multi-underscore codes like
+// "4529100000_14_1107" by preferring the longest matching prefix (so
+// "4529100000" wins over any shorter partial). Used by the bulk lot
+// ledger report so parent lots roll up their re-lot children and
+// children don't appear as their own rows.
+function buildLotFamilies(idx) {
+  const parentOf = new Map();  // child code -> parent code
+  const childrenOf = new Map(); // parent code -> [children]
+  for (const child of idx.byBatch.keys()) {
+    if (!child.includes("_")) continue;
+    const parts = child.split("_");
+    // Try progressively shorter prefixes; longest match wins so
+    // "4529100000_14_1107" prefers "4529100000_14" if it exists (it
+    // doesn't in practice, so we fall back to "4529100000").
+    for (let i = parts.length - 1; i >= 1; i--) {
+      const candidate = parts.slice(0, i).join("_");
+      if (idx.byBatch.has(candidate)) {
+        parentOf.set(child, candidate);
+        if (!childrenOf.has(candidate)) childrenOf.set(candidate, []);
+        childrenOf.get(candidate).push(child);
+        break;
+      }
+    }
+  }
+  return { parentOf, childrenOf };
+}
+
 // GET /api/traceability/lot-balance/:code — single lot rollup, aggregated
 // over parent + auto-detected sub-lots by default.
 // Query params:
@@ -6809,11 +6838,24 @@ app.get("/api/traceability/lot-balance-report", (req, res) => {
   const minAdjPctThreshold = isFinite(minAdjPct) && minAdjPct >= 0 ? minAdjPct : 20;
   const limit = Math.max(1, Math.min(5000, parseInt(req.query.limit, 10) || 500));
   const sort = String(req.query.sort || "adjusted_desc").toLowerCase();
+  const parentOnly = req.query.parent_only === "1" || req.query.parent_only === "true";
 
   const idx = getMovementIndex();
+  // Detect the re-lot family map once per request so parent lots roll up
+  // their sub-lot children (and children don't appear as separate rows).
+  // Skipped when parent_only=1 for legacy behavior.
+  const families = parentOnly ? { parentOf: new Map(), childrenOf: new Map() } : buildLotFamilies(idx);
   const out = [];
-  for (const [batch, rows] of idx.byBatch) {
+  for (const [batch, parentRows] of idx.byBatch) {
+    // Skip sub-lots — they roll up under their parent.
+    if (families.parentOf.has(batch)) continue;
+    // Build the family's row set: parent rows + all children's rows.
+    const childCodes = families.childrenOf.get(batch) || [];
+    const rows = childCodes.length ? parentRows.concat(...childCodes.map(c => idx.byBatch.get(c) || [])) : parentRows;
+
     // Activity filter: only include lots with qualifying qty_out in window
+    // (checked against family-aggregated rows so consumption on a sub-lot
+    // still qualifies the parent).
     if (filterMode === "activity") {
       let qualifies = false;
       for (const m of rows) {
@@ -6828,6 +6870,8 @@ app.get("/api/traceability/lot-balance-report", (req, res) => {
     const balance = enrichBalanceWithOnHand(computeLotBalance(rows), batch);
     balance.batch = batch;
     balance.movement_count = rows.length;
+    balance.sub_lot_codes = childCodes;
+    balance.sub_lot_movement_count = rows.length - parentRows.length;
     balance.category = skuCategory(balance.sku);
 
     // Category / SKU filters
