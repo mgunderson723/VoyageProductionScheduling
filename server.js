@@ -6703,6 +6703,35 @@ app.get("/api/traceability/lot-balance/:code", (req, res) => {
   balance.batch = code;
   balance.movement_count = rows.length;
   balance.category = skuCategory(balance.sku);
+  // Per-lot triage: attach the raw ST rows so the UI can render each
+  // adjustment with its date + reference + qty + document. This is the
+  // 80/20 answer to "what happened to this lot" — one glance tells you
+  // whether the adjustment was one big write-off or a lot of small ones,
+  // whether there's a document reference for backup, and whether the
+  // adjustments cluster in a data-quality window (spot the audit-safe
+  // ones vs. the ones actually needing follow-up).
+  const stRowsRaw = rows
+    .filter(m => String(m.ref_type || "").toUpperCase() === "ST")
+    .slice()
+    .sort((a, b) => (a.movement_date || "").localeCompare(b.movement_date || ""));
+  // Route through the noise-window annotator so lot-migration and
+  // vc-via-st flags surface on each row — these often explain 80% of the
+  // "why" without any documentation being missing.
+  const stRows = annotateMovements(stRowsRaw);
+  balance.adjustment_rows = stRows.map(m => ({
+    movement_date: m.movement_date || null,
+    reference: m.reference || null,
+    ref_number: m.ref_number || null,
+    movement_type: m.movement_type || null,
+    qty_in: Number(m.qty_in) || 0,
+    qty_out: Number(m.qty_out) || 0,
+    net: round4((Number(m.qty_out) || 0) - (Number(m.qty_in) || 0)),
+    location: m.location || null,
+    document_reference: m.document_reference || null,
+    cost_in: Number(m.cost_in) || 0,
+    cost_out: Number(m.cost_out) || 0,
+    dq_notes: m.dq_notes || null,
+  }));
   res.json({ ok: true, balance });
 });
 

@@ -5666,6 +5666,61 @@ function renderBalanceView(balance) {
     reconHtml = `<div style="margin-top:12px;padding:8px 12px;background:var(--vf-surface-sunken);border-radius:0 0 var(--vf-radius-md) var(--vf-radius-md);font-size:12px;color:var(--vf-text-tertiary);">Cin7 on-hand not synced for this lot — reconciliation check unavailable.</div>`;
   }
   const catBadge = balance.category ? `<span class="badge badge-neutral" style="margin-left:8px;">${escapeHtml(balance.category)}</span>` : '';
+  // Stock adjustment detail — the "what happened" table. Rendered only
+  // when there are actual ST rows. Highlights the biggest ones (usually
+  // one write-off dominates), surfaces document references so QA can see
+  // whether there's paperwork, and pipes through noise-window flags so
+  // audit-safe adjustments (lot migration, VC-via-ST) are visible.
+  let adjDetailHtml = '';
+  const adjRows = balance.adjustment_rows || [];
+  if (adjRows.length) {
+    const fmtSigned = v => (v > 0 ? '+' : '') + fmt(v);
+    // Sort by |net| desc so the biggest hits are on top
+    const sorted = adjRows.slice().sort((a, b) => Math.abs(b.net || 0) - Math.abs(a.net || 0));
+    const totalNetOut = sorted.reduce((s, r) => s + (r.net > 0 ? r.net : 0), 0);
+    const rows = sorted.map(r => {
+      const netColor = Math.abs(r.net || 0) > 0.01
+        ? (r.net > 0 ? 'var(--vf-danger-text)' : 'var(--vf-info-text)')
+        : 'var(--vf-text-tertiary)';
+      const share = totalNetOut > 0 && r.net > 0
+        ? `<span style="font-size:10px;color:var(--vf-text-tertiary);margin-left:4px;">(${(r.net/totalNetOut*100).toFixed(0)}% of loss)</span>`
+        : '';
+      const dqBadge = (r.dq_notes && r.dq_notes.length)
+        ? `<div style="margin-top:2px;">${r.dq_notes.map(n => `<span class="badge badge-neutral" style="font-size:9px;background:var(--vf-warning-base);color:white;">${escapeHtml(n.id || 'noise')}</span>`).join(' ')}</div>`
+        : '';
+      const doc = r.document_reference
+        ? `<div style="font-size:10px;color:var(--vf-text-tertiary);">doc: ${escapeHtml(r.document_reference)}</div>`
+        : `<div style="font-size:10px;color:var(--vf-warning-text);">no document</div>`;
+      return `<tr>
+        <td style="padding:4px 8px;font-size:11px;white-space:nowrap;">${r.movement_date || '?'}</td>
+        <td style="padding:4px 8px;font-size:11px;font-family:monospace;">${escapeHtml(r.reference || r.ref_number || '?')}${dqBadge}</td>
+        <td style="padding:4px 8px;font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(r.movement_type || '')}</td>
+        <td style="padding:4px 8px;text-align:right;font-variant-numeric:tabular-nums;color:${netColor};font-weight:${Math.abs(r.net||0) > 0.01 ? '600':'400'};">${fmtSigned(r.net)}${unit}${share}</td>
+        <td style="padding:4px 8px;font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(r.location || '')}${doc}</td>
+      </tr>`;
+    }).join('');
+    adjDetailHtml = `
+      <div style="max-width:720px;margin-top:12px;background:var(--vf-surface-raised);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);overflow:hidden;">
+        <div style="padding:10px 16px;background:var(--vf-surface-sunken);border-bottom:1px solid var(--vf-border-default);">
+          <div style="font-weight:600;font-size:13px;">Stock adjustment detail (${adjRows.length} row${adjRows.length===1?'':'s'})</div>
+          <div style="font-size:11px;color:var(--vf-text-tertiary);margin-top:2px;">
+            Sorted largest first. Positive net = adjusted OUT of the lot. Rows with a noise-window badge are documented-by-context (lot migration, VC-via-ST); rows with "no document" flagged are the ones QA should chase for paperwork.
+          </div>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:11px;">
+          <thead>
+            <tr style="background:var(--vf-surface-sunken);color:var(--vf-text-tertiary);text-transform:uppercase;letter-spacing:0.04em;font-size:10px;">
+              <th style="padding:6px 8px;text-align:left;">Date</th>
+              <th style="padding:6px 8px;text-align:left;">Reference</th>
+              <th style="padding:6px 8px;text-align:left;">Type</th>
+              <th style="padding:6px 8px;text-align:right;">Net qty</th>
+              <th style="padding:6px 8px;text-align:left;">Location / doc</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+  }
   return `
     <div style="max-width:720px;background:var(--vf-surface-raised);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);overflow:hidden;">
       <div style="padding:12px 16px;background:var(--vf-surface-sunken);border-bottom:1px solid var(--vf-border-default);">
@@ -5680,12 +5735,13 @@ function renderBalanceView(balance) {
           ${row('2', 'Used in manufacturing', balance.used_in_mfg, 'MO consumption (qty_out on MO refs)', null)}
           ${row('3', 'Sold to customers', balance.sold_to_customers, 'SO shipments + non-SO dispatch (FG refs)', null)}
           ${row('4', 'Net transferred', balance.net_transferred, `TR-in (${fmt(balance.tr_in)}) − TR-out (${fmt(balance.tr_out)}); should be ~0 for paired location moves`, null)}
-          ${row('5', 'Net stock-adjusted out', balance.net_adjusted_out, `ST-out (${fmt(balance.st_out)}) − ST-in (${fmt(balance.st_in)}); ${balance.adjustment_pct_of_received != null ? '<b>' + balance.adjustment_pct_of_received.toLocaleString(undefined,{maximumFractionDigits:1}) + '%</b> of receipt — ' : ''}undocumented adjustments show here`, adjColor)}
+          ${row('5', 'Net stock-adjusted out', balance.net_adjusted_out, `ST-out (${fmt(balance.st_out)}) − ST-in (${fmt(balance.st_in)}); ${balance.adjustment_pct_of_received != null ? '<b>' + balance.adjustment_pct_of_received.toLocaleString(undefined,{maximumFractionDigits:1}) + '%</b> of receipt — ' : ''}see detail table below`, adjColor)}
           ${row('6', 'Remaining (paper)', balance.remaining_paper, '(1) − (2) − (3) − (5) + (4)', remColor)}
         </tbody>
       </table>
       ${reconHtml}
-    </div>`;
+    </div>
+    ${adjDetailHtml}`;
 }
 
 function renderTimelineTable(movements) {
