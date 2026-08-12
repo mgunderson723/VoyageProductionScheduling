@@ -933,6 +933,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
     <button class="tab" onclick="switchTab('capacity')">Capacity &amp; ops</button>
     <button class="tab" onclick="switchTab('traceability')">Traceability</button>
     <button class="tab" onclick="switchTab('expiring-lots')">Expiring lots</button>
+    <button class="tab" onclick="switchTab('lot-report')">Lot ledger report</button>
     <button class="tab" onclick="switchTab('mo-status')">MO Status</button>
     <button class="tab" onclick="switchTab('live-inv')">Live Inventory</button>
     <button class="tab" onclick="switchTab('error-reporting')">Error reporting</button>
@@ -1149,6 +1150,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       <div id="trace-dq-banner" class="trace-dq-banner" style="display:none;"></div>
       <div class="trace-view-tabs" id="trace-view-tabs" style="display:flex;align-items:center;">
         <button class="trace-view-tab active" data-view="timeline" onclick="setTraceView('timeline')">Timeline</button>
+        <button class="trace-view-tab" data-view="balance" onclick="setTraceView('balance')" title="6-field lot balance for reconciliation (received / used / sold / transferred / adjusted / remaining)">Balance</button>
         <button class="trace-view-tab" data-view="lineage" onclick="setTraceView('lineage')">Lineage tree</button>
         <button class="trace-view-tab" data-view="forward" onclick="setTraceView('forward')">Forward trace</button>
         <button class="trace-view-tab" data-view="ledger" onclick="setTraceView('ledger')">Ledger + balance</button>
@@ -1218,6 +1220,82 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       </table>
     </div>
     <div id="expiring-lots-empty" class="no-inv-note" style="display:none;">No lots match the current filters.</div>
+  </div>
+
+  <!-- LOT LEDGER REPORT -->
+  <div id="tab-lot-report" style="display:none;">
+    <div class="header">
+      <div>
+        <h2>Lot ledger report</h2>
+        <span style="font-size:var(--vf-text-sm);color:var(--vf-text-tertiary);">6-field lot rollup for internal audit triage. Default scope: lots with production consumption or customer shipments in the trailing window (matches SQF pre-assessment sample selection).</span>
+      </div>
+      <div style="display:flex;gap:var(--vf-space-2);align-items:center;">
+        <span id="lot-report-ts" style="font-size:var(--vf-text-xs);color:var(--vf-text-tertiary);"></span>
+        <button class="btn btn-sm" onclick="downloadLotReportCsv()">↓ CSV</button>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:var(--vf-space-2);align-items:center;margin-bottom:var(--vf-space-3);flex-wrap:wrap;">
+      <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
+        Trailing:
+        <select id="lot-report-days" onchange="loadLotReport()" style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;height:32px;">
+          <option value="30">30 days</option>
+          <option value="60">60 days</option>
+          <option value="90" selected>90 days</option>
+          <option value="180">180 days</option>
+          <option value="365">1 year</option>
+        </select>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
+        Filter:
+        <select id="lot-report-filter" onchange="loadLotReport()" style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;height:32px;">
+          <option value="activity" selected>Any production/sale activity (default)</option>
+          <option value="adjustments">Only lots with net adjustments</option>
+          <option value="delta">Only lots with reconciliation delta</option>
+          <option value="all">All lots (any movement)</option>
+        </select>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
+        SKU contains:
+        <input id="lot-report-sku" placeholder="e.g. RM-110" oninput="_debouncedLoadLotReport()" style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;width:140px;height:32px;">
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
+        Sort:
+        <select id="lot-report-sort" onchange="loadLotReport()" style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;height:32px;">
+          <option value="adjusted_desc" selected>Largest adjustments first</option>
+          <option value="delta_desc">Largest reconciliation delta first</option>
+          <option value="received_desc">Largest received qty first</option>
+          <option value="last_movement_desc">Most recent movement first</option>
+        </select>
+      </label>
+      <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">
+        <span style="font-size:var(--vf-text-sm);color:var(--vf-text-secondary);margin-right:4px;">Categories:</span>
+        <div id="lot-report-category-chips" style="display:flex;gap:4px;flex-wrap:wrap;"></div>
+      </div>
+    </div>
+
+    <div class="status-summary" id="lot-report-kpis"></div>
+
+    <div style="overflow-x:auto;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);max-height:640px;overflow-y:auto;">
+      <table class="status-table" id="lot-report-table" style="margin-top:0;">
+        <thead style="position:sticky;top:0;background:var(--vf-surface-sunken);z-index:1;">
+          <tr>
+            <th>Lot / SKU</th>
+            <th style="text-align:right;" title="Σ qty_in for PO / MO / TR-in refs">Received</th>
+            <th style="text-align:right;" title="Σ qty_out for MO refs">Used in mfg</th>
+            <th style="text-align:right;" title="Σ qty_out for SO / FG refs">Sold</th>
+            <th style="text-align:right;" title="TR-in − TR-out">Net xfer</th>
+            <th style="text-align:right;" title="ST-out − ST-in (the audit-flagged bucket)">Net adjusted</th>
+            <th style="text-align:right;" title="Received − Used − Sold − Net xfer − Net adjusted">Remaining (paper)</th>
+            <th style="text-align:right;" title="Cin7 actual on-hand for this lot">Cin7 OH</th>
+            <th style="text-align:right;" title="Cin7 OH − Remaining paper (≠ 0 = reconciliation issue)">Δ</th>
+            <th>Last movement</th>
+          </tr>
+        </thead>
+        <tbody id="lot-report-tbody"></tbody>
+      </table>
+    </div>
+    <div id="lot-report-empty" class="no-inv-note" style="display:none;">No lots match the current filters.</div>
   </div>
 
   <!-- MO STATUS -->
@@ -2871,10 +2949,10 @@ function switchTab(t){
   if(t==='yield-setup'&&(!currentUser||currentUser.role!=='admin'))return;
   if(t==='pipeline'&&(!currentUser||currentUser.role!=='admin'))return;
   if(t==='mrp'&&(!currentUser||currentUser.role==='viewer'))return;
-  ['calendar','orders','pipeline','capacity','traceability','expiring-lots','mo-status','live-inv','error-reporting','production-output','yield','mrp','mrp-setup','yield-setup','admin'].forEach(k=>{document.getElementById('tab-'+k).style.display=k===t?'':'none';});
+  ['calendar','orders','pipeline','capacity','traceability','expiring-lots','lot-report','mo-status','live-inv','error-reporting','production-output','yield','mrp','mrp-setup','yield-setup','admin'].forEach(k=>{const el=document.getElementById('tab-'+k);if(el)el.style.display=k===t?'':'none';});
   document.querySelectorAll('.tab').forEach(el=>{
     const tabName=el.textContent.trim().toLowerCase();
-    const map={'calendar':'calendar','work orders':'orders','pipeline':'pipeline','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','expiring lots':'expiring-lots','mo status':'mo-status','live inventory':'live-inv','error reporting':'error-reporting','production output':'production-output','yield':'yield','mrp':'mrp','mrp setup':'mrp-setup','yield setup':'yield-setup','admin console':'admin'};
+    const map={'calendar':'calendar','work orders':'orders','pipeline':'pipeline','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','expiring lots':'expiring-lots','lot ledger report':'lot-report','mo status':'mo-status','live inventory':'live-inv','error reporting':'error-reporting','production output':'production-output','yield':'yield','mrp':'mrp','mrp setup':'mrp-setup','yield setup':'yield-setup','admin console':'admin'};
     el.classList.toggle('active',map[tabName]===t);
   });
   if(t==='calendar')renderCal();
@@ -2882,6 +2960,7 @@ function switchTab(t){
   if(t==='admin'){renderUsers();loadAuditLog();loadBugReports();}
   if(t==='traceability'){ renderTraceability(); }
   if(t==='expiring-lots'){ loadExpiringLots(); }
+  if(t==='lot-report'){ loadLotReport(); }
   if(t==='mo-status'){populateMOStatusMachineFilter();renderMOStatus();loadSyncStatus();}
   if(t==='live-inv')loadLiveInventory();
   if(t==='error-reporting')loadErrorReporting();
@@ -4946,6 +5025,152 @@ function downloadExpiringLotsCsv() {
   URL.revokeObjectURL(url);
 }
 
+// ── Lot ledger report tab ───────────────────────────────────────────────────
+// Rollup table of the 6-field lot balance for a set of lots, defaulting to
+// the SQF audit scope (lots with production/sale activity in trailing N days).
+let _lotReportCache = null;
+let _lotReportSelectedCategories = new Set();
+let _lotReportDebounce = null;
+
+function _debouncedLoadLotReport() {
+  clearTimeout(_lotReportDebounce);
+  _lotReportDebounce = setTimeout(loadLotReport, 300);
+}
+
+function renderLotReportCategoryChips() {
+  const container = document.getElementById('lot-report-category-chips');
+  if (!container) return;
+  const allActive = _lotReportSelectedCategories.size === 0;
+  const chip = (label, code, active) => {
+    const bg = active ? 'var(--vf-cat-purple-base)' : 'var(--vf-surface-raised)';
+    const fg = active ? 'white' : 'var(--vf-text-secondary)';
+    const border = active ? 'var(--vf-cat-purple-base)' : 'var(--vf-border-default)';
+    return `<button type="button" onclick="toggleLotReportCategory('${code}')" style="padding:4px 10px;font-size:11px;border:1px solid ${border};border-radius:12px;background:${bg};color:${fg};font-family:inherit;cursor:pointer;font-weight:${active?'600':'400'};">${label}</button>`;
+  };
+  const cats = ['RM','VC','PK','WIP','FG','OTHER'];
+  container.innerHTML =
+    chip('All', '__all__', allActive) +
+    cats.map(c => chip(c, c, _lotReportSelectedCategories.has(c))).join('');
+}
+
+function toggleLotReportCategory(code) {
+  if (code === '__all__') _lotReportSelectedCategories.clear();
+  else if (_lotReportSelectedCategories.has(code)) _lotReportSelectedCategories.delete(code);
+  else _lotReportSelectedCategories.add(code);
+  renderLotReportCategoryChips();
+  loadLotReport();
+}
+
+async function loadLotReport() {
+  renderLotReportCategoryChips();
+  const tbody = document.getElementById('lot-report-tbody');
+  const emptyEl = document.getElementById('lot-report-empty');
+  const tsEl = document.getElementById('lot-report-ts');
+  if (tbody) tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:24px;color:var(--vf-text-tertiary);">Loading…</td></tr>';
+  if (emptyEl) emptyEl.style.display = 'none';
+  try {
+    const params = new URLSearchParams({
+      days: document.getElementById('lot-report-days').value,
+      filter: document.getElementById('lot-report-filter').value,
+      sort: document.getElementById('lot-report-sort').value,
+    });
+    const sku = (document.getElementById('lot-report-sku').value || '').trim();
+    if (sku) params.set('sku', sku);
+    if (_lotReportSelectedCategories.size > 0) {
+      params.set('category', Array.from(_lotReportSelectedCategories).join(','));
+    }
+    const resp = await fetch('/api/traceability/lot-balance-report?' + params.toString());
+    const j = await resp.json();
+    if (!j.ok) throw new Error(j.error || 'HTTP ' + resp.status);
+    _lotReportCache = j;
+    if (tsEl) tsEl.textContent = `${j.total_qualifying} lot${j.total_qualifying===1?'':'s'} match · window since ${j.activity_since}`;
+    renderLotReportTable();
+    renderLotReportKpis();
+  } catch (e) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:24px;color:var(--vf-danger-text);">Failed: ${escapeHtml(e.message)}</td></tr>`;
+  }
+}
+
+function renderLotReportKpis() {
+  const el = document.getElementById('lot-report-kpis');
+  if (!el || !_lotReportCache) return;
+  const lots = _lotReportCache.lots || [];
+  const withAdj = lots.filter(l => Math.abs(l.net_adjusted_out || 0) > 0.01).length;
+  const withDelta = lots.filter(l => l.reconciliation_delta != null && Math.abs(l.reconciliation_delta) > 0.01).length;
+  const sumAdj = lots.reduce((s, l) => s + Math.abs(l.net_adjusted_out || 0), 0);
+  const kpis = [
+    { label:'Lots in report',           val: (_lotReportCache.count||0).toLocaleString(),                accent:'var(--vf-info-base)' },
+    { label:'With net adjustments',     val: withAdj.toLocaleString(),                                    accent: withAdj > 0 ? 'var(--vf-warning-base)' : 'var(--vf-success-base)' },
+    { label:'With reconciliation Δ',    val: withDelta.toLocaleString(),                                  accent: withDelta > 0 ? 'var(--vf-warning-base)' : 'var(--vf-success-base)' },
+    { label:'Σ |net adjustments|',      val: sumAdj.toLocaleString(undefined,{maximumFractionDigits:1}), accent: 'var(--vf-cat-purple-base)' },
+  ];
+  el.innerHTML = kpis.map(x =>
+    `<div class="metric" style="${x.accent?'border-left:3px solid '+x.accent+';':''}"><div class="metric-label">${x.label}</div><div class="metric-value">${x.val}</div></div>`
+  ).join('');
+}
+
+function renderLotReportTable() {
+  const tbody = document.getElementById('lot-report-tbody');
+  const emptyEl = document.getElementById('lot-report-empty');
+  if (!tbody || !_lotReportCache) return;
+  const lots = _lotReportCache.lots || [];
+  if (!lots.length) { tbody.innerHTML = ''; if (emptyEl) emptyEl.style.display = 'block'; return; }
+  if (emptyEl) emptyEl.style.display = 'none';
+  const num = v => (v == null || !isFinite(v)) ? '—' : Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
+  const cell = (v, color) => `<td style="text-align:right;font-variant-numeric:tabular-nums;${color?'color:'+color+';font-weight:600;':''}">${num(v)}</td>`;
+  tbody.innerHTML = lots.map(l => {
+    const adjColor = Math.abs(l.net_adjusted_out || 0) > 0.01 ? 'var(--vf-warning-text)' : null;
+    const remColor = (l.remaining_paper || 0) < 0 ? 'var(--vf-danger-text)' : null;
+    const deltaColor = (l.reconciliation_delta != null && Math.abs(l.reconciliation_delta) > 0.01)
+      ? (Math.abs(l.reconciliation_delta) > 1 ? 'var(--vf-danger-text)' : 'var(--vf-warning-text)')
+      : null;
+    return `<tr>
+      <td>
+        <a href="?trace=${encodeURIComponent(l.batch)}" onclick="event.preventDefault();switchTab('traceability');document.getElementById('trace-search-input').value='${escapeHtml(l.batch)}';runTraceabilitySearch();" style="color:var(--vf-info-text);text-decoration:none;font-family:monospace;font-size:12px;">${escapeHtml(l.batch)}</a>
+        <div style="font-size:10px;color:var(--vf-text-tertiary);">${escapeHtml(l.sku || '')} · ${escapeHtml(l.category || '')}</div>
+      </td>
+      ${cell(l.received_qty)}
+      ${cell(l.used_in_mfg)}
+      ${cell(l.sold_to_customers)}
+      ${cell(l.net_transferred)}
+      ${cell(l.net_adjusted_out, adjColor)}
+      ${cell(l.remaining_paper, remColor)}
+      ${cell(l.actual_onhand)}
+      ${cell(l.reconciliation_delta, deltaColor)}
+      <td style="font-size:11px;color:var(--vf-text-tertiary);white-space:nowrap;">${l.last_movement_date || '—'}</td>
+    </tr>`;
+  }).join('');
+}
+
+function downloadLotReportCsv() {
+  if (!_lotReportCache || !_lotReportCache.lots || !_lotReportCache.lots.length) {
+    alert('No lots loaded to export. Adjust filters and try again.');
+    return;
+  }
+  const headers = ['batch','sku','product','unit','category','movement_count','first_movement_date','last_movement_date',
+    'received_qty','used_in_mfg','sold_to_customers','tr_in','tr_out','net_transferred',
+    'st_in','st_out','net_adjusted_out','remaining_paper',
+    'actual_onhand','actual_allocated','actual_available','actual_locations','reconciliation_delta'];
+  const rows = _lotReportCache.lots.map(l => headers.map(h => {
+    let v;
+    if (h === 'actual_locations') v = (l.actual_locations || []).join('; ');
+    else v = l[h];
+    v = v == null ? '' : String(v);
+    return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+  }).join(','));
+  const meta = `# Voyage Lot ledger report\n# as_of=${_lotReportCache.as_of}, activity_since=${_lotReportCache.activity_since}, days=${_lotReportCache.days}, filter=${_lotReportCache.filter}\n# total_qualifying=${_lotReportCache.total_qualifying}, in_export=${_lotReportCache.lots.length}\n`;
+  const csv = meta + headers.join(',') + '\n' + rows.join('\n') + '\n';
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `lot-ledger-report-${_lotReportCache.as_of}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 // ── CSV export for the four Traceability views ─────────────────────────────
 // One entry point that adapts to _traceState.view. Timeline / Ledger export
 // as flat movement rows; Lineage / Forward flatten the recursive tree with
@@ -5106,6 +5331,23 @@ function downloadTraceViewCsv() {
     for (const r of roots) _flattenTreeToCsv(r, 0, '', '', rows, 'forward');
     headers = ['depth', 'path', 'parent_lot', 'lot', 'sku', 'product', 'category', 'unit', 'qty', 'still_on_hand', 'producing_mo', 'producing_date', 'customer', 'customer_reference', 'so_ship_date', 'note'];
     if (!rows.length) { alert('No forward-trace rows to export.'); return; }
+  } else if (view === 'balance') {
+    const b = extra.balance;
+    if (!b) { alert('Balance unavailable to export.'); return; }
+    headers = ['batch', 'sku', 'product', 'unit', 'category', 'movement_count', 'first_movement_date', 'last_movement_date',
+      'received_qty', 'used_in_mfg', 'sold_to_customers', 'tr_in', 'tr_out', 'net_transferred',
+      'st_in', 'st_out', 'net_adjusted_out', 'remaining_paper',
+      'actual_onhand', 'actual_allocated', 'actual_available', 'actual_locations', 'reconciliation_delta'];
+    rows = [{
+      batch: b.batch, sku: b.sku, product: b.product, unit: b.unit, category: b.category,
+      movement_count: b.movement_count, first_movement_date: b.first_movement_date, last_movement_date: b.last_movement_date,
+      received_qty: b.received_qty, used_in_mfg: b.used_in_mfg, sold_to_customers: b.sold_to_customers,
+      tr_in: b.tr_in, tr_out: b.tr_out, net_transferred: b.net_transferred,
+      st_in: b.st_in, st_out: b.st_out, net_adjusted_out: b.net_adjusted_out, remaining_paper: b.remaining_paper,
+      actual_onhand: b.actual_onhand, actual_allocated: b.actual_allocated, actual_available: b.actual_available,
+      actual_locations: (b.actual_locations || []).join('; '),
+      reconciliation_delta: b.reconciliation_delta,
+    }];
   } else {
     alert('Unknown view: ' + view);
     return;
@@ -5173,16 +5415,18 @@ async function runTraceabilitySearch() {
     }
     primary = primaryResp;
 
-    // For lot lookups, also fetch lineage + forward + rm-history in parallel so tab switching is instant.
+    // For lot lookups, also fetch lineage + forward + rm-history + balance in parallel so tab switching is instant.
     if (kind === 'lot') {
-      const [lineage, forward, rm] = await Promise.all([
+      const [lineage, forward, rm, balance] = await Promise.all([
         fetch('/api/traceability/fg-lineage/' + encodeURIComponent(q)).then(r => r.json()).catch(() => null),
         fetch('/api/traceability/forward/' + encodeURIComponent(q)).then(r => r.json()).catch(() => null),
         fetch('/api/traceability/rm-history/' + encodeURIComponent(q)).then(r => r.json()).catch(() => null),
+        fetch('/api/traceability/lot-balance/' + encodeURIComponent(q)).then(r => r.json()).catch(() => null),
       ]);
       extra.lineage = lineage;
       extra.forward = forward;
       extra.rm = rm;
+      extra.balance = balance && balance.ok ? balance.balance : null;
     } else if (kind === 'sku') {
       const rm = await fetch('/api/traceability/rm-history/' + encodeURIComponent(q)).then(r => r.json()).catch(() => null);
       extra.rm = rm;
@@ -5319,6 +5563,7 @@ function updateTraceViewTabs(kind, primary, extra) {
       );
     }
     if (view === 'ledger') enabled = !!extra.rm && (extra.rm.timeline || []).length > 0;
+    if (view === 'balance') enabled = kind === 'lot' && !!extra.balance;
     t.disabled = !enabled;
     t.classList.toggle('active', view === _traceState.view);
   });
@@ -5342,9 +5587,76 @@ function renderTraceView() {
   if (!s.lastResult) { body.innerHTML = ''; return; }
   const { primary, extra } = s.lastResult;
   if (s.view === 'timeline') body.innerHTML = renderTimelineTable(primary.movements || primary.timeline || []);
+  else if (s.view === 'balance') body.innerHTML = renderBalanceView(extra.balance);
   else if (s.view === 'lineage') body.innerHTML = renderLineageView(extra.lineage);
   else if (s.view === 'forward') body.innerHTML = renderForwardView(extra.forward);
   else if (s.view === 'ledger') body.innerHTML = renderLedgerView(extra.rm);
+}
+
+// 6-field lot balance card + reconciliation footer. Anchored around the
+// audit-relevant question: does received − consumed − shipped − transferred
+// − adjusted reconcile against the actual on-hand Cin7 shows? If not, the
+// delta is the audit finding.
+function renderBalanceView(balance) {
+  if (!balance) return `<div class="trace-empty">No balance data — this view is only available for lot-code searches with recorded movements.</div>`;
+  const fmt = v => (v == null || !isFinite(v)) ? '—' : Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
+  const unit = balance.unit ? ` <span style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(balance.unit)}</span>` : '';
+  const row = (num, label, val, hint, color) => `
+    <tr>
+      <td style="font-weight:600;color:var(--vf-text-tertiary);width:34px;text-align:right;">${num}</td>
+      <td style="padding:6px 12px;">
+        <div style="font-weight:500;color:var(--vf-text-primary);">${label}</div>
+        ${hint ? `<div style="font-size:11px;color:var(--vf-text-tertiary);margin-top:2px;">${hint}</div>` : ''}
+      </td>
+      <td style="text-align:right;font-variant-numeric:tabular-nums;font-size:14px;color:${color || 'var(--vf-text-primary)'};font-weight:${color?'600':'400'};">${fmt(val)}${unit}</td>
+    </tr>`;
+  const adjColor = Math.abs(balance.net_adjusted_out || 0) > 0.01 ? 'var(--vf-warning-text)' : null;
+  const remColor = (balance.remaining_paper || 0) < 0 ? 'var(--vf-danger-text)' : null;
+  // Reconciliation footer
+  let reconHtml = '';
+  if (balance.actual_onhand != null) {
+    const delta = balance.reconciliation_delta;
+    const deltaColor = Math.abs(delta || 0) < 0.01
+      ? 'var(--vf-success-text)'
+      : (Math.abs(delta || 0) > 1 ? 'var(--vf-danger-text)' : 'var(--vf-warning-text)');
+    const deltaLabel = Math.abs(delta || 0) < 0.01
+      ? '✓ Reconciled (paper matches actual on-hand)'
+      : (delta > 0 ? `⚠ Cin7 shows ${fmt(delta)}${unit} MORE than paper predicts` : `⚠ Cin7 shows ${fmt(Math.abs(delta))}${unit} LESS than paper predicts`);
+    reconHtml = `
+      <div style="margin-top:12px;padding:12px;background:var(--vf-surface-sunken);border-top:2px solid var(--vf-border-default);border-radius:0 0 var(--vf-radius-md) var(--vf-radius-md);">
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:13px;">
+          <span style="color:var(--vf-text-secondary);">Cin7 actual on-hand${balance.actual_locations && balance.actual_locations.length ? ' (' + balance.actual_locations.map(escapeHtml).join(', ') + ')' : ''}:</span>
+          <span style="font-variant-numeric:tabular-nums;font-weight:600;">${fmt(balance.actual_onhand)}${unit}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:13px;margin-top:6px;color:${deltaColor};font-weight:600;">
+          <span>${deltaLabel}</span>
+          <span style="font-variant-numeric:tabular-nums;">${delta > 0 ? '+' : ''}${fmt(delta)}${unit}</span>
+        </div>
+      </div>`;
+  } else {
+    reconHtml = `<div style="margin-top:12px;padding:8px 12px;background:var(--vf-surface-sunken);border-radius:0 0 var(--vf-radius-md) var(--vf-radius-md);font-size:12px;color:var(--vf-text-tertiary);">Cin7 on-hand not synced for this lot — reconciliation check unavailable.</div>`;
+  }
+  const catBadge = balance.category ? `<span class="badge badge-neutral" style="margin-left:8px;">${escapeHtml(balance.category)}</span>` : '';
+  return `
+    <div style="max-width:720px;background:var(--vf-surface-raised);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);overflow:hidden;">
+      <div style="padding:12px 16px;background:var(--vf-surface-sunken);border-bottom:1px solid var(--vf-border-default);">
+        <div style="font-weight:600;font-size:14px;">Lot ${escapeHtml(balance.batch)}${catBadge}</div>
+        <div style="font-size:11px;color:var(--vf-text-tertiary);margin-top:2px;">
+          ${escapeHtml(balance.sku || '?')} · ${escapeHtml(balance.product || '')} · ${balance.movement_count} movements · first ${balance.first_movement_date || '?'} → last ${balance.last_movement_date || '?'}
+        </div>
+      </div>
+      <table style="width:100%;border-collapse:collapse;">
+        <tbody>
+          ${row('1', 'Initially received', balance.received_qty, 'PO receipts + MO outputs + TR-in', null)}
+          ${row('2', 'Used in manufacturing', balance.used_in_mfg, 'MO consumption (qty_out on MO refs)', null)}
+          ${row('3', 'Sold to customers', balance.sold_to_customers, 'SO shipments + non-SO dispatch (FG refs)', null)}
+          ${row('4', 'Net transferred', balance.net_transferred, `TR-in (${fmt(balance.tr_in)}) − TR-out (${fmt(balance.tr_out)}); should be ~0 for paired location moves`, null)}
+          ${row('5', 'Net stock-adjusted out', balance.net_adjusted_out, `ST-out (${fmt(balance.st_out)}) − ST-in (${fmt(balance.st_in)}); undocumented adjustments show here`, adjColor)}
+          ${row('6', 'Remaining (paper)', balance.remaining_paper, '(1) − (2) − (3) − (4) − (5)', remColor)}
+        </tbody>
+      </table>
+      ${reconHtml}
+    </div>`;
 }
 
 function renderTimelineTable(movements) {

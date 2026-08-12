@@ -6527,6 +6527,248 @@ app.get("/api/traceability/expiring-lots", (req, res) => {
   });
 });
 
+// ── Lot balance / ledger reconciliation ──────────────────────────────────────
+//
+// Rolls a lot's movements into six audit-friendly buckets:
+//   1. received_qty      Σ qty_in where ref_type ∈ {PO, MO, TR-in} — inbound
+//   2. used_in_mfg       Σ qty_out where ref_type = MO — consumed by production
+//   3. sold_to_customers Σ qty_out where ref_type ∈ {SO, FG}  — shipped
+//   4. net_transferred   Σ TR-in − Σ TR-out — location moves (should ≈ 0)
+//   5. net_adjusted_out  Σ ST-out − Σ ST-in — the audit-flagged bucket
+//   6. remaining_paper   (1) − (2) − (3) − (4) − (5); the paper-balance answer
+//
+// Also carries actual_onhand and delta = actual_onhand − remaining_paper so
+// callers can see reconciliation discrepancies at a glance.
+//
+// Note on TR classification: our movement rows carry ref_type = "TR" with the
+// direction encoded in qty_in vs qty_out. TR-in adds to received, so we route
+// TR-in qty into both received (row 1) AND net_transferred (row 4). Row 4 is
+// the intra-lot audit signal; row 1 is the "how much came in" total. This
+// avoids double-counting in row 6's reconciliation: received minus consumed
+// minus shipped minus transferred (which subtracts the TR-in back out on the
+// out side) minus adjusted = paper on hand.
+function computeLotBalance(rows) {
+  const b = {
+    received_qty: 0,
+    used_in_mfg: 0,
+    sold_to_customers: 0,
+    tr_in: 0,
+    tr_out: 0,
+    st_in: 0,
+    st_out: 0,
+    other_in: 0,
+    other_out: 0,
+    total_in: 0,
+    total_out: 0,
+    first_movement_date: null,
+    last_movement_date: null,
+    first_reference: null,
+    first_ref_type: null,
+    sku: null,
+    product: null,
+    unit: null,
+    location: null,
+    expiry_date: null,
+  };
+  const sorted = rows.slice().sort((a, b) => (a.movement_date || "").localeCompare(b.movement_date || ""));
+  for (const m of sorted) {
+    const qi = Number(m.qty_in) || 0;
+    const qo = Number(m.qty_out) || 0;
+    b.total_in += qi;
+    b.total_out += qo;
+    if (!b.first_movement_date) {
+      b.first_movement_date = m.movement_date || null;
+      b.first_reference = m.reference || null;
+      b.first_ref_type = m.ref_type || null;
+    }
+    b.last_movement_date = m.movement_date || b.last_movement_date;
+    b.sku = b.sku || m.sku || null;
+    b.product = b.product || m.product || null;
+    b.unit = b.unit || m.unit || null;
+    b.location = b.location || m.location || null;
+    if (!b.expiry_date && m.expiry_date) b.expiry_date = m.expiry_date;
+    const rt = String(m.ref_type || "").toUpperCase();
+    if (rt === "PO") {
+      b.received_qty += qi;         // POs are always inbound
+      b.other_out += qo;            // rare, but preserve
+    } else if (rt === "MO") {
+      b.received_qty += qi;         // MO outputs (WIP/FG creation) count as received
+      b.used_in_mfg += qo;
+    } else if (rt === "TR") {
+      b.tr_in += qi;
+      b.tr_out += qo;
+      b.received_qty += qi;         // TR-in adds to the lot's total received
+    } else if (rt === "SO" || rt === "FG") {
+      b.sold_to_customers += qo;
+      b.other_in += qi;             // returns, rare
+    } else if (rt === "ST") {
+      b.st_in += qi;
+      b.st_out += qo;
+    } else {
+      b.other_in += qi;
+      b.other_out += qo;
+    }
+  }
+  b.net_transferred = round4(b.tr_in - b.tr_out);
+  b.net_adjusted_out = round4(b.st_out - b.st_in);
+  b.remaining_paper = round4(
+    b.received_qty - b.used_in_mfg - b.sold_to_customers - b.net_transferred - b.net_adjusted_out
+  );
+  // Round the aggregation buckets so ledger arithmetic is exact for audit
+  b.received_qty      = round4(b.received_qty);
+  b.used_in_mfg       = round4(b.used_in_mfg);
+  b.sold_to_customers = round4(b.sold_to_customers);
+  b.tr_in             = round4(b.tr_in);
+  b.tr_out            = round4(b.tr_out);
+  b.st_in             = round4(b.st_in);
+  b.st_out            = round4(b.st_out);
+  b.other_in          = round4(b.other_in);
+  b.other_out         = round4(b.other_out);
+  b.total_in          = round4(b.total_in);
+  b.total_out         = round4(b.total_out);
+  return b;
+}
+function round4(v) { return Math.round(Number(v || 0) * 10000) / 10000; }
+
+// Build a batch → { qty, locations, sku } index from the raw Cin7 on-hand blob
+// (populated by performCin7OnHandSync). We use the raw rows field which
+// preserves per-batch/location detail; the top-level bySku rollup discards it.
+let _onHandByBatchCache = null;
+let _onHandByBatchSyncKey = null;
+function getOnHandByBatch() {
+  const blob = readData("inventory_onhand");
+  if (!blob || !Array.isArray(blob.rows)) return null;
+  // Cache invalidation keyed on lastSync — cheap and correct
+  if (_onHandByBatchSyncKey === blob.lastSync && _onHandByBatchCache) return _onHandByBatchCache;
+  const byBatch = new Map();
+  for (const r of blob.rows) {
+    const key = String(r.BatchSN || "").trim();
+    if (!key) continue;
+    let e = byBatch.get(key);
+    if (!e) {
+      e = { batch: key, sku: r.SKU || "", onHand: 0, allocated: 0, available: 0, locations: new Set() };
+      byBatch.set(key, e);
+    }
+    e.onHand    += Number(r.OnHand)    || 0;
+    e.allocated += Number(r.Allocated) || 0;
+    e.available += Number(r.Available) || 0;
+    if (r.Location) e.locations.add(r.Location);
+  }
+  _onHandByBatchCache = byBatch;
+  _onHandByBatchSyncKey = blob.lastSync;
+  return byBatch;
+}
+
+function enrichBalanceWithOnHand(b, batch) {
+  const onHandIdx = getOnHandByBatch();
+  const oh = onHandIdx && onHandIdx.get(batch);
+  b.actual_onhand = oh ? round4(oh.onHand) : null;
+  b.actual_allocated = oh ? round4(oh.allocated) : null;
+  b.actual_available = oh ? round4(oh.available) : null;
+  b.actual_locations = oh ? [...oh.locations].sort() : [];
+  b.reconciliation_delta = (b.actual_onhand != null) ? round4(b.actual_onhand - b.remaining_paper) : null;
+  return b;
+}
+
+// GET /api/traceability/lot-balance/:code — single lot rollup
+app.get("/api/traceability/lot-balance/:code", (req, res) => {
+  const code = String(req.params.code || "").trim();
+  if (!code) return res.status(400).json({ ok: false, error: "Empty lot code" });
+  const idx = getMovementIndex();
+  const rows = idx.byBatch.get(code) || [];
+  if (!rows.length) return res.status(404).json({ ok: false, error: `No movements found for lot ${code}` });
+  const balance = enrichBalanceWithOnHand(computeLotBalance(rows), code);
+  balance.batch = code;
+  balance.movement_count = rows.length;
+  balance.category = skuCategory(balance.sku);
+  res.json({ ok: true, balance });
+});
+
+// GET /api/traceability/lot-balance-report?days=90&category=...&sku=...&filter=...
+//
+// Bulk audit report. Default filter matches the SQF pre-assessment scope:
+// "any lot with production consumption (MO qty_out) OR customer shipment
+// (SO/FG qty_out) in the trailing N days". This is the auditor's zoom-in
+// path — pick a shipped FG, work back through the RMs it consumed.
+//
+// Query params (all optional):
+//   days               Trailing window for the activity filter. Default 90.
+//   category           Comma-separated (RM,VC,PK,WIP,FG,OTHER). Default: all.
+//   sku                Substring match on SKU. Default: none.
+//   filter             "activity" (default, matches audit scope),
+//                      "adjustments" (only lots with |net_adjusted_out| > 0),
+//                      "delta" (only lots where reconciliation_delta != 0),
+//                      "all" (every lot with any movement).
+//   min_activity_qty   Minimum qty_out during window to qualify as "activity".
+//                      Default 0.01 so numeric-noise lots don't dominate.
+//   limit              Cap result size. Default 500, max 5000.
+//   sort               "adjusted_desc" (default), "delta_desc", "received_desc",
+//                      "last_movement_desc".
+app.get("/api/traceability/lot-balance-report", (req, res) => {
+  const days = Math.max(1, Math.min(3650, parseInt(req.query.days, 10) || 90));
+  const today = new Date().toISOString().slice(0, 10);
+  const activitySince = new Date();
+  activitySince.setUTCDate(activitySince.getUTCDate() - days);
+  const activitySinceStr = activitySince.toISOString().slice(0, 10);
+  const categoryFilter = String(req.query.category || "").split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+  const skuFilter = String(req.query.sku || "").trim().toUpperCase();
+  const filterMode = String(req.query.filter || "activity").toLowerCase();
+  const minActivity = parseFloat(req.query.min_activity_qty) || 0.01;
+  const limit = Math.max(1, Math.min(5000, parseInt(req.query.limit, 10) || 500));
+  const sort = String(req.query.sort || "adjusted_desc").toLowerCase();
+
+  const idx = getMovementIndex();
+  const out = [];
+  for (const [batch, rows] of idx.byBatch) {
+    // Activity filter: only include lots with qualifying qty_out in window
+    if (filterMode === "activity") {
+      let qualifies = false;
+      for (const m of rows) {
+        if (!m.movement_date || m.movement_date < activitySinceStr) continue;
+        const qo = Number(m.qty_out) || 0;
+        if (qo < minActivity) continue;
+        const rt = String(m.ref_type || "").toUpperCase();
+        if (rt === "MO" || rt === "SO" || rt === "FG") { qualifies = true; break; }
+      }
+      if (!qualifies) continue;
+    }
+    const balance = enrichBalanceWithOnHand(computeLotBalance(rows), batch);
+    balance.batch = batch;
+    balance.movement_count = rows.length;
+    balance.category = skuCategory(balance.sku);
+
+    // Category / SKU filters
+    if (categoryFilter.length && !categoryFilter.includes(balance.category)) continue;
+    if (skuFilter && !String(balance.sku || "").toUpperCase().includes(skuFilter)) continue;
+
+    // Filter-mode zoom-ins
+    if (filterMode === "adjustments" && Math.abs(balance.net_adjusted_out) < minActivity) continue;
+    if (filterMode === "delta") {
+      if (balance.reconciliation_delta == null) continue;
+      if (Math.abs(balance.reconciliation_delta) < minActivity) continue;
+    }
+    out.push(balance);
+  }
+  // Sort
+  const cmp = {
+    adjusted_desc:      (a, b) => Math.abs(b.net_adjusted_out) - Math.abs(a.net_adjusted_out),
+    delta_desc:         (a, b) => Math.abs(b.reconciliation_delta || 0) - Math.abs(a.reconciliation_delta || 0),
+    received_desc:      (a, b) => (b.received_qty || 0) - (a.received_qty || 0),
+    last_movement_desc: (a, b) => (b.last_movement_date || "").localeCompare(a.last_movement_date || ""),
+  }[sort] || ((a, b) => Math.abs(b.net_adjusted_out) - Math.abs(a.net_adjusted_out));
+  out.sort(cmp);
+  res.json({
+    ok: true,
+    as_of: today,
+    activity_since: activitySinceStr,
+    days,
+    filter: filterMode,
+    total_qualifying: out.length,
+    count: Math.min(out.length, limit),
+    lots: out.slice(0, limit),
+  });
+});
+
 // ── Chain traversal ──────────────────────────────────────────────────────────
 // FG lot → producing MO → BOM inputs consumed → recurse on each input lot.
 
