@@ -5666,6 +5666,21 @@ function renderBalanceView(balance) {
     reconHtml = `<div style="margin-top:12px;padding:8px 12px;background:var(--vf-surface-sunken);border-radius:0 0 var(--vf-radius-md) var(--vf-radius-md);font-size:12px;color:var(--vf-text-tertiary);">Cin7 on-hand not synced for this lot — reconciliation check unavailable.</div>`;
   }
   const catBadge = balance.category ? `<span class="badge badge-neutral" style="margin-left:8px;">${escapeHtml(balance.category)}</span>` : '';
+  // Sub-lot family callout. When we auto-aggregated re-lot children (e.g.
+  // 4529100000_02, _03, _14_1107 rolled up under 4529100000), show the
+  // list so the totals are auditable. Also gives the operator a quick
+  // check that nothing spurious got pulled in.
+  const subLots = balance.sub_lot_codes || [];
+  const subLotHtml = subLots.length ? `
+    <div style="margin:0;padding:8px 16px;background:var(--vf-info-surface, var(--vf-surface-sunken));border-top:1px solid var(--vf-border-default);font-size:11px;color:var(--vf-text-secondary);">
+      <span style="font-weight:600;">Aggregating ${subLots.length} sub-lot${subLots.length===1?'':'s'}</span> (auto-detected by <code>${escapeHtml(balance.batch)}_*</code> prefix) —
+      ${balance.sub_lot_movement_count} extra movement${balance.sub_lot_movement_count===1?'':'s'} rolled into the parent's balance:
+      <div style="margin-top:4px;font-family:monospace;font-size:10px;color:var(--vf-text-tertiary);">${subLots.map(escapeHtml).join(', ')}</div>
+      <div style="margin-top:4px;font-size:11px;color:var(--vf-warning-text);">
+        Typos or different code shapes (e.g. missing a digit) aren't auto-linked — search that lot separately if it exists.
+      </div>
+    </div>
+  ` : '';
   // Stock adjustment detail — the "what happened" table. Rendered only
   // when there are actual ST rows. Highlights the biggest ones (usually
   // one write-off dominates), surfaces document references so QA can see
@@ -5691,9 +5706,12 @@ function renderBalanceView(balance) {
       const doc = r.document_reference
         ? `<div style="font-size:10px;color:var(--vf-text-tertiary);">doc: ${escapeHtml(r.document_reference)}</div>`
         : `<div style="font-size:10px;color:var(--vf-warning-text);">no document</div>`;
+      const batchCell = r.batch && r.batch !== balance.batch
+        ? `<div style="font-size:9px;color:var(--vf-info-text);font-family:monospace;">on <b>${escapeHtml(r.batch)}</b></div>`
+        : '';
       return `<tr>
         <td style="padding:4px 8px;font-size:11px;white-space:nowrap;">${r.movement_date || '?'}</td>
-        <td style="padding:4px 8px;font-size:11px;font-family:monospace;">${escapeHtml(r.reference || r.ref_number || '?')}${dqBadge}</td>
+        <td style="padding:4px 8px;font-size:11px;font-family:monospace;">${escapeHtml(r.reference || r.ref_number || '?')}${batchCell}${dqBadge}</td>
         <td style="padding:4px 8px;font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(r.movement_type || '')}</td>
         <td style="padding:4px 8px;text-align:right;font-variant-numeric:tabular-nums;color:${netColor};font-weight:${Math.abs(r.net||0) > 0.01 ? '600':'400'};">${fmtSigned(r.net)}${unit}${share}</td>
         <td style="padding:4px 8px;font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(r.location || '')}${doc}</td>
@@ -5729,6 +5747,7 @@ function renderBalanceView(balance) {
           ${escapeHtml(balance.sku || '?')} · ${escapeHtml(balance.product || '')} · ${balance.movement_count} movements · first ${balance.first_movement_date || '?'} → last ${balance.last_movement_date || '?'}
         </div>
       </div>
+      ${subLotHtml}
       <table style="width:100%;border-collapse:collapse;">
         <tbody>
           ${row('1', 'Initially received', balance.received_qty, 'PO receipts + MO outputs only (TRs are location moves, not new inventory — tracked separately in row 4)', null)}

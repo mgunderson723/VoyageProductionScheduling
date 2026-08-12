@@ -6692,15 +6692,45 @@ function enrichBalanceWithOnHand(b, batch) {
   return b;
 }
 
-// GET /api/traceability/lot-balance/:code — single lot rollup
+// Find batch codes that look like sub-lots of a parent — same prefix
+// followed by an underscore + arbitrary suffix. Voyage's re-lot process
+// (typically via ST split) creates codes like "4529100000_02",
+// "4529100000_14_1107", etc. Rolling these into the parent's balance
+// gives the true "lifecycle" view; without it, MO consumption tagged to
+// a sub-lot code is invisible under the parent.
+function findRelatedSubLots(parent, idx) {
+  if (!parent) return [];
+  const escaped = parent.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp("^" + escaped + "_");
+  const out = [];
+  for (const [batch] of idx.byBatch) {
+    if (batch !== parent && re.test(batch)) out.push(batch);
+  }
+  return out.sort();
+}
+
+// GET /api/traceability/lot-balance/:code — single lot rollup, aggregated
+// over parent + auto-detected sub-lots by default.
+// Query params:
+//   parent_only=1   Skip sub-lot aggregation; show only the exact code.
 app.get("/api/traceability/lot-balance/:code", (req, res) => {
   const code = String(req.params.code || "").trim();
   if (!code) return res.status(400).json({ ok: false, error: "Empty lot code" });
+  const parentOnly = req.query.parent_only === "1" || req.query.parent_only === "true";
   const idx = getMovementIndex();
-  const rows = idx.byBatch.get(code) || [];
-  if (!rows.length) return res.status(404).json({ ok: false, error: `No movements found for lot ${code}` });
+  const parentRows = idx.byBatch.get(code) || [];
+  if (!parentRows.length) return res.status(404).json({ ok: false, error: `No movements found for lot ${code}` });
+  const subLotCodes = parentOnly ? [] : findRelatedSubLots(code, idx);
+  const rows = parentRows.slice();
+  for (const sc of subLotCodes) {
+    const extra = idx.byBatch.get(sc) || [];
+    for (const m of extra) rows.push(m);
+  }
   const balance = enrichBalanceWithOnHand(computeLotBalance(rows), code);
   balance.batch = code;
+  balance.parent_only = parentOnly;
+  balance.sub_lot_codes = subLotCodes;
+  balance.sub_lot_movement_count = rows.length - parentRows.length;
   balance.movement_count = rows.length;
   balance.category = skuCategory(balance.sku);
   // Per-lot triage: attach the raw ST rows so the UI can render each
@@ -6713,7 +6743,10 @@ app.get("/api/traceability/lot-balance/:code", (req, res) => {
   const stRowsRaw = rows
     .filter(m => String(m.ref_type || "").toUpperCase() === "ST")
     .slice()
-    .sort((a, b) => (a.movement_date || "").localeCompare(b.movement_date || ""));
+    .sort((a, b) => (a.movement_date || "").localeCompare(b.movement_date || ""))
+    // Tag which batch code this ST row was booked against so operators can
+    // see when a write-off happened on a sub-lot vs the parent.
+    .map(m => ({ ...m, batch: m.batch || null }));
   // Route through the noise-window annotator so lot-migration and
   // vc-via-st flags surface on each row — these often explain 80% of the
   // "why" without any documentation being missing.
@@ -6723,6 +6756,7 @@ app.get("/api/traceability/lot-balance/:code", (req, res) => {
     reference: m.reference || null,
     ref_number: m.ref_number || null,
     movement_type: m.movement_type || null,
+    batch: m.batch || null,
     qty_in: Number(m.qty_in) || 0,
     qty_out: Number(m.qty_out) || 0,
     net: round4((Number(m.qty_out) || 0) - (Number(m.qty_in) || 0)),
