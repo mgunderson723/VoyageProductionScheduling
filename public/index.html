@@ -1583,6 +1583,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
         </div>
         <div class="status-summary" id="mrp-outlay-kpis"></div>
         <div id="mrp-outlay-empty" class="no-inv-note" style="display:none;">No PO line costs to project — MRP produced no costed POs.</div>
+        <div id="mrp-outlay-mode-row" style="margin-bottom:var(--vf-space-3);padding:var(--vf-space-2) var(--vf-space-3);background:var(--vf-surface-sunken);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);"></div>
         <div id="mrp-outlay-chart-wrap" style="margin-bottom:var(--vf-space-3);overflow-x:auto;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);padding:var(--vf-space-3);background:var(--vf-surface-raised);">
           <svg id="mrp-outlay-chart" style="width:100%;min-height:280px;display:block;"></svg>
         </div>
@@ -3829,28 +3830,62 @@ function renderMrpPackoutSkippedBanner() {
 // with a running count so the user sees how much projection is missing
 // due to Cin7 having no AverageCost on those SKUs.
 let _mrpOutlayCache = null;
+let _mrpOutlayMode = 'smoothed'; // 'smoothed' | 'as_suggested'
 
-function _bucketPosByPayMonth() {
+// Bucket suggested POs into a (SKU × pay-month) matrix.
+// mode='as_suggested' (legacy): each PO's full lineCost lands on its payDate
+//   month. Matches the actual procurement plan MRP put together — but if a
+//   single PO covers 6 months of demand it lands as one spike.
+// mode='smoothed' (default): each PO's lineCost is split across its
+//   demandByMonth curve in proportion. Slice i's pay month is
+//   demand_month_i + payTermsDays (receipt anchor) or
+//   demand_month_i − leadTimeDays + payTermsDays (po_issue anchor). Same
+//   total as as_suggested, but distributed like the JIT re-ordering
+//   cadence a scheduler would actually use if they weren't consolidating.
+function _bucketPosByPayMonth(mode) {
   if (!mrpData) return null;
+  mode = mode || 'smoothed';
   const both = [].concat(mrpData.suggestedPOs || [], mrpData.deferredPOs || []);
-  const bySku = new Map();  // sku -> { sku, name, category, byMonth: {YYYY-MM: $}, total, payAnchor, payTermsDays }
+  const bySku = new Map();
   const monthSet = new Set();
-  let missingCostCount = 0, missingCostLines = 0;
+  let missingCostCount = 0;
   let missingPayDateCount = 0;
+  let smoothableCount = 0;   // POs with demandByMonth spanning > 1 month
   for (const po of both) {
     if (!po) continue;
     if (po.costMissing || !isFinite(po.lineCost) || po.lineCost <= 0) { missingCostCount++; continue; }
     if (!po.payDate) { missingPayDateCount++; continue; }
-    const month = po.payDate.slice(0, 7);
-    monthSet.add(month);
+
     let e = bySku.get(po.sku);
     if (!e) {
       e = { sku: po.sku, name: po.name || '', category: _skuCategory(po.sku), byMonth: {}, total: 0, payAnchor: po.payAnchor, payTermsDays: po.payTermsDays };
       bySku.set(po.sku, e);
     }
-    e.byMonth[month] = (e.byMonth[month] || 0) + po.lineCost;
-    e.total += po.lineCost;
-    missingCostLines += 0; // (bookkeeping placeholder)
+
+    const demandMonths = po.demandByMonth && Object.keys(po.demandByMonth).length ? po.demandByMonth : null;
+    const demandTotal = demandMonths ? Object.values(demandMonths).reduce((s, v) => s + v, 0) : 0;
+    const canSmooth = demandMonths && demandTotal > 0 && Object.keys(demandMonths).length > 1;
+    if (canSmooth) smoothableCount++;
+
+    if (mode === 'smoothed' && canSmooth) {
+      // Allocate lineCost proportionally to demand qty per month, and
+      // shift each slice's month by pay terms.
+      const termsShiftDays = (po.payTermsDays || 0)
+        - (po.payAnchor === 'po_issue' && po.leadTimeDays ? po.leadTimeDays : 0);
+      for (const [demandMonth, demandQty] of Object.entries(demandMonths)) {
+        const share = po.lineCost * (demandQty / demandTotal);
+        const payMonth = _shiftMonth(demandMonth, termsShiftDays);
+        monthSet.add(payMonth);
+        e.byMonth[payMonth] = (e.byMonth[payMonth] || 0) + share;
+      }
+      e.total += po.lineCost;
+    } else {
+      // as_suggested OR single-month PO — lands as one bucket on payDate
+      const month = po.payDate.slice(0, 7);
+      monthSet.add(month);
+      e.byMonth[month] = (e.byMonth[month] || 0) + po.lineCost;
+      e.total += po.lineCost;
+    }
   }
   const months = [...monthSet].sort();
   const rows = [...bySku.values()].sort((a, b) => b.total - a.total);
@@ -3858,7 +3893,17 @@ function _bucketPosByPayMonth() {
   for (const m of months) totalByMonth[m] = 0;
   for (const r of rows) for (const m of months) totalByMonth[m] += (r.byMonth[m] || 0);
   const grandTotal = rows.reduce((s, r) => s + r.total, 0);
-  return { months, rows, totalByMonth, grandTotal, missingCostCount, missingPayDateCount };
+  return { months, rows, totalByMonth, grandTotal, missingCostCount, missingPayDateCount, smoothableCount, mode };
+}
+
+// Shift a YYYY-MM month by N days, returning the YYYY-MM of the result.
+// Anchors at day-15 to avoid month-boundary edge cases (a 30-day shift
+// from a 31st-day date crosses into month+2).
+function _shiftMonth(monthStr, days) {
+  const [y, m] = monthStr.split('-').map(Number);
+  const d = new Date(Date.UTC(y, m - 1, 15));
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 7);
 }
 
 function _skuCategory(sku) {
@@ -3882,7 +3927,7 @@ const _MRP_CAT_COLORS = {
 };
 
 function renderMrpOutlay() {
-  _mrpOutlayCache = _bucketPosByPayMonth();
+  _mrpOutlayCache = _bucketPosByPayMonth(_mrpOutlayMode);
   const emptyEl = document.getElementById('mrp-outlay-empty');
   const chartWrap = document.getElementById('mrp-outlay-chart-wrap');
   if (!_mrpOutlayCache || _mrpOutlayCache.grandTotal <= 0) {
@@ -3910,8 +3955,35 @@ function renderMrpOutlay() {
     `<div class="metric" style="${x.accent?'border-left:3px solid '+x.accent+';':''}"><div class="metric-label">${x.label}</div><div class="metric-value">${x.val}</div></div>`
   ).join('');
 
+  // Mode-toggle row + descriptive note. "Smoothed" (default) spreads a
+  // multi-month PO's line cost across the months of actual demand;
+  // "As suggested" lands the full lineCost on the PO's pay date. Toggle
+  // sits above the chart so it's obvious which view is in effect.
+  const toggleEl = document.getElementById('mrp-outlay-mode-row');
+  if (toggleEl) {
+    const smoothedLabel = `Smoothed by demand curve${c.smoothableCount > 0 ? ` (${c.smoothableCount} multi-month PO${c.smoothableCount===1?'':'s'} auto-split)` : ''}`;
+    toggleEl.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
+        <span>View:</span>
+        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;">
+          <input type="radio" name="mrp-outlay-mode" value="smoothed" ${_mrpOutlayMode==='smoothed'?'checked':''} onchange="setMrpOutlayMode('smoothed')"/>
+          <span>${escapeHtml(smoothedLabel)}</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;">
+          <input type="radio" name="mrp-outlay-mode" value="as_suggested" ${_mrpOutlayMode==='as_suggested'?'checked':''} onchange="setMrpOutlayMode('as_suggested')"/>
+          <span>As MRP-suggested (single-month bucket)</span>
+        </label>
+        <span style="margin-left:auto;font-size:11px;color:var(--vf-text-tertiary);">${_mrpOutlayMode==='smoothed' ? 'Each multi-month PO is proportionally allocated to the months it covers, then shifted by pay terms.' : 'Each PO lands as a single bucket on its computed pay date.'}</span>
+      </div>`;
+  }
+
   renderMrpOutlayChart();
   renderMrpOutlayTable();
+}
+
+function setMrpOutlayMode(mode) {
+  _mrpOutlayMode = mode === 'as_suggested' ? 'as_suggested' : 'smoothed';
+  renderMrpOutlay();
 }
 
 // SVG stacked bar chart. One bar per month, stacked by SKU category so
@@ -4057,13 +4129,13 @@ function exportMrpOutlayCsv() {
     return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
   }).join(','));
   const totalsRow = ['TOTAL', '', '', '', '', ...c.months.map(m => (c.totalByMonth[m] || 0).toFixed(2)), c.grandTotal.toFixed(2)].join(',');
-  const meta = `# Voyage MRP Capital outlay projection\n# runAt=${mrpData.runAt}, today=${mrpData.today}\n# grandTotal=${c.grandTotal.toFixed(2)}, missingCostSkus=${c.missingCostCount}\n`;
+  const meta = `# Voyage MRP Capital outlay projection\n# runAt=${mrpData.runAt}, today=${mrpData.today}\n# mode=${_mrpOutlayMode}, grandTotal=${c.grandTotal.toFixed(2)}, missingCostSkus=${c.missingCostCount}, smoothablePOs=${c.smoothableCount}\n`;
   const csv = meta + headers.join(',') + '\n' + rows.join('\n') + '\n' + totalsRow + '\n';
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `mrp-capital-outlay-${mrpData.today}.csv`;
+  a.download = `mrp-capital-outlay-${_mrpOutlayMode}-${mrpData.today}.csv`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);

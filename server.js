@@ -6158,6 +6158,18 @@ app.get("/api/mrp/run", (req, res) => {
     const dollarsByMonth = {}; // YYYY-MM -> { total, overdue, count }
     const inWindowPOs = [];
     const deferredPOs = [];
+    // Pre-index demand per (SKU, needed-month) so we can enrich each PO
+    // with a demand curve. The Capital outlay view uses this to spread a
+    // multi-month PO's line cost across the months of actual consumption
+    // (a $221k chickpea PO that covers 6 months of demand shouldn't land
+    // as one August spike in the cash forecast).
+    const demandBySkuMonth = {};
+    for (const r of requirements) {
+      if (!r.sku || !r.neededByDate) continue;
+      const m = r.neededByDate.slice(0, 7);
+      if (!demandBySkuMonth[r.sku]) demandBySkuMonth[r.sku] = {};
+      demandBySkuMonth[r.sku][m] = (demandBySkuMonth[r.sku][m] || 0) + (Number(r.qtyKg) || 0);
+    }
     for (const po of suggestedPOs) {
       const c = costsBySku[po.sku];
       const unitCost = c && c.averageCost > 0 ? c.averageCost : null;
@@ -6169,6 +6181,7 @@ app.get("/api/mrp/run", (req, res) => {
       po.payDate = pay.payDate;
       po.payAnchor = pay.payAnchor;
       po.payTermsDays = pay.payTermsDays;
+      po.demandByMonth = demandBySkuMonth[po.sku] || null;
       const deferred = poHorizonEndDate && po.mustOrderByDate && po.mustOrderByDate > poHorizonEndDate;
       po.deferredByHorizon = !!deferred;
       if (deferred) {
