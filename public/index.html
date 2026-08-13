@@ -1522,6 +1522,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       <div style="display:flex;gap:var(--vf-space-2);margin-bottom:var(--vf-space-4);border-bottom:1px solid var(--vf-border-default);">
         <button class="btn btn-sm" id="mrp-tab-pos"     onclick="switchMrpSection('pos')"     style="border-radius:0;border-bottom:2px solid var(--vf-brand-orange);">Suggested POs</button>
         <button class="btn btn-sm" id="mrp-tab-summary" onclick="switchMrpSection('summary')" style="border-radius:0;background:transparent;">$ Summary</button>
+        <button class="btn btn-sm" id="mrp-tab-outlay"  onclick="switchMrpSection('outlay')"  style="border-radius:0;background:transparent;" title="Cash-out projection by month based on pay terms (receipt+N days, or PO-issue+N for upfront items).">Capital outlay</button>
         <button class="btn btn-sm" id="mrp-tab-risk"    onclick="switchMrpSection('risk')"    style="border-radius:0;background:transparent;">At-risk MOs</button>
         <button class="btn btn-sm" id="mrp-tab-skus"    onclick="switchMrpSection('skus')"    style="border-radius:0;background:transparent;">All SKUs</button>
         <span style="margin-left:auto;display:flex;align-items:center;gap:8px;">
@@ -1572,6 +1573,36 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
             </div>
           </div>
           <div id="mrp-summary-missing" style="display:none;margin-top:var(--vf-space-3);padding:var(--vf-space-3) var(--vf-space-4);background:var(--vf-warning-soft);color:var(--vf-warning-text);border-left:3px solid var(--vf-warning-base);border-radius:var(--vf-radius-md);font-size:var(--vf-text-sm);"></div>
+        </div>
+      </div>
+
+      <!-- Capital outlay sub-view -->
+      <div id="mrp-section-outlay" style="display:none;">
+        <div style="margin-bottom:var(--vf-space-3);padding:var(--vf-space-3);background:var(--vf-surface-sunken);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">
+          <strong style="color:var(--vf-text-primary);">Cash-out projection by month.</strong> Each suggested PO's line cost is bucketed to the month it's expected to be paid, based on the payment terms configured per SKU in MRP Setup → Supply Settings. Default is <em>receipt + 30 days</em>; SKUs with anchor <code>PO issue</code> and days <code>0</code> (CBE fats, grapeseeds) fall in the month the PO is placed. Includes both in-window and deferred POs so this reflects the full plan horizon.
+        </div>
+        <div class="status-summary" id="mrp-outlay-kpis"></div>
+        <div id="mrp-outlay-empty" class="no-inv-note" style="display:none;">No PO line costs to project — MRP produced no costed POs.</div>
+        <div id="mrp-outlay-chart-wrap" style="margin-bottom:var(--vf-space-3);overflow-x:auto;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);padding:var(--vf-space-3);background:var(--vf-surface-raised);">
+          <svg id="mrp-outlay-chart" style="width:100%;min-height:280px;display:block;"></svg>
+        </div>
+        <div style="display:flex;gap:var(--vf-space-2);align-items:center;margin-bottom:var(--vf-space-2);flex-wrap:wrap;">
+          <input id="mrp-outlay-search" placeholder="Search SKU or name…" oninput="renderMrpOutlayTable()" style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;width:240px;height:32px;">
+          <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);" title="Roll up rows into the buckets used for the chart above.">
+            <input type="checkbox" id="mrp-outlay-group-category" onchange="renderMrpOutlayTable()" style="margin:0;">
+            Group by category
+          </label>
+          <span style="margin-left:auto;display:flex;align-items:center;gap:8px;">
+            <button class="btn btn-sm" onclick="exportMrpOutlayCsv()">↓ Export outlay pivot CSV</button>
+          </span>
+        </div>
+        <div style="overflow-x:auto;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);max-height:520px;overflow-y:auto;">
+          <table class="status-table" id="mrp-outlay-table" style="margin-top:0;">
+            <thead style="position:sticky;top:0;background:var(--vf-surface-sunken);z-index:1;">
+              <tr id="mrp-outlay-thead-row"><th>SKU / Product</th><th style="text-align:right;">Total ($)</th></tr>
+            </thead>
+            <tbody id="mrp-outlay-tbody"></tbody>
+          </table>
         </div>
       </div>
 
@@ -1674,6 +1705,17 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
             Packaging blanks default (days)
             <input type="number" id="mrp-default-pack" min="0" onchange="saveMrpSupply()" style="width:90px;padding:5px 8px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;">
           </label>
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:var(--vf-text-xs);color:var(--vf-text-tertiary);" title="Default anchor for payment terms. 'receipt' = pay N days after goods arrive; 'po_issue' = pay N days after placing the PO (used for upfront-pay items).">
+            Default pay anchor
+            <select id="mrp-default-pay-anchor" onchange="saveMrpSupply()" style="padding:5px 8px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;height:32px;">
+              <option value="receipt">Receipt</option>
+              <option value="po_issue">PO issue</option>
+            </select>
+          </label>
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:var(--vf-text-xs);color:var(--vf-text-tertiary);" title="Default payment terms in days. 30 = net-30 from anchor.">
+            Default pay terms (days)
+            <input type="number" id="mrp-default-pay-days" min="0" onchange="saveMrpSupply()" style="width:90px;padding:5px 8px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;">
+          </label>
         </div>
       </div>
 
@@ -1721,7 +1763,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       <div style="overflow-x:auto;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);max-height:600px;overflow-y:auto;">
         <table class="status-table" id="mrp-supply-table" style="margin-top:0;">
           <thead style="position:sticky;top:0;background:var(--vf-surface-sunken);z-index:1;">
-            <tr><th>SKU</th><th style="text-align:right;">Lead time (days)</th><th>Source</th><th style="text-align:right;" title="Optional. Set only when the BOM's qtyToProduce is in cases/units but operators enter qty in kg (e.g. PFS pouching SKUs). MRP divides the order qty by this value before BOM expansion.">kg/unit</th><th>Notes</th><th></th></tr>
+            <tr><th>SKU</th><th style="text-align:right;">Lead time (days)</th><th>Source</th><th style="text-align:right;" title="Optional. Set only when the BOM's qtyToProduce is in cases/units but operators enter qty in kg (e.g. PFS pouching SKUs). MRP divides the order qty by this value before BOM expansion.">kg/unit</th><th title="Pay anchor. Leave blank to use default. 'PO issue' = pay when we place the order (upfront items like CBE fats, grapeseeds).">Pay anchor</th><th style="text-align:right;" title="Days from anchor. 0 = pay on anchor date. Blank = use default.">Pay days</th><th>Notes</th><th></th></tr>
           </thead>
           <tbody id="mrp-supply-tbody"></tbody>
         </table>
@@ -3644,14 +3686,18 @@ async function runMrp() {
 
 function switchMrpSection(name) {
   mrpSection = name;
-  ['pos','summary','risk','skus'].forEach(k => {
-    document.getElementById('mrp-section-' + k).style.display = (k === name) ? '' : 'none';
+  ['pos','summary','outlay','risk','skus'].forEach(k => {
+    const el = document.getElementById('mrp-section-' + k);
+    if (el) el.style.display = (k === name) ? '' : 'none';
     const btn = document.getElementById('mrp-tab-' + k);
     if (btn) {
       btn.style.borderBottom = (k === name) ? '2px solid var(--vf-brand-orange)' : '2px solid transparent';
       btn.style.background = (k === name) ? '' : 'transparent';
     }
   });
+  // Chart-rendering views need a re-render when they become visible because
+  // SVG width computations depend on the container being non-zero.
+  if (name === 'outlay') renderMrpOutlayChart();
 }
 
 // Format dollars consistently across the MRP views. Compact (k/M) above
@@ -3736,6 +3782,7 @@ function renderMrp() {
   renderMrpPackoutSkippedBanner();
   renderMrpPos();
   renderMrpSummary();
+  renderMrpOutlay();
   renderMrpRisk();
   renderMrpSkus();
 }
@@ -3773,6 +3820,254 @@ function renderMrpPackoutSkippedBanner() {
       </div>
     </div>
   `;
+}
+
+// ── Capital outlay sub-view ────────────────────────────────────────────────
+// Buckets each PO's line cost into (SKU × pay-month) using the server-
+// computed payDate. Includes both in-window and deferred POs so the
+// projection covers the full plan horizon. Costless POs are dropped
+// with a running count so the user sees how much projection is missing
+// due to Cin7 having no AverageCost on those SKUs.
+let _mrpOutlayCache = null;
+
+function _bucketPosByPayMonth() {
+  if (!mrpData) return null;
+  const both = [].concat(mrpData.suggestedPOs || [], mrpData.deferredPOs || []);
+  const bySku = new Map();  // sku -> { sku, name, category, byMonth: {YYYY-MM: $}, total, payAnchor, payTermsDays }
+  const monthSet = new Set();
+  let missingCostCount = 0, missingCostLines = 0;
+  let missingPayDateCount = 0;
+  for (const po of both) {
+    if (!po) continue;
+    if (po.costMissing || !isFinite(po.lineCost) || po.lineCost <= 0) { missingCostCount++; continue; }
+    if (!po.payDate) { missingPayDateCount++; continue; }
+    const month = po.payDate.slice(0, 7);
+    monthSet.add(month);
+    let e = bySku.get(po.sku);
+    if (!e) {
+      e = { sku: po.sku, name: po.name || '', category: _skuCategory(po.sku), byMonth: {}, total: 0, payAnchor: po.payAnchor, payTermsDays: po.payTermsDays };
+      bySku.set(po.sku, e);
+    }
+    e.byMonth[month] = (e.byMonth[month] || 0) + po.lineCost;
+    e.total += po.lineCost;
+    missingCostLines += 0; // (bookkeeping placeholder)
+  }
+  const months = [...monthSet].sort();
+  const rows = [...bySku.values()].sort((a, b) => b.total - a.total);
+  const totalByMonth = {};
+  for (const m of months) totalByMonth[m] = 0;
+  for (const r of rows) for (const m of months) totalByMonth[m] += (r.byMonth[m] || 0);
+  const grandTotal = rows.reduce((s, r) => s + r.total, 0);
+  return { months, rows, totalByMonth, grandTotal, missingCostCount, missingPayDateCount };
+}
+
+function _skuCategory(sku) {
+  const s = String(sku || '').toUpperCase();
+  if (s.startsWith('RM-')) return 'RM';
+  if (s.startsWith('VC-')) return 'VC';
+  if (s.startsWith('PK-')) return 'PK';
+  if (s.startsWith('WIP-') || /^WIP\d+-/.test(s)) return 'WIP';
+  if (s.startsWith('FG-')) return 'FG';
+  return 'OTHER';
+}
+
+// Palette used for both the stacked chart and the category-grouped table.
+const _MRP_CAT_COLORS = {
+  RM: '#3b82f6',    // blue
+  VC: '#a855f7',    // purple
+  PK: '#f59e0b',    // amber
+  WIP: '#10b981',   // green
+  FG: '#ef4444',    // red
+  OTHER: '#94a3b8', // slate
+};
+
+function renderMrpOutlay() {
+  _mrpOutlayCache = _bucketPosByPayMonth();
+  const emptyEl = document.getElementById('mrp-outlay-empty');
+  const chartWrap = document.getElementById('mrp-outlay-chart-wrap');
+  if (!_mrpOutlayCache || _mrpOutlayCache.grandTotal <= 0) {
+    if (emptyEl) emptyEl.style.display = 'block';
+    if (chartWrap) chartWrap.style.display = 'none';
+    document.getElementById('mrp-outlay-kpis').innerHTML = '';
+    document.getElementById('mrp-outlay-tbody').innerHTML = '';
+    return;
+  }
+  if (emptyEl) emptyEl.style.display = 'none';
+  if (chartWrap) chartWrap.style.display = '';
+
+  const c = _mrpOutlayCache;
+  const biggestMonth = c.months.reduce((best, m) => (c.totalByMonth[m] > (c.totalByMonth[best] || 0) ? m : best), c.months[0]);
+  const kpis = [
+    { label: 'Total projected outlay', val: fmtUsd(c.grandTotal, { full: true }), accent: 'var(--vf-cat-purple-base)' },
+    { label: 'Months in projection',   val: c.months.length.toLocaleString(), accent: 'var(--vf-info-base)' },
+    { label: 'Biggest month',          val: biggestMonth ? `${biggestMonth} · ${fmtUsd(c.totalByMonth[biggestMonth])}` : '—', accent: 'var(--vf-warning-base)' },
+    { label: 'SKUs projected',         val: c.rows.length.toLocaleString(), accent: '' },
+  ];
+  if (c.missingCostCount > 0) {
+    kpis.push({ label: 'Excluded (no cost)', val: c.missingCostCount.toLocaleString(), accent: 'var(--vf-warning-base)' });
+  }
+  document.getElementById('mrp-outlay-kpis').innerHTML = kpis.map(x =>
+    `<div class="metric" style="${x.accent?'border-left:3px solid '+x.accent+';':''}"><div class="metric-label">${x.label}</div><div class="metric-value">${x.val}</div></div>`
+  ).join('');
+
+  renderMrpOutlayChart();
+  renderMrpOutlayTable();
+}
+
+// SVG stacked bar chart. One bar per month, stacked by SKU category so
+// the visual identifies at a glance whether a given month's spike is
+// RM-heavy, VC-heavy, or packaging-heavy. Categories match the palette
+// so the table below reads the same way.
+function renderMrpOutlayChart() {
+  const svg = document.getElementById('mrp-outlay-chart');
+  const c = _mrpOutlayCache;
+  if (!svg || !c || !c.months.length) return;
+  const wrap = svg.parentElement;
+  const outerWidth = Math.max(wrap ? wrap.clientWidth - 24 : 800, c.months.length * 60);
+  const outerHeight = 280;
+  const padL = 60, padR = 16, padT = 12, padB = 44;
+  const plotW = outerWidth - padL - padR;
+  const plotH = outerHeight - padT - padB;
+  const cats = ['RM', 'VC', 'PK', 'WIP', 'FG', 'OTHER'];
+  // Sum by category per month
+  const byMonthCat = {}; // month -> { RM: $, VC: ... }
+  for (const m of c.months) byMonthCat[m] = { RM: 0, VC: 0, PK: 0, WIP: 0, FG: 0, OTHER: 0 };
+  for (const r of c.rows) {
+    for (const m of Object.keys(r.byMonth)) {
+      byMonthCat[m][r.category] = (byMonthCat[m][r.category] || 0) + r.byMonth[m];
+    }
+  }
+  const maxTotal = Math.max(...c.months.map(m => c.totalByMonth[m]));
+  // Y-axis: pick a "nice" round max
+  const yMax = _niceCeil(maxTotal);
+  const barGap = 8;
+  const barW = Math.max(20, (plotW - barGap * (c.months.length - 1)) / c.months.length);
+  const yScale = v => plotH - (v / yMax) * plotH;
+  // Grid + Y labels
+  const ticks = 5;
+  let gridHtml = '';
+  for (let i = 0; i <= ticks; i++) {
+    const val = yMax * (i / ticks);
+    const y = yScale(val) + padT;
+    gridHtml += `<line x1="${padL}" y1="${y}" x2="${outerWidth - padR}" y2="${y}" stroke="var(--vf-border-default)" stroke-opacity="0.5" stroke-dasharray="${i===0?'0':'2 2'}"/>`;
+    gridHtml += `<text x="${padL - 6}" y="${y + 3}" text-anchor="end" font-size="10" fill="var(--vf-text-tertiary)" font-family="inherit">${fmtUsd(val)}</text>`;
+  }
+  // Bars stacked
+  let barsHtml = '';
+  let xLabels = '';
+  for (let i = 0; i < c.months.length; i++) {
+    const m = c.months[i];
+    const x = padL + i * (barW + barGap);
+    let yStack = padT + plotH;
+    for (const cat of cats) {
+      const val = byMonthCat[m][cat] || 0;
+      if (val <= 0) continue;
+      const h = (val / yMax) * plotH;
+      yStack -= h;
+      barsHtml += `<rect x="${x}" y="${yStack}" width="${barW}" height="${h}" fill="${_MRP_CAT_COLORS[cat]}" opacity="0.9"><title>${m} · ${cat}: ${fmtUsd(val)}</title></rect>`;
+    }
+    // Total label above bar
+    const totalTxt = fmtUsd(c.totalByMonth[m]);
+    barsHtml += `<text x="${x + barW/2}" y="${yScale(c.totalByMonth[m]) + padT - 4}" text-anchor="middle" font-size="10" fill="var(--vf-text-secondary)" font-family="inherit">${totalTxt}</text>`;
+    xLabels += `<text x="${x + barW/2}" y="${padT + plotH + 16}" text-anchor="middle" font-size="11" fill="var(--vf-text-secondary)" font-family="inherit">${m}</text>`;
+  }
+  // Legend (top-right of the plot area)
+  const legendItems = cats.filter(cat => c.rows.some(r => r.category === cat));
+  let legendHtml = '';
+  let lx = padL + 4;
+  const ly = padT + 4;
+  for (const cat of legendItems) {
+    legendHtml += `<rect x="${lx}" y="${ly}" width="10" height="10" fill="${_MRP_CAT_COLORS[cat]}" rx="2"/>`;
+    legendHtml += `<text x="${lx + 14}" y="${ly + 9}" font-size="10" fill="var(--vf-text-secondary)" font-family="inherit">${cat}</text>`;
+    lx += 44;
+  }
+  svg.setAttribute('viewBox', `0 0 ${outerWidth} ${outerHeight}`);
+  svg.setAttribute('preserveAspectRatio', 'xMinYMin meet');
+  svg.style.minWidth = outerWidth + 'px';
+  svg.innerHTML = gridHtml + barsHtml + xLabels + legendHtml;
+}
+function _niceCeil(v) {
+  if (v <= 0) return 1;
+  const magnitude = Math.pow(10, Math.floor(Math.log10(v)));
+  const norm = v / magnitude;
+  const step = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10;
+  return step * magnitude;
+}
+
+function renderMrpOutlayTable() {
+  const tbody = document.getElementById('mrp-outlay-tbody');
+  const theadRow = document.getElementById('mrp-outlay-thead-row');
+  const c = _mrpOutlayCache;
+  if (!tbody || !c) return;
+  const search = (document.getElementById('mrp-outlay-search').value || '').toLowerCase();
+  const groupByCategory = document.getElementById('mrp-outlay-group-category').checked;
+
+  // Column headers = months
+  theadRow.innerHTML =
+    `<th>${groupByCategory ? 'Category' : 'SKU / Product'}</th>` +
+    c.months.map(m => `<th style="text-align:right;">${m}</th>`).join('') +
+    `<th style="text-align:right;">Total ($)</th>`;
+
+  let rows = c.rows;
+  if (search) rows = rows.filter(r => r.sku.toLowerCase().includes(search) || (r.name||'').toLowerCase().includes(search));
+
+  if (groupByCategory) {
+    const cats = {};
+    for (const r of rows) {
+      const k = r.category;
+      if (!cats[k]) cats[k] = { key: k, byMonth: {}, total: 0 };
+      for (const m of c.months) cats[k].byMonth[m] = (cats[k].byMonth[m] || 0) + (r.byMonth[m] || 0);
+      cats[k].total += r.total;
+    }
+    const catRows = Object.values(cats).sort((a, b) => b.total - a.total);
+    tbody.innerHTML = catRows.length === 0 ? `<tr><td colspan="${c.months.length + 2}" class="empty">No rows.</td></tr>` :
+      catRows.map(r => `<tr>
+        <td><span style="display:inline-block;width:8px;height:8px;background:${_MRP_CAT_COLORS[r.key]||'#94a3b8'};border-radius:2px;margin-right:6px;"></span><b>${r.key}</b></td>
+        ${c.months.map(m => `<td style="text-align:right;font-variant-numeric:tabular-nums;color:${(r.byMonth[m]||0)===0?'var(--vf-text-tertiary)':''};">${(r.byMonth[m]||0)===0?'—':fmtCurrencyLine(r.byMonth[m])}</td>`).join('')}
+        <td style="text-align:right;font-variant-numeric:tabular-nums;font-weight:600;">${fmtCurrencyLine(r.total)}</td>
+      </tr>`).join('');
+  } else {
+    tbody.innerHTML = rows.length === 0 ? `<tr><td colspan="${c.months.length + 2}" class="empty">No SKUs match.</td></tr>` :
+      rows.map(r => {
+        const catPill = `<span style="display:inline-block;width:8px;height:8px;background:${_MRP_CAT_COLORS[r.category]||'#94a3b8'};border-radius:2px;margin-right:6px;" title="${r.category}"></span>`;
+        const anchorHint = r.payAnchor === 'po_issue'
+          ? `<span style="font-size:9px;color:var(--vf-warning-text);margin-left:4px;" title="Paid on PO issue">upfront</span>`
+          : '';
+        return `<tr>
+          <td>${catPill}<span class="mo-id">${escapeHtml(r.sku)}</span>${anchorHint}
+            <div style="font-size:10px;color:var(--vf-text-tertiary);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(r.name||'')}</div>
+          </td>
+          ${c.months.map(m => `<td style="text-align:right;font-variant-numeric:tabular-nums;color:${(r.byMonth[m]||0)===0?'var(--vf-text-tertiary)':''};">${(r.byMonth[m]||0)===0?'—':fmtCurrencyLine(r.byMonth[m])}</td>`).join('')}
+          <td style="text-align:right;font-variant-numeric:tabular-nums;font-weight:500;">${fmtCurrencyLine(r.total)}</td>
+        </tr>`;
+      }).join('');
+  }
+}
+
+function exportMrpOutlayCsv() {
+  const c = _mrpOutlayCache;
+  if (!c || !c.rows.length) { alert('No outlay to export. Run MRP first.'); return; }
+  const headers = ['SKU', 'Product', 'Category', 'Pay anchor', 'Pay terms (days)', ...c.months, 'Total'];
+  const rows = c.rows.map(r => [
+    r.sku, r.name, r.category, r.payAnchor || '', r.payTermsDays == null ? '' : r.payTermsDays,
+    ...c.months.map(m => (r.byMonth[m] || 0).toFixed(2)),
+    r.total.toFixed(2),
+  ].map(v => {
+    const s = String(v == null ? '' : v);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }).join(','));
+  const totalsRow = ['TOTAL', '', '', '', '', ...c.months.map(m => (c.totalByMonth[m] || 0).toFixed(2)), c.grandTotal.toFixed(2)].join(',');
+  const meta = `# Voyage MRP Capital outlay projection\n# runAt=${mrpData.runAt}, today=${mrpData.today}\n# grandTotal=${c.grandTotal.toFixed(2)}, missingCostSkus=${c.missingCostCount}\n`;
+  const csv = meta + headers.join(',') + '\n' + rows.join('\n') + '\n' + totalsRow + '\n';
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `mrp-capital-outlay-${mrpData.today}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 function renderMrpPos() {
@@ -4416,9 +4711,13 @@ function renderMrpSupply() {
   const dl = document.getElementById('mrp-default-lead');
   const ds = document.getElementById('mrp-default-safety');
   const dp = document.getElementById('mrp-default-pack');
+  const dpa = document.getElementById('mrp-default-pay-anchor');
+  const dpd = document.getElementById('mrp-default-pay-days');
   if (dl && document.activeElement !== dl) dl.value = defaults.leadTimeDays ?? 30;
   if (ds && document.activeElement !== ds) ds.value = defaults.safetyStockDays ?? 14;
   if (dp && document.activeElement !== dp) dp.value = defaults.packagingDefaultDays ?? 14;
+  if (dpa && document.activeElement !== dpa) dpa.value = defaults.defaultPaymentAnchor || 'receipt';
+  if (dpd && document.activeElement !== dpd) dpd.value = defaults.defaultPaymentTermsDays ?? 30;
 
   const search = (document.getElementById('mrp-supply-search').value || '').toLowerCase();
   const sourceFilter = document.getElementById('mrp-supply-source-filter').value;
@@ -4432,12 +4731,14 @@ function renderMrpSupply() {
     if (search && !r.sku.toLowerCase().includes(search)) return false;
     return true;
   }).sort((a,b) => a.sku.localeCompare(b.sku));
-  tbody.innerHTML = filtered.length === 0 ? `<tr><td colspan="6" class="empty">No SKUs match.</td></tr>` :
+  tbody.innerHTML = filtered.length === 0 ? `<tr><td colspan="8" class="empty">No SKUs match.</td></tr>` :
     filtered.map(r => {
       const sku = escapeHtml(r.sku);
       const leadDisabled = r.isContract || r.isAlias;
       const leadValue = r.leadTimeDays != null ? r.leadTimeDays : '';
       const kgPerUnitValue = r.kgPerUnit != null ? r.kgPerUnit : '';
+      const payAnchorValue = r.paymentAnchor || '';
+      const payDaysValue = r.paymentTermsDays != null ? r.paymentTermsDays : '';
       const sources = ['explicit','contract','alias'];
       const sourceSelect = `<select onchange="onMrpSourceChange('${sku}', this.value)" style="padding:3px 6px;font-size:11px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;">
         ${sources.map(s => `<option value="${s}"${s===r.source?' selected':''}>${s}</option>`).join('')}
@@ -4462,6 +4763,16 @@ function renderMrpSupply() {
         <td style="text-align:right;">
           <input type="number" min="0" step="0.01" value="${kgPerUnitValue}" placeholder="—" onblur="onMrpKgPerUnitChange('${sku}', this.value)" onkeydown="if(event.key==='Enter')this.blur()" title="Optional. Set only for SKUs whose BOM is per-case but orders are entered in kg (e.g. PFS pouching, qty in kg, BOM qtyToProduce=1 case → kgPerUnit≈8.5)." style="width:70px;padding:3px 6px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;text-align:right;font-variant-numeric:tabular-nums;">
         </td>
+        <td>
+          <select onchange="onMrpPayAnchorChange('${sku}', this.value)" style="padding:3px 6px;font-size:11px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;">
+            <option value=""${payAnchorValue===''?' selected':''}>— default —</option>
+            <option value="receipt"${payAnchorValue==='receipt'?' selected':''}>Receipt</option>
+            <option value="po_issue"${payAnchorValue==='po_issue'?' selected':''}>PO issue</option>
+          </select>
+        </td>
+        <td style="text-align:right;">
+          <input type="number" min="0" value="${payDaysValue}" placeholder="—" onblur="onMrpPayDaysChange('${sku}', this.value)" onkeydown="if(event.key==='Enter')this.blur()" style="width:70px;padding:3px 6px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;text-align:right;font-variant-numeric:tabular-nums;">
+        </td>
         <td>${notesCell}</td>
         <td style="text-align:right;">
           <button class="btn btn-sm btn-danger" onclick="deleteMrpSku('${sku}')" title="Remove this SKU (falls back to default)" style="padding:2px 8px;font-size:11px;">✕</button>
@@ -4476,6 +4787,23 @@ function onMrpKgPerUnitChange(sku, value) {
   const v = parseFloat(value);
   if (isFinite(v) && v > 0) entry.kgPerUnit = v;
   else delete entry.kgPerUnit;
+  saveMrpSupply();
+}
+
+function onMrpPayAnchorChange(sku, value) {
+  const entry = mrpSupplyData.perSku[sku];
+  if (!entry) return;
+  if (value === 'receipt' || value === 'po_issue') entry.paymentAnchor = value;
+  else delete entry.paymentAnchor;
+  saveMrpSupply();
+}
+
+function onMrpPayDaysChange(sku, value) {
+  const entry = mrpSupplyData.perSku[sku];
+  if (!entry) return;
+  const v = parseInt(value, 10);
+  if (isFinite(v) && v >= 0) entry.paymentTermsDays = v;
+  else delete entry.paymentTermsDays;
   saveMrpSupply();
 }
 
@@ -4549,10 +4877,14 @@ function confirmAddSku() {
 let mrpSupplySaveTimer = null;
 async function saveMrpSupply() {
   // Collect current defaults from inputs
+  const dpaEl = document.getElementById('mrp-default-pay-anchor');
+  const dpdEl = document.getElementById('mrp-default-pay-days');
   const defaults = {
     leadTimeDays: parseInt(document.getElementById('mrp-default-lead').value, 10) || 30,
     safetyStockDays: parseInt(document.getElementById('mrp-default-safety').value, 10) || 14,
     packagingDefaultDays: parseInt(document.getElementById('mrp-default-pack').value, 10) || 14,
+    defaultPaymentAnchor: (dpaEl && (dpaEl.value === 'po_issue' || dpaEl.value === 'receipt')) ? dpaEl.value : 'receipt',
+    defaultPaymentTermsDays: dpdEl ? (parseInt(dpdEl.value, 10) || 0) : 30,
   };
   mrpSupplyData.defaults = defaults;
   const ind = document.getElementById('mrp-supply-save-ind');

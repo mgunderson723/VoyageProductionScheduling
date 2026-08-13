@@ -1687,6 +1687,13 @@ async function executeAITool(name, input, context) {
         // Cin7 native UOM (Kg, g, Each, case, etc.) — surfaced so callers
         // don't have to reason about whether qtyToOrder is in kg or grams.
         po.uom = (c && c.uom) || null;
+        // Capital outlay: bucket line cost by cash-out date. Receipt-anchor
+        // for typical net-30 supplies; PO-issue-anchor for pay-upfront items
+        // (CBE fats, grapeseeds, etc. — configured per-SKU in supply settings).
+        const pay = computePayDate(po, supply);
+        po.payDate = pay.payDate;
+        po.payAnchor = pay.payAnchor;
+        po.payTermsDays = pay.payTermsDays;
         const isDeferred = poHorizonEndDate && po.mustOrderByDate && po.mustOrderByDate > poHorizonEndDate;
         if (isDeferred) {
           deferred.push(po);
@@ -5340,7 +5347,17 @@ app.put("/api/supply-settings", requireAdmin, (req, res) => {
   try {
     const body = req.body || {};
     const defaults = Object.assign(
-      { leadTimeDays: 30, safetyStockDays: 14, packagingDefaultDays: 14 },
+      {
+        leadTimeDays: 30,
+        safetyStockDays: 14,
+        packagingDefaultDays: 14,
+        // Payment terms defaults — used by the Capital outlay view. Anchor
+        // "receipt" means "days from goods arriving"; "po_issue" means "days
+        // from placing the PO". CBE fats and grapeseeds (paid upfront) get
+        // per-SKU overrides with anchor=po_issue, days=0.
+        defaultPaymentAnchor: "receipt",
+        defaultPaymentTermsDays: 30,
+      },
       body.defaults || {},
     );
     // Coerce default values to non-negative integers
@@ -5349,6 +5366,13 @@ app.put("/api/supply-settings", requireAdmin, (req, res) => {
       if (!isFinite(n) || n < 0) return res.status(400).json({ ok: false, error: `defaults.${k} must be a non-negative integer` });
       defaults[k] = n;
     }
+    // Payment defaults have their own type checks.
+    if (!["receipt", "po_issue"].includes(defaults.defaultPaymentAnchor)) {
+      return res.status(400).json({ ok: false, error: "defaults.defaultPaymentAnchor must be 'receipt' or 'po_issue'" });
+    }
+    const dptd = parseInt(defaults.defaultPaymentTermsDays, 10);
+    if (!isFinite(dptd) || dptd < 0) return res.status(400).json({ ok: false, error: "defaults.defaultPaymentTermsDays must be a non-negative integer" });
+    defaults.defaultPaymentTermsDays = dptd;
     const inSku = body.perSku || {};
     if (typeof inSku !== "object" || Array.isArray(inSku)) return res.status(400).json({ ok: false, error: "perSku must be an object" });
     const cleanSku = {};
@@ -5369,6 +5393,15 @@ app.put("/api/supply-settings", requireAdmin, (req, res) => {
       if (v.kgPerUnit != null && v.kgPerUnit !== "") {
         const n = parseFloat(v.kgPerUnit);
         if (isFinite(n) && n > 0) entry.kgPerUnit = n;
+      }
+      // Payment-terms overrides — only stored when explicitly set so the
+      // Capital outlay view can fall back to the blob-level defaults.
+      if (v.paymentAnchor === "receipt" || v.paymentAnchor === "po_issue") {
+        entry.paymentAnchor = v.paymentAnchor;
+      }
+      if (v.paymentTermsDays != null && v.paymentTermsDays !== "") {
+        const n = parseInt(v.paymentTermsDays, 10);
+        if (isFinite(n) && n >= 0) entry.paymentTermsDays = n;
       }
       // If isContract or isAlias, leadTimeDays may be null. If neither and
       // the value is null, the SKU effectively falls back to the default.
@@ -5539,6 +5572,37 @@ function mrpAddDays(dateStr, days) {
   const d = new Date(dateStr + "T00:00:00Z");
   d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().slice(0, 10);
+}
+
+// Resolve effective payment terms for a SKU. Per-SKU override wins,
+// otherwise the blob-level defaults apply. anchor="receipt" means N days
+// after goods arrive (typical net-30); anchor="po_issue" means N days
+// after placing the PO (used for upfront-pay items like CBE fats and
+// grapeseeds where days=0 = pay when we place the order).
+function resolvePaymentTerms(sku, supply) {
+  const defaults = (supply && supply.defaults) || {};
+  const per = (supply && supply.perSku && supply.perSku[sku]) || {};
+  const anchor = per.paymentAnchor || defaults.defaultPaymentAnchor || "receipt";
+  const days = per.paymentTermsDays != null
+    ? per.paymentTermsDays
+    : (defaults.defaultPaymentTermsDays != null ? defaults.defaultPaymentTermsDays : 30);
+  return { anchor, days };
+}
+
+// Compute the expected cash-out date for a suggested PO. Uses
+// mustOrderByDate as a proxy for PO issue date (assumes we always order
+// on the latest safe date to preserve cash), and earliestNeedDate as the
+// receipt date (mustOrderByDate + leadTimeDays). Returns YYYY-MM-DD or
+// null when we lack the anchor date.
+function computePayDate(po, supply) {
+  const terms = resolvePaymentTerms(po.sku, supply);
+  const anchorDate = terms.anchor === "po_issue" ? po.mustOrderByDate : po.earliestNeedDate;
+  if (!anchorDate) return { payDate: null, payAnchor: terms.anchor, payTermsDays: terms.days };
+  return {
+    payDate: mrpAddDays(anchorDate, terms.days),
+    payAnchor: terms.anchor,
+    payTermsDays: terms.days,
+  };
 }
 
 // Order.sku field formats vary across the import history — sometimes it's a
@@ -6101,6 +6165,10 @@ app.get("/api/mrp/run", (req, res) => {
       po.lineCost = unitCost != null ? unitCost * po.qtyToOrder : null;
       po.costMissing = unitCost == null;
       po.uom = (c && c.uom) || null;
+      const pay = computePayDate(po, supply);
+      po.payDate = pay.payDate;
+      po.payAnchor = pay.payAnchor;
+      po.payTermsDays = pay.payTermsDays;
       const deferred = poHorizonEndDate && po.mustOrderByDate && po.mustOrderByDate > poHorizonEndDate;
       po.deferredByHorizon = !!deferred;
       if (deferred) {
