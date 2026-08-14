@@ -968,6 +968,7 @@ const AI_TOOLS = [
         includeUnconfirmed: { type: "boolean", description: "Default false" },
         includeDrafts:      { type: "boolean", description: "Default false — set true if you want pipeline drafts considered" },
         includeCompanions:  { type: "boolean", description: "Default false — set true to include synthetic companion-demand orders (see run_mrp docs on companion rules)" },
+        includeUpsideOnly:  { type: "boolean", description: "Default false — when includeDrafts is true, pipeline drafts flagged 'Upside Only' are excluded unless this is also true. Turn on to answer 'what if the upside deals land?'" },
         excludeBefore:      { type: "string",  description: "YYYY-MM-DD optional" },
       },
       required: ["sku"],
@@ -995,6 +996,7 @@ const AI_TOOLS = [
         includeUnconfirmed: { type: "boolean", description: "Include tentative/unconfirmed orders. Default false." },
         includeDrafts:      { type: "boolean", description: "Include pipeline drafts as additional demand. Default false." },
         includeCompanions:  { type: "boolean", description: "Include companion-demand rules: when a driver SKU (e.g., chocolate liquor) is scheduled, synthetic orders are generated for its configured companion SKUs (e.g., flavor packs) at the same need-date. Flow through the normal MRP pipeline — BOM expansion, FG netting, PO suggestions. Default false. Ask the user before enabling if they haven't mentioned it — this can materially change the PO $$ if rules exist. Companion-derived requirements are flagged isCompanionDemand=true with companionDriverOrderId/companionDriverSku so you can attribute them." },
+        includeUpsideOnly:  { type: "boolean", description: "Default false. When includeDrafts is true, pipeline drafts with 'Upside Only=Y' are excluded from the base case unless this flag is also true. Turn on when the user asks 'what if upside deals land' or 'MRP with all pipeline, upside included'." },
         excludeBefore:      { type: "string",  description: "Skip orders with start date before this (YYYY-MM-DD). Useful for filtering stale TBD orders." },
         topN:               { type: "number",  description: "How many top-$ suggested POs to return. Default 20." },
         netFgOnHand:        { type: "boolean", description: "Net finished-good on-hand inventory against planned production before computing RM demand. Default true. If a scheduled MO or pipeline draft would produce FG that's already sitting in stock (on-hand minus SO allocations), MRP subtracts that qty from planned production first, then expands the BOM on the reduced qty. This is what real MRP does; only turn OFF (netFgOnHand=false) when you want a 'gross production plan' view that shows what a full run would require ignoring existing FG inventory." },
@@ -1086,6 +1088,7 @@ function buildMrpSettingsBanner(s) {
   if (s.includeUnconfirmed)      parts.push("includeUnconfirmed=true");
   if (s.includeDrafts)           parts.push("includeDrafts=true");
   if (s.includeCompanions)       parts.push("includeCompanions=true");
+  if (s.includeUpsideOnly)       parts.push("includeUpsideOnly=true");
   if (s.excludeBefore && /^\d{4}-\d{2}-\d{2}$/.test(String(s.excludeBefore).trim())) {
     parts.push(`excludeBefore=${String(s.excludeBefore).trim()}`);
   }
@@ -1504,6 +1507,7 @@ async function executeAITool(name, input, context) {
       const includeUnconfirmed = pickBool(input.includeUnconfirmed, userSettings.includeUnconfirmed, false);
       const includeDrafts      = pickBool(input.includeDrafts, userSettings.includeDrafts, false);
       const includeCompanions  = pickBool(input.includeCompanions, userSettings.includeCompanions, false);
+      const includeUpsideOnly  = pickBool(input.includeUpsideOnly, userSettings.includeUpsideOnly, false);
       const excludeBeforeRaw   = pickStr(input.excludeBefore, userSettings.excludeBefore);
       const excludeBeforeDate  = /^\d{4}-\d{2}-\d{2}$/.test(excludeBeforeRaw) ? excludeBeforeRaw : null;
       const today              = new Date().toISOString().slice(0, 10);
@@ -1512,7 +1516,8 @@ async function executeAITool(name, input, context) {
       let mrpOrders = rawOrders;
       if (includeDrafts) {
         const pipelineBlob = readData("vf_pipeline_drafts");
-        const drafts = (pipelineBlob && pipelineBlob.drafts) || [];
+        const drafts = ((pipelineBlob && pipelineBlob.drafts) || [])
+          .filter(d => includeUpsideOnly || !d.upsideOnly);
         const synth = drafts.map(synthPipelineDraftAsOrder).filter(Boolean);
         mrpOrders = rawOrders.concat(synth);
       }
@@ -1592,7 +1597,7 @@ async function executeAITool(name, input, context) {
         totalKgNeeded,
         sourceCount: sources.length,
         sources,
-        settings: { horizonDays, includeUnconfirmed, includeDrafts, includeCompanions, excludeBeforeDate },
+        settings: { horizonDays, includeUnconfirmed, includeDrafts, includeCompanions, includeUpsideOnly, excludeBeforeDate },
         note: "Each entry is one source order/draft whose BOM expansion produced demand for this RM. If you expected an order to appear here and it isn't, that order does NOT actually use this RM (the BOM tree doesn't expand to it) — do NOT attribute demand to it.",
       };
     }
@@ -1641,6 +1646,7 @@ async function executeAITool(name, input, context) {
       const includeUnconfirmed = pickBool(input.includeUnconfirmed, userSettings.includeUnconfirmed, false);
       const includeDrafts      = pickBool(input.includeDrafts, userSettings.includeDrafts, false);
       const includeCompanions  = pickBool(input.includeCompanions, userSettings.includeCompanions, false);
+      const includeUpsideOnly  = pickBool(input.includeUpsideOnly, userSettings.includeUpsideOnly, false);
       const excludeBeforeRaw   = pickStr(input.excludeBefore, userSettings.excludeBefore);
       const excludeBeforeDate  = /^\d{4}-\d{2}-\d{2}$/.test(excludeBeforeRaw) ? excludeBeforeRaw : null;
       const topN               = Math.max(1, Math.min(100, isFinite(input.topN) ? input.topN : 20));
@@ -1655,7 +1661,8 @@ async function executeAITool(name, input, context) {
       let draftsCount = 0;
       if (includeDrafts) {
         const pipelineBlob = readData("vf_pipeline_drafts");
-        const drafts = (pipelineBlob && pipelineBlob.drafts) || [];
+        const drafts = ((pipelineBlob && pipelineBlob.drafts) || [])
+          .filter(d => includeUpsideOnly || !d.upsideOnly);
         const synth = drafts.map(synthPipelineDraftAsOrder).filter(Boolean);
         draftsCount = synth.length;
         mrpOrders = rawOrders.concat(synth);
@@ -1729,7 +1736,7 @@ async function executeAITool(name, input, context) {
         ok: true,
         runAt: new Date().toISOString(),
         today,
-        settings: { poHorizonDays, horizonDays, includeUnconfirmed, includeDrafts, draftsCount, includeCompanions, companionsCount, excludeBeforeDate, netFgOnHand },
+        settings: { poHorizonDays, horizonDays, includeUnconfirmed, includeDrafts, draftsCount, includeCompanions, companionsCount, includeUpsideOnly, excludeBeforeDate, netFgOnHand },
         summary: {
           ordersConsidered: mrpOrders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom + skipped.excludedByDate + (skipped.packoutFormulaOnly || 0)),
           requirementCount: requirements.length,
@@ -2100,16 +2107,14 @@ app.post("/api/chat/apply-pending", requireOrderEdit, async (req, res) => {
 const PIPELINE_NFS_CHANNEL = "Nut Free Spreads";
 const PIPELINE_NFS_SKU_PREFIX = "FG-604-";
 
-function parsePipelineXlsx(buffer) {
-  const wb = XLSX.read(buffer, { type: "buffer", cellDates: true });
-  if (!wb.SheetNames.length) throw new Error("Workbook has no sheets");
-  const ws = wb.Sheets[wb.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
-
+// Shared row-processor used by both the XLSX upload path and the CSV
+// webhook path. Takes a 2D array (rows of columns) and returns the same
+// { opportunities, mrpYesCount, ... } shape either entry point wants.
+function _parsePipelineRows(rows) {
   // Find the header row by scanning for the distinctive label set
   let hdrIdx = -1;
   for (let i = 0; i < Math.min(rows.length, 60); i++) {
-    const fields = rows[i].map(f => String(f || "").toLowerCase().trim());
+    const fields = (rows[i] || []).map(f => String(f || "").toLowerCase().trim());
     if (fields.includes("quarter shipping") && fields.some(f => f.startsWith("include in mrp"))) {
       hdrIdx = i; break;
     }
@@ -2128,6 +2133,7 @@ function parsePipelineXlsx(buffer) {
     else if (h === "confidence level") col.confidence = i;
     else if (h === "sku") col.sku = i;
     else if (h.startsWith("include in mrp")) col.includeInMrp = i;
+    else if (h.startsWith("upside only")) col.upsideOnly = i;
     else if (h === "comments") col.comments = i;
   });
   for (const k of ["quarter", "month", "customer", "channel", "qty", "sku", "includeInMrp"]) {
@@ -2158,6 +2164,11 @@ function parsePipelineXlsx(buffer) {
     if (!customer && !sku) { blankRowsSkipped++; continue; }
     const flag = String(r[col.includeInMrp] || "").trim().toUpperCase();
     if (flag === "Y") mrpYesCount++; else if (flag === "N") { mrpNoCount++; continue; } else { blankRowsSkipped++; continue; }
+    // Upside Only column: "Y" flags deals that should only be counted in
+    // MRP when the user explicitly turns on the upside toggle. Base case
+    // stays conservative. Blank/anything-else = counts in base case as
+    // long as Include-in-MRP = Y above.
+    const upsideOnly = col.upsideOnly !== undefined && String(r[col.upsideOnly] || "").trim().toUpperCase() === "Y";
 
     const channel = String(r[col.channel] || "").trim();
     const qtyValue = numOf(r[col.qty]);
@@ -2188,6 +2199,7 @@ function parsePipelineXlsx(buffer) {
       qtyRaw: qtyValue, qtyValue: qtyInUnit, qtyUnit,
       confidence,
       fgSKU: sku,
+      upsideOnly,
       comments,
       dataIssues,
     });
@@ -2197,8 +2209,26 @@ function parsePipelineXlsx(buffer) {
     mrpYesCount,
     mrpNoCount,
     blankRowsSkipped,
+    upsideOnlyCount: opportunities.filter(o => o.upsideOnly).length,
     headerRowIndex: hdrIdx,
+    hasUpsideOnlyColumn: col.upsideOnly !== undefined,
   };
+}
+
+function parsePipelineXlsx(buffer) {
+  const wb = XLSX.read(buffer, { type: "buffer", cellDates: true });
+  if (!wb.SheetNames.length) throw new Error("Workbook has no sheets");
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+  return _parsePipelineRows(rows);
+}
+
+// CSV variant used by the Google Sheets Apps Script webhook. parseCsvLine
+// is defined near the BOM CSV parser and handles quoted fields correctly.
+function parsePipelineCsv(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  const rows = lines.map(line => parseCsvLine(line));
+  return _parsePipelineRows(rows);
 }
 
 // Pipeline drafts only have a "Ship Month" — no production start. If we
@@ -2302,6 +2332,7 @@ function buildPipelineDrafts(opportunities) {
       qtyRaw: o.qtyRaw,
       qtyUnit: o.qtyUnit,
       fgSKU: o.fgSKU,
+      upsideOnly: !!o.upsideOnly,
       comments: o.comments,
       dataIssues: o.dataIssues,
       chain,
@@ -2328,9 +2359,12 @@ app.post("/api/pipeline/import", requireAdmin, upload.single("file"), (req, res)
     source: {
       filename: req.file.originalname || null,
       importedBy: u ? u.username : "(unknown)",
+      channel: "xlsx-upload",
       mrpYesCount: parsed.mrpYesCount,
       mrpNoCount: parsed.mrpNoCount,
       blankRowsSkipped: parsed.blankRowsSkipped,
+      upsideOnlyCount: parsed.upsideOnlyCount,
+      hasUpsideOnlyColumn: parsed.hasUpsideOnlyColumn,
       headerRowIndex: parsed.headerRowIndex,
     },
     drafts,
@@ -2341,6 +2375,59 @@ app.post("/api/pipeline/import", requireAdmin, upload.single("file"), (req, res)
     draftCount: drafts.length,
     mrpYesCount: parsed.mrpYesCount,
     mrpNoCount: parsed.mrpNoCount,
+    upsideOnlyCount: parsed.upsideOnlyCount,
+    hasUpsideOnlyColumn: parsed.hasUpsideOnlyColumn,
+    issuesCount: drafts.filter(d => d.dataIssues && d.dataIssues.length).length,
+  });
+});
+
+// POST /api/pipeline/webhook — Google Sheets Apps Script push endpoint.
+//
+// Secured by a shared secret in the X-Webhook-Secret header (matched
+// against PIPELINE_WEBHOOK_SECRET env var). Body is JSON:
+//   { csv: "<full sheet CSV>", source?: "...", sheetName?: "..." }
+//
+// Same parse + build + write flow as /api/pipeline/import; only the
+// entry point (CSV instead of XLSX) and the auth model differ. Lets
+// the sheet stay private — Apps Script has full read on the sheet the
+// user owns and just pushes the rendered CSV over.
+app.post("/api/pipeline/webhook", (req, res) => {
+  const expected = process.env.PIPELINE_WEBHOOK_SECRET;
+  if (!expected) return res.status(503).json({ ok: false, error: "PIPELINE_WEBHOOK_SECRET not configured on the server" });
+  const provided = req.get("X-Webhook-Secret") || (req.body && req.body.secret) || "";
+  if (provided !== expected) return res.status(401).json({ ok: false, error: "Invalid webhook secret" });
+  const body = req.body || {};
+  const csv = body.csv;
+  if (!csv || typeof csv !== "string") return res.status(400).json({ ok: false, error: "Missing 'csv' string in body" });
+  let parsed;
+  try { parsed = parsePipelineCsv(csv); }
+  catch (e) { return res.status(400).json({ ok: false, error: "Parse failed: " + e.message }); }
+  const drafts = buildPipelineDrafts(parsed.opportunities);
+  const blob = {
+    lastImport: new Date().toISOString(),
+    source: {
+      filename: null,
+      importedBy: `webhook:${body.source || "google-sheets"}`,
+      sheetName: body.sheetName || null,
+      channel: "google-sheets-webhook",
+      mrpYesCount: parsed.mrpYesCount,
+      mrpNoCount: parsed.mrpNoCount,
+      blankRowsSkipped: parsed.blankRowsSkipped,
+      upsideOnlyCount: parsed.upsideOnlyCount,
+      hasUpsideOnlyColumn: parsed.hasUpsideOnlyColumn,
+      headerRowIndex: parsed.headerRowIndex,
+    },
+    drafts,
+  };
+  writeData("vf_pipeline_drafts", blob);
+  console.log(`[Pipeline webhook] Ingested ${drafts.length} drafts (yes=${parsed.mrpYesCount}, upside=${parsed.upsideOnlyCount}) from ${body.source || "google-sheets"}`);
+  res.json({
+    ok: true,
+    draftCount: drafts.length,
+    mrpYesCount: parsed.mrpYesCount,
+    mrpNoCount: parsed.mrpNoCount,
+    upsideOnlyCount: parsed.upsideOnlyCount,
+    hasUpsideOnlyColumn: parsed.hasUpsideOnlyColumn,
     issuesCount: drafts.filter(d => d.dataIssues && d.dataIssues.length).length,
   });
 });
@@ -6098,6 +6185,9 @@ app.get("/api/mrp/run", (req, res) => {
     const excludeBeforeDate = /^\d{4}-\d{2}-\d{2}$/.test(excludeBeforeRaw) ? excludeBeforeRaw : null;
     const includeDrafts = req.query.includeDrafts === "1" || req.query.includeDrafts === "true";
     const includeCompanions = req.query.includeCompanions === "1" || req.query.includeCompanions === "true";
+    // Upside Only: when off (default), pipeline drafts flagged "Upside Only=Y"
+    // are excluded from MRP. Turn on to answer "what if the upside deals land?"
+    const includeUpsideOnly = req.query.includeUpsideOnly === "1" || req.query.includeUpsideOnly === "true";
     // PO horizon — how far ahead the user is willing to commit purchase
     // orders. Suggested POs whose mustOrderByDate falls beyond this
     // window are deferred to a separate bucket (visible in the response
@@ -6116,9 +6206,14 @@ app.get("/api/mrp/run", (req, res) => {
     // by definition).
     let mrpOrders = orders;
     let draftsCount = 0;
+    let upsideOnlyExcluded = 0;
     if (includeDrafts) {
       const pipelineBlob = readData("vf_pipeline_drafts");
-      const drafts = (pipelineBlob && pipelineBlob.drafts) || [];
+      const allDrafts = (pipelineBlob && pipelineBlob.drafts) || [];
+      const drafts = allDrafts.filter(d => {
+        if (d.upsideOnly && !includeUpsideOnly) { upsideOnlyExcluded++; return false; }
+        return true;
+      });
       const synth = drafts.map(synthPipelineDraftAsOrder).filter(Boolean);
       draftsCount = synth.length;
       mrpOrders = orders.concat(synth);
@@ -6214,7 +6309,7 @@ app.get("/api/mrp/run", (req, res) => {
       ok: true,
       runAt: new Date().toISOString(),
       today,
-      settings: { includeUnconfirmed, applyWastage, horizonDays, excludeBeforeDate, includeDrafts, draftsCount, includeCompanions, companionsCount, poHorizonDays, poHorizonEndDate, netFgOnHand: netFgOnHandFlag },
+      settings: { includeUnconfirmed, applyWastage, horizonDays, excludeBeforeDate, includeDrafts, draftsCount, includeCompanions, companionsCount, includeUpsideOnly, upsideOnlyExcluded, poHorizonDays, poHorizonEndDate, netFgOnHand: netFgOnHandFlag },
       fgNettingSummary: fgNettingSummary || [],
       wipNettingSummary: wipNettingSummary || [],
       summary: {

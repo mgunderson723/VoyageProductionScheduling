@@ -998,14 +998,38 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       <div style="display:flex;gap:var(--vf-space-2);align-items:center;">
         <input type="file" id="pipeline-file-input" accept=".xlsx,.xls" style="display:none;" onchange="onPipelineFilePicked()">
         <button class="btn" onclick="document.getElementById('pipeline-file-input').click()">↑ Import pipeline XLSX</button>
+        <button class="btn btn-sm" onclick="openPipelineGSheetsModal()" title="Set up automatic push from a Google Sheet via Apps Script">⚙ Google Sheets sync</button>
         <button class="btn btn-sm" onclick="loadPipeline()">⟳ Refresh</button>
       </div>
     </div>
 
     <div style="font-size:var(--vf-text-sm);color:var(--vf-text-secondary);margin:var(--vf-space-2) 0 var(--vf-space-3);max-width:820px;">
-      Upload the Voyage Pipeline Review .xlsx to generate draft production runs. Only rows with
-      <strong>Include in MRP = Y</strong> are pulled in. Drafts stay here until you click <strong>Promote</strong> — they
+      Upload the Voyage Pipeline Review .xlsx to generate draft production runs, or set up Google Sheets sync for automatic pushes. Only rows with
+      <strong>Include in MRP = Y</strong> are pulled in. Rows flagged <strong>Upside Only = Y</strong> are excluded from the MRP base case (toggle "Include upside-only deals" on the MRP tab to add them). Drafts stay here until you click <strong>Promote</strong> — they
       don't touch the calendar or MRP until you do. Confidence color: 🟢 ≥75% · 🟡 50–74% · 🔴 &lt;50%.
+    </div>
+
+    <!-- Google Sheets sync setup modal -->
+    <div id="pipeline-gsheets-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+      <div style="background:var(--vf-surface-raised);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-lg);padding:var(--vf-space-4);width:720px;max-width:90vw;max-height:88vh;overflow-y:auto;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:var(--vf-space-3);">
+          <h3 style="margin:0;color:var(--vf-text-primary);">Google Sheets sync setup</h3>
+          <button class="btn btn-sm" onclick="closePipelineGSheetsModal()" style="padding:2px 8px;">×</button>
+        </div>
+        <div style="font-size:13px;color:var(--vf-text-secondary);line-height:1.5;">
+          <p><strong>What this does:</strong> the sheet pushes its current contents to Voyage whenever edited (or on a daily schedule). The sheet stays private — no share settings change required.</p>
+          <ol style="padding-left:22px;">
+            <li>Ask IT to set env var <code>PIPELINE_WEBHOOK_SECRET</code> on the Railway service (any long random string). This is the shared secret between the sheet and the app.</li>
+            <li>In your pipeline Google Sheet, open <strong>Extensions → Apps Script</strong>. Delete the existing sample and paste the code below.</li>
+            <li>Replace <code>SHEET_NAME</code> with the tab name of your pipeline (e.g. <code>2026 Pipeline</code>) and <code>WEBHOOK_SECRET</code> with the same secret IT set on Railway.</li>
+            <li>Save the script, then click <strong>Run → pushPipelineToVoyage</strong>. Grant the permissions it asks for (Google will ask you to authorize the script to read the sheet and make HTTP requests).</li>
+            <li>Optionally run <strong>installDailyTrigger</strong> once — it'll push the sheet to Voyage every day at 6 AM sheet time. Or add an edit trigger via <strong>Triggers → Add trigger → onEdit → pushPipelineToVoyage</strong>.</li>
+          </ol>
+          <p style="margin-top:12px;"><strong>Apps Script code:</strong> (click the code, Ctrl+A, Ctrl+C to copy)</p>
+          <pre id="pipeline-gsheets-script" style="background:var(--vf-surface-sunken);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);padding:10px;font-size:11px;font-family:monospace;overflow-x:auto;white-space:pre;max-height:340px;overflow-y:auto;user-select:text;"></pre>
+          <p style="margin-top:12px;color:var(--vf-text-tertiary);font-size:12px;">Once configured, pushes will show up here just like manual uploads (source will read <code>webhook:google-sheets-apps-script</code> instead of a filename).</p>
+        </div>
+      </div>
     </div>
 
     <div id="pipeline-bulk-bar" style="display:none;background:var(--vf-surface-raised);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);padding:8px 12px;margin-bottom:var(--vf-space-3);display:flex;gap:var(--vf-space-2);align-items:center;flex-wrap:wrap;">
@@ -1488,6 +1512,10 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
         <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);" title="Treat pending Pipeline-tab drafts as additional demand sources for this MRP run.">
           <input type="checkbox" id="mrp-include-drafts" style="margin:0;"/>
           Include pipeline drafts
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);" title="When 'Include pipeline drafts' is on, also include drafts flagged 'Upside Only=Y' in the pipeline sheet. Off by default so the base case stays conservative.">
+          <input type="checkbox" id="mrp-include-upside" style="margin:0;"/>
+          Include upside-only deals
         </label>
         <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);" title="Add synthetic companion-demand orders for each in-scope driver order per MRP Setup → Companion demand rules (e.g. liquor → flavor packs). Runs the companion's BOM through normal expansion + PO suggestions.">
           <input type="checkbox" id="mrp-include-companions" style="margin:0;"/>
@@ -3650,6 +3678,7 @@ async function runMrp() {
   if (excludeBefore) params.set('excludeBefore', excludeBefore);
   if (document.getElementById('mrp-include-drafts').checked) params.set('includeDrafts', '1');
   if (document.getElementById('mrp-include-companions').checked) params.set('includeCompanions', '1');
+  if (document.getElementById('mrp-include-upside').checked) params.set('includeUpsideOnly', '1');
   const poHorizonRaw = parseInt(document.getElementById('mrp-po-horizon-days').value, 10);
   if (Number.isFinite(poHorizonRaw) && poHorizonRaw >= 0) params.set('poHorizonDays', String(poHorizonRaw));
   const tsEl = document.getElementById('mrp-run-ts');
@@ -3669,6 +3698,9 @@ async function runMrp() {
     const draftsNote = (j.settings && j.settings.includeDrafts)
       ? ` · ${j.settings.draftsCount || 0} pipeline draft${(j.settings.draftsCount || 0) === 1 ? '' : 's'} included`
       : '';
+    const upsideNote = (j.settings && j.settings.includeDrafts && (j.settings.upsideOnlyExcluded || 0) > 0 && !j.settings.includeUpsideOnly)
+      ? ` · ${j.settings.upsideOnlyExcluded} upside-only draft${j.settings.upsideOnlyExcluded === 1 ? '' : 's'} excluded`
+      : (j.settings && j.settings.includeUpsideOnly ? ` · upside-only included` : '');
     const companionsNote = (j.settings && j.settings.includeCompanions)
       ? ` · ${j.settings.companionsCount || 0} companion order${(j.settings.companionsCount || 0) === 1 ? '' : 's'} added`
       : '';
@@ -3677,7 +3709,7 @@ async function runMrp() {
     const poNote = (poHorizon > 0 && deferredCount > 0)
       ? ` · ${deferredCount} PO${deferredCount === 1 ? '' : 's'} deferred beyond ${poHorizon}d horizon`
       : '';
-    tsEl.textContent = `Last run ${d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} · today=${j.today}${filterNote}${draftsNote}${companionsNote}${poNote}`;
+    tsEl.textContent = `Last run ${d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} · today=${j.today}${filterNote}${draftsNote}${upsideNote}${companionsNote}${poNote}`;
     renderMrp();
   } catch (e) {
     tsEl.textContent = 'Failed: ' + e.message;
@@ -7113,6 +7145,70 @@ async function saveYieldBucket(idx) {
 let pipelineData = null;
 let pipelineSelection = new Set();
 
+function openPipelineGSheetsModal() {
+  const webhookUrl = window.location.origin + '/api/pipeline/webhook';
+  const script = `// Voyage Pipeline → Production Scheduling app push
+// Paste this into your pipeline sheet's Extensions -> Apps Script.
+// Edit SHEET_NAME and WEBHOOK_SECRET below to match your setup.
+
+const SHEET_NAME      = '2026 Pipeline';    // <-- edit: exact tab name
+const WEBHOOK_URL     = ${JSON.stringify(webhookUrl)};
+const WEBHOOK_SECRET  = 'REPLACE-WITH-YOUR-SECRET';  // <-- edit: same as PIPELINE_WEBHOOK_SECRET on Railway
+
+function pushPipelineToVoyage() {
+  const sheet = SpreadsheetApp.getActive().getSheetByName(SHEET_NAME);
+  if (!sheet) throw new Error('Sheet not found: ' + SHEET_NAME);
+
+  const values = sheet.getDataRange().getValues();
+  const tz = Session.getScriptTimeZone();
+  const csv = values.map(row => row.map(cell => {
+    let s;
+    if (cell instanceof Date) s = Utilities.formatDate(cell, tz, 'yyyy-MM-dd');
+    else s = String(cell == null ? '' : cell);
+    return /[",\\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }).join(',')).join('\\n');
+
+  const resp = UrlFetchApp.fetch(WEBHOOK_URL, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'X-Webhook-Secret': WEBHOOK_SECRET },
+    payload: JSON.stringify({
+      csv: csv,
+      source: 'google-sheets-apps-script',
+      sheetName: SHEET_NAME
+    }),
+    muteHttpExceptions: true
+  });
+
+  const code = resp.getResponseCode();
+  const body = resp.getContentText();
+  if (code !== 200) throw new Error('Push failed: ' + code + ' ' + body);
+  Logger.log('Pushed to Voyage: ' + body);
+  return body;
+}
+
+// One-time helper: run this once to install a daily 6 AM push.
+// You can also add an onEdit trigger via Triggers -> Add trigger.
+function installDailyTrigger() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'pushPipelineToVoyage') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('pushPipelineToVoyage')
+    .timeBased()
+    .everyDays(1)
+    .atHour(6)
+    .create();
+  Logger.log('Daily 6am trigger installed.');
+}
+`;
+  document.getElementById('pipeline-gsheets-script').textContent = script;
+  document.getElementById('pipeline-gsheets-modal').style.display = 'flex';
+}
+
+function closePipelineGSheetsModal() {
+  document.getElementById('pipeline-gsheets-modal').style.display = 'none';
+}
+
 async function loadPipeline() {
   const meta = document.getElementById('pipeline-meta');
   const content = document.getElementById('pipeline-content');
@@ -7168,7 +7264,7 @@ function renderPipeline() {
     return `
       <tr style="border-top:1px solid var(--vf-border-subtle);">
         <td style="text-align:center;padding:8px;"><input type="checkbox" ${selected ? 'checked' : ''} onchange="togglePipelineSelect('${d.id}')"></td>
-        <td style="font-size:12px;font-weight:500;">${escapeHtml(d.customer || '?')}</td>
+        <td style="font-size:12px;font-weight:500;">${escapeHtml(d.customer || '?')}${d.upsideOnly ? '<span style="display:inline-block;margin-left:6px;padding:1px 6px;font-size:9px;background:var(--vf-warning-base);color:white;border-radius:8px;vertical-align:middle;" title="Excluded from MRP base case. Toggle \'Include upside-only deals\' on MRP tab to include.">upside</span>' : ''}</td>
         <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(d.channel || '')}</td>
         <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(d.shipMonth || '?')}<div style="font-size:10px;">${escapeHtml(d.quarter || '')}</div></td>
         <td style="text-align:right;font-variant-numeric:tabular-nums;font-size:12px;">${fmtQty(d.qtyValue, d.qtyUnit)}</td>
@@ -7962,6 +8058,7 @@ function readCurrentMrpSettings() {
     includeUnconfirmed: boolOr('mrp-include-unconfirmed', false),
     includeDrafts:      boolOr('mrp-include-drafts', false),
     includeCompanions:  boolOr('mrp-include-companions', false),
+    includeUpsideOnly:  boolOr('mrp-include-upside', false),
     excludeBefore:      strOr('mrp-exclude-before', ''),
   };
 }
