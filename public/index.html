@@ -1509,11 +1509,11 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
           <input type="checkbox" id="mrp-apply-wastage" checked style="margin:0;"/>
           Apply wastage %
         </label>
-        <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);" title="Treat pending Pipeline-tab drafts as additional demand sources for this MRP run.">
+        <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);" title="Treat pending Pipeline-tab drafts (synced from the financial model sheet) as additional demand sources for this MRP run.">
           <input type="checkbox" id="mrp-include-drafts" style="margin:0;"/>
-          Include pipeline drafts
+          Include pipeline orders from financial model
         </label>
-        <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);" title="When 'Include pipeline drafts' is on, also include drafts flagged 'Upside Only=Y' in the pipeline sheet. Off by default so the base case stays conservative.">
+        <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);" title="When the pipeline-orders toggle is on, also include rows flagged 'Upside Only=Y' in the financial model. Off by default so the base case stays conservative.">
           <input type="checkbox" id="mrp-include-upside" style="margin:0;"/>
           Include upside-only deals
         </label>
