@@ -4238,7 +4238,11 @@ function pullMrpOutlayToVoyage() {
   const settings = j.settings || {};
   const scenarioBits = [];
   if (settings.includeDrafts) scenarioBits.push('pipeline');
-  if (settings.includeUpsideOnly) scenarioBits.push('upside-only');
+  if (settings.includeUpsideOnly) {
+    scenarioBits.push('upside-only INCLUDED');
+  } else if (settings.upsideOnlyExcluded > 0) {
+    scenarioBits.push(settings.upsideOnlyExcluded + ' upside-only draft(s) EXCLUDED');
+  }
   if (settings.includeCompanions) scenarioBits.push('companions');
   scenarioBits.push('mode=' + (outlay.mode || 'smoothed'));
   scenarioBits.push('horizon=' + (settings.horizonDays || '?') + 'd');
