@@ -251,6 +251,7 @@ const SESSION_BYPASS_PATHS = new Set([
   "/login",
   "/logout",
   "/cin7/inventory-movements", // Apps Script auto-sync, gated by X-VF-Sync-Secret
+  "/pipeline/webhook",         // Apps Script pipeline push, gated by X-Webhook-Secret
 ]);
 app.use("/api", (req, res, next) => {
   if (SESSION_BYPASS_PATHS.has(req.path)) return next();
