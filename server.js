@@ -250,8 +250,9 @@ app.post("/api/logout", (req, res) => {
 const SESSION_BYPASS_PATHS = new Set([
   "/login",
   "/logout",
-  "/cin7/inventory-movements", // Apps Script auto-sync, gated by X-VF-Sync-Secret
-  "/pipeline/webhook",         // Apps Script pipeline push, gated by X-Webhook-Secret
+  "/cin7/inventory-movements",     // Apps Script auto-sync, gated by X-VF-Sync-Secret
+  "/pipeline/webhook",             // Apps Script pipeline push, gated by X-Webhook-Secret
+  "/mrp/capital-outlay.json",      // Apps Script pull from financial model, gated by X-Webhook-Secret
 ]);
 app.use("/api", (req, res, next) => {
   if (SESSION_BYPASS_PATHS.has(req.path)) return next();
@@ -6175,176 +6176,245 @@ function allocateAndPlan(requirements, onHandBySku, supply, today, poHorizonEndD
 }
 
 // GET /api/mrp/run?includeUnconfirmed=0&horizonDays=120&applyWastage=1
+// Shared MRP calc. Both /api/mrp/run (interactive UI) and
+// /api/mrp/capital-outlay.json (Google Sheets pull from the financial
+// model) call this so they never drift. Returns the full result payload
+// including enriched suggestedPOs, deferredPOs, and the run settings.
+// Query object is req.query or any object with the same shape.
+function computeMrpRun(query) {
+  query = query || {};
+  const includeUnconfirmed = query.includeUnconfirmed === "1" || query.includeUnconfirmed === "true";
+  const applyWastage = query.applyWastage !== "0" && query.applyWastage !== "false";
+  const horizonDays = Math.max(1, Math.min(365, parseInt(query.horizonDays, 10) || 120));
+  const excludeBeforeRaw = String(query.excludeBefore || "").trim();
+  const excludeBeforeDate = /^\d{4}-\d{2}-\d{2}$/.test(excludeBeforeRaw) ? excludeBeforeRaw : null;
+  const includeDrafts = query.includeDrafts === "1" || query.includeDrafts === "true";
+  const includeCompanions = query.includeCompanions === "1" || query.includeCompanions === "true";
+  const includeUpsideOnly = query.includeUpsideOnly === "1" || query.includeUpsideOnly === "true";
+  const poHorizonDays = Math.max(0, Math.min(365, parseInt(query.poHorizonDays, 10) || 30));
+  const today = new Date().toISOString().slice(0, 10);
+  const poHorizonEndDate = poHorizonDays > 0 ? mrpAddDays(today, poHorizonDays) : null;
+
+  const { orders, bomParents, supply, onHandBySku, costsBySku, costsLastSync } = getMrpInputs();
+
+  let mrpOrders = orders;
+  let draftsCount = 0;
+  let upsideOnlyExcluded = 0;
+  if (includeDrafts) {
+    const pipelineBlob = readData("vf_pipeline_drafts");
+    const allDrafts = (pipelineBlob && pipelineBlob.drafts) || [];
+    const drafts = allDrafts.filter(d => {
+      if (d.upsideOnly && !includeUpsideOnly) { upsideOnlyExcluded++; return false; }
+      return true;
+    });
+    const synth = drafts.map(synthPipelineDraftAsOrder).filter(Boolean);
+    draftsCount = synth.length;
+    mrpOrders = orders.concat(synth);
+  }
+  let companionsCount = 0;
+  if (includeCompanions) {
+    const cblob = _companionRulesBlob();
+    const synths = generateCompanionOrders(mrpOrders, cblob.rules || []);
+    companionsCount = synths.length;
+    if (synths.length) mrpOrders = mrpOrders.concat(synths);
+  }
+
+  const netFgOnHandFlag = query.netFgOnHand !== "false";
+  const { requirements, skipped, noBomExamples, packoutSkippedExamples, fgNettingSummary, wipNettingSummary } = buildRequirements(mrpOrders, bomParents, {
+    today, horizonDays, includeUnconfirmed, applyWastage, excludeBeforeDate, supply,
+    onHandBySku, netFgOnHand: netFgOnHandFlag,
+  });
+  const { skuResults, suggestedPOs, atRiskOrders } = allocateAndPlan(requirements, onHandBySku, supply, today, poHorizonEndDate);
+
+  let totalDollars = 0, overdueDollars = 0, missingCostCount = 0;
+  let deferredDollars = 0, deferredMissingCostCount = 0;
+  const dollarsByMonth = {};
+  const inWindowPOs = [], deferredPOs = [];
+  const demandBySkuMonth = {};
+  for (const r of requirements) {
+    if (!r.sku || !r.neededByDate) continue;
+    const m = r.neededByDate.slice(0, 7);
+    if (!demandBySkuMonth[r.sku]) demandBySkuMonth[r.sku] = {};
+    demandBySkuMonth[r.sku][m] = (demandBySkuMonth[r.sku][m] || 0) + (Number(r.qtyKg) || 0);
+  }
+  for (const po of suggestedPOs) {
+    const c = costsBySku[po.sku];
+    const unitCost = c && c.averageCost > 0 ? c.averageCost : null;
+    po.unitCost = unitCost;
+    po.lineCost = unitCost != null ? unitCost * po.qtyToOrder : null;
+    po.costMissing = unitCost == null;
+    po.uom = (c && c.uom) || null;
+    const pay = computePayDate(po, supply);
+    po.payDate = pay.payDate;
+    po.payAnchor = pay.payAnchor;
+    po.payTermsDays = pay.payTermsDays;
+    po.demandByMonth = demandBySkuMonth[po.sku] || null;
+    const deferred = poHorizonEndDate && po.mustOrderByDate && po.mustOrderByDate > poHorizonEndDate;
+    po.deferredByHorizon = !!deferred;
+    if (deferred) {
+      deferredPOs.push(po);
+      if (po.costMissing) deferredMissingCostCount++;
+      else deferredDollars += po.lineCost;
+    } else {
+      inWindowPOs.push(po);
+      if (po.costMissing) missingCostCount++;
+      else {
+        totalDollars += po.lineCost;
+        if (po.isOverdue) overdueDollars += po.lineCost;
+      }
+    }
+    if (po.lineCost != null) {
+      const bucketDate = po.mustOrderByDate || po.earliestNeedDate;
+      if (bucketDate) {
+        const month = bucketDate.slice(0, 7);
+        if (!dollarsByMonth[month]) dollarsByMonth[month] = { month, total: 0, overdue: 0, count: 0 };
+        dollarsByMonth[month].total += po.lineCost;
+        if (po.isOverdue && !deferred) dollarsByMonth[month].overdue += po.lineCost;
+        dollarsByMonth[month].count += 1;
+      }
+    }
+  }
+  const dollarsByMonthArr = Object.values(dollarsByMonth).sort((a, b) => a.month.localeCompare(b.month));
+
+  return {
+    ok: true,
+    runAt: new Date().toISOString(),
+    today,
+    settings: { includeUnconfirmed, applyWastage, horizonDays, excludeBeforeDate, includeDrafts, draftsCount, includeCompanions, companionsCount, includeUpsideOnly, upsideOnlyExcluded, poHorizonDays, poHorizonEndDate, netFgOnHand: netFgOnHandFlag },
+    fgNettingSummary: fgNettingSummary || [],
+    wipNettingSummary: wipNettingSummary || [],
+    summary: {
+      ordersConsidered: mrpOrders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom + skipped.excludedByDate + (skipped.packoutFormulaOnly || 0)),
+      ordersSkipped: skipped,
+      noBomExamples,
+      packoutSkippedExamples,
+      requirementCount: requirements.length,
+      skuCount: skuResults.length,
+      atRiskOrderCount: atRiskOrders.length,
+      suggestedPoCount: inWindowPOs.length,
+      overduePoCount: inWindowPOs.filter(p => p.isOverdue).length,
+      deferredPoCount: deferredPOs.length,
+      currency: "USD",
+      totalDollars: Math.round(totalDollars * 100) / 100,
+      overdueDollars: Math.round(overdueDollars * 100) / 100,
+      deferredDollars: Math.round(deferredDollars * 100) / 100,
+      missingCostCount,
+      deferredMissingCostCount,
+      costsLastSync,
+      dollarsByMonth: dollarsByMonthArr,
+    },
+    suggestedPOs: inWindowPOs,
+    deferredPOs,
+    atRiskOrders,
+    skuResults,
+  };
+}
+
+// Bucket the enriched suggestedPOs + deferredPOs into a
+// (SKU × pay-month) pivot matching what the Capital outlay view renders.
+// Server-side twin of _bucketPosByPayMonth in the frontend so
+// /api/mrp/capital-outlay.json returns the same shape the sheet needs.
+function bucketOutlayForExport(mrpRun, mode) {
+  mode = mode === "as_suggested" ? "as_suggested" : "smoothed";
+  const both = [].concat(mrpRun.suggestedPOs || [], mrpRun.deferredPOs || []);
+  const bySku = new Map();
+  const monthSet = new Set();
+  let missingCostCount = 0, missingPayDateCount = 0, smoothableCount = 0;
+  for (const po of both) {
+    if (!po) continue;
+    if (po.costMissing || !isFinite(po.lineCost) || po.lineCost <= 0) { missingCostCount++; continue; }
+    if (!po.payDate) { missingPayDateCount++; continue; }
+    let e = bySku.get(po.sku);
+    if (!e) {
+      e = { sku: po.sku, name: po.name || "", category: _serverSkuCategory(po.sku), byMonth: {}, total: 0, payAnchor: po.payAnchor, payTermsDays: po.payTermsDays };
+      bySku.set(po.sku, e);
+    }
+    const dm = po.demandByMonth && Object.keys(po.demandByMonth).length ? po.demandByMonth : null;
+    const dmTotal = dm ? Object.values(dm).reduce((s, v) => s + v, 0) : 0;
+    const canSmooth = dm && dmTotal > 0 && Object.keys(dm).length > 1;
+    if (canSmooth) smoothableCount++;
+    if (mode === "smoothed" && canSmooth) {
+      const shift = (po.payTermsDays || 0) - (po.payAnchor === "po_issue" && po.leadTimeDays ? po.leadTimeDays : 0);
+      for (const [dMonth, dQty] of Object.entries(dm)) {
+        const share = po.lineCost * (dQty / dmTotal);
+        const payMonth = _shiftMonthByDays(dMonth, shift);
+        monthSet.add(payMonth);
+        e.byMonth[payMonth] = (e.byMonth[payMonth] || 0) + share;
+      }
+      e.total += po.lineCost;
+    } else {
+      const month = po.payDate.slice(0, 7);
+      monthSet.add(month);
+      e.byMonth[month] = (e.byMonth[month] || 0) + po.lineCost;
+      e.total += po.lineCost;
+    }
+  }
+  const months = [...monthSet].sort();
+  const rows = [...bySku.values()].sort((a, b) => b.total - a.total);
+  const totalByMonth = {};
+  for (const m of months) totalByMonth[m] = 0;
+  for (const r of rows) for (const m of months) totalByMonth[m] += (r.byMonth[m] || 0);
+  const grandTotal = rows.reduce((s, r) => s + r.total, 0);
+  return { mode, months, rows, totalByMonth, grandTotal, missingCostCount, missingPayDateCount, smoothableCount };
+}
+function _serverSkuCategory(sku) {
+  const s = String(sku || "").toUpperCase();
+  if (s.startsWith("RM-")) return "RM";
+  if (s.startsWith("VC-")) return "VC";
+  if (s.startsWith("PK-")) return "PK";
+  if (s.startsWith("WIP-") || /^WIP\d+-/.test(s)) return "WIP";
+  if (s.startsWith("FG-")) return "FG";
+  return "OTHER";
+}
+function _shiftMonthByDays(monthStr, days) {
+  const [y, m] = monthStr.split("-").map(Number);
+  const d = new Date(Date.UTC(y, m - 1, 15));
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 7);
+}
+
 app.get("/api/mrp/run", (req, res) => {
   try {
-    const includeUnconfirmed = req.query.includeUnconfirmed === "1" || req.query.includeUnconfirmed === "true";
-    const applyWastage = req.query.applyWastage !== "0" && req.query.applyWastage !== "false";
-    const horizonDays = Math.max(1, Math.min(365, parseInt(req.query.horizonDays, 10) || 120));
-    // Optional "exclude orders with start < this date" filter — accepts
-    // YYYY-MM-DD. Empty/invalid → filter disabled.
-    const excludeBeforeRaw = String(req.query.excludeBefore || "").trim();
-    const excludeBeforeDate = /^\d{4}-\d{2}-\d{2}$/.test(excludeBeforeRaw) ? excludeBeforeRaw : null;
-    const includeDrafts = req.query.includeDrafts === "1" || req.query.includeDrafts === "true";
-    const includeCompanions = req.query.includeCompanions === "1" || req.query.includeCompanions === "true";
-    // Upside Only: when off (default), pipeline drafts flagged "Upside Only=Y"
-    // are excluded from MRP. Turn on to answer "what if the upside deals land?"
-    const includeUpsideOnly = req.query.includeUpsideOnly === "1" || req.query.includeUpsideOnly === "true";
-    // PO horizon — how far ahead the user is willing to commit purchase
-    // orders. Suggested POs whose mustOrderByDate falls beyond this
-    // window are deferred to a separate bucket (visible in the response
-    // but excluded from headline KPIs). Default 30d; 0 or negative
-    // disables the cap (legacy behavior).
-    const poHorizonDays = Math.max(0, Math.min(365, parseInt(req.query.poHorizonDays, 10) || 30));
-    const today = new Date().toISOString().slice(0, 10);
-    const poHorizonEndDate = poHorizonDays > 0 ? mrpAddDays(today, poHorizonDays) : null;
-
-    const { orders, bomParents, supply, onHandBySku, costsBySku, costsLastSync } = getMrpInputs();
-
-    // When the toggle is on, synthesize order-shaped objects from each
-    // pipeline draft and concat them with the real orders. Synthetic
-    // entries are flagged with __fromPipelineDraft so buildRequirements
-    // can bypass the unconfirmed filter (drafts are always unconfirmed
-    // by definition).
-    let mrpOrders = orders;
-    let draftsCount = 0;
-    let upsideOnlyExcluded = 0;
-    if (includeDrafts) {
-      const pipelineBlob = readData("vf_pipeline_drafts");
-      const allDrafts = (pipelineBlob && pipelineBlob.drafts) || [];
-      const drafts = allDrafts.filter(d => {
-        if (d.upsideOnly && !includeUpsideOnly) { upsideOnlyExcluded++; return false; }
-        return true;
-      });
-      const synth = drafts.map(synthPipelineDraftAsOrder).filter(Boolean);
-      draftsCount = synth.length;
-      mrpOrders = orders.concat(synth);
-    }
-
-    // Companion-demand synthesizer runs AFTER draft synthesis so a pipeline
-    // draft for a liquor SKU can also trigger companion flavor demand. Skips
-    // if disabled or no rules configured.
-    let companionsCount = 0;
-    if (includeCompanions) {
-      const cblob = _companionRulesBlob();
-      const synths = generateCompanionOrders(mrpOrders, cblob.rules || []);
-      companionsCount = synths.length;
-      if (synths.length) mrpOrders = mrpOrders.concat(synths);
-    }
-
-    const netFgOnHandFlag = req.query.netFgOnHand !== "false"; // default true
-    const { requirements, skipped, noBomExamples, packoutSkippedExamples, fgNettingSummary, wipNettingSummary } = buildRequirements(mrpOrders, bomParents, {
-      today, horizonDays, includeUnconfirmed, applyWastage, excludeBeforeDate, supply,
-      onHandBySku, netFgOnHand: netFgOnHandFlag,
-    });
-    const { skuResults, suggestedPOs, atRiskOrders } = allocateAndPlan(requirements, onHandBySku, supply, today, poHorizonEndDate);
-
-    // Enrich each suggested PO with $$ — unit cost from Cin7 product cache,
-    // line cost = unitCost × qtyToOrder. Mark missing-cost SKUs explicitly so
-    // the UI can flag them rather than silently treating them as $0.
-    //
-    // The PO horizon split happens here too: POs whose mustOrderByDate is
-    // beyond the cap move into deferredPOs and don't count toward the
-    // headline KPIs. dollarsByMonth still aggregates across both so the
-    // monthly cash-flow projection stays useful as a forward look.
-    let totalDollars = 0;          // in-window only
-    let overdueDollars = 0;        // in-window only
-    let missingCostCount = 0;      // in-window only (deferred tracked separately)
-    let deferredDollars = 0;
-    let deferredMissingCostCount = 0;
-    const dollarsByMonth = {}; // YYYY-MM -> { total, overdue, count }
-    const inWindowPOs = [];
-    const deferredPOs = [];
-    // Pre-index demand per (SKU, needed-month) so we can enrich each PO
-    // with a demand curve. The Capital outlay view uses this to spread a
-    // multi-month PO's line cost across the months of actual consumption
-    // (a $221k chickpea PO that covers 6 months of demand shouldn't land
-    // as one August spike in the cash forecast).
-    const demandBySkuMonth = {};
-    for (const r of requirements) {
-      if (!r.sku || !r.neededByDate) continue;
-      const m = r.neededByDate.slice(0, 7);
-      if (!demandBySkuMonth[r.sku]) demandBySkuMonth[r.sku] = {};
-      demandBySkuMonth[r.sku][m] = (demandBySkuMonth[r.sku][m] || 0) + (Number(r.qtyKg) || 0);
-    }
-    for (const po of suggestedPOs) {
-      const c = costsBySku[po.sku];
-      const unitCost = c && c.averageCost > 0 ? c.averageCost : null;
-      po.unitCost = unitCost;
-      po.lineCost = unitCost != null ? unitCost * po.qtyToOrder : null;
-      po.costMissing = unitCost == null;
-      po.uom = (c && c.uom) || null;
-      const pay = computePayDate(po, supply);
-      po.payDate = pay.payDate;
-      po.payAnchor = pay.payAnchor;
-      po.payTermsDays = pay.payTermsDays;
-      po.demandByMonth = demandBySkuMonth[po.sku] || null;
-      const deferred = poHorizonEndDate && po.mustOrderByDate && po.mustOrderByDate > poHorizonEndDate;
-      po.deferredByHorizon = !!deferred;
-      if (deferred) {
-        deferredPOs.push(po);
-        if (po.costMissing) deferredMissingCostCount++;
-        else deferredDollars += po.lineCost;
-      } else {
-        inWindowPOs.push(po);
-        if (po.costMissing) missingCostCount++;
-        else {
-          totalDollars += po.lineCost;
-          if (po.isOverdue) overdueDollars += po.lineCost;
-        }
-      }
-      // dollarsByMonth spans both — gives the user a forward cash flow view
-      if (po.lineCost != null) {
-        const bucketDate = po.mustOrderByDate || po.earliestNeedDate;
-        if (bucketDate) {
-          const month = bucketDate.slice(0, 7);
-          if (!dollarsByMonth[month]) dollarsByMonth[month] = { month, total: 0, overdue: 0, count: 0 };
-          dollarsByMonth[month].total += po.lineCost;
-          if (po.isOverdue && !deferred) dollarsByMonth[month].overdue += po.lineCost;
-          dollarsByMonth[month].count += 1;
-        }
-      }
-    }
-    const dollarsByMonthArr = Object.values(dollarsByMonth).sort((a, b) => a.month.localeCompare(b.month));
-
-    res.json({
-      ok: true,
-      runAt: new Date().toISOString(),
-      today,
-      settings: { includeUnconfirmed, applyWastage, horizonDays, excludeBeforeDate, includeDrafts, draftsCount, includeCompanions, companionsCount, includeUpsideOnly, upsideOnlyExcluded, poHorizonDays, poHorizonEndDate, netFgOnHand: netFgOnHandFlag },
-      fgNettingSummary: fgNettingSummary || [],
-      wipNettingSummary: wipNettingSummary || [],
-      summary: {
-        ordersConsidered: mrpOrders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom + skipped.excludedByDate + (skipped.packoutFormulaOnly || 0)),
-        ordersSkipped: skipped,
-        noBomExamples,
-        packoutSkippedExamples,
-        requirementCount: requirements.length,
-        skuCount: skuResults.length,
-        atRiskOrderCount: atRiskOrders.length,
-        // PO counts — headline KPIs reflect in-window only
-        suggestedPoCount: inWindowPOs.length,
-        overduePoCount: inWindowPOs.filter(p => p.isOverdue).length,
-        deferredPoCount: deferredPOs.length,
-        // $$ planning
-        currency: "USD",
-        totalDollars: Math.round(totalDollars * 100) / 100,
-        overdueDollars: Math.round(overdueDollars * 100) / 100,
-        deferredDollars: Math.round(deferredDollars * 100) / 100,
-        missingCostCount,
-        deferredMissingCostCount,
-        costsLastSync,
-        dollarsByMonth: dollarsByMonthArr,
-      },
-      suggestedPOs: inWindowPOs,
-      deferredPOs,
-      atRiskOrders,
-      skuResults,
-    });
+    const result = computeMrpRun(req.query);
+    res.json(result);
   } catch (e) {
     console.error("[mrp] Run failed:", e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+// GET /api/mrp/capital-outlay.json — pull-mode endpoint for the FP&A
+// financial model's Apps Script. Runs MRP with the caller's chosen
+// scenario params, buckets each PO into pay-month × SKU (smoothed by
+// default), returns a compact pivot the Apps Script writes to a
+// dedicated tab. Auth: X-Webhook-Secret header matching
+// PIPELINE_WEBHOOK_SECRET (reused; if you want a separate secret later
+// we can split them). Session bypass required — see SESSION_BYPASS_PATHS.
+app.get("/api/mrp/capital-outlay.json", (req, res) => {
+  const expected = process.env.PIPELINE_WEBHOOK_SECRET;
+  if (!expected) return res.status(503).json({ ok: false, error: "PIPELINE_WEBHOOK_SECRET not configured on the server" });
+  const provided = req.get("X-Webhook-Secret") || req.query.secret || "";
+  if (provided !== expected) return res.status(401).json({ ok: false, error: "Invalid webhook secret" });
+  try {
+    const run = computeMrpRun(req.query);
+    const outlay = bucketOutlayForExport(run, req.query.mode);
+    res.json({
+      ok: true,
+      runAt: run.runAt,
+      today: run.today,
+      settings: run.settings,
+      outlay,
+      excluded: {
+        missingCostCount: outlay.missingCostCount,
+        missingPayDateCount: outlay.missingPayDateCount,
+      },
+    });
+  } catch (e) {
+    console.error("[mrp] Capital outlay export failed:", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 
 // ── Traceability (SQF audit): line-level lot / SKU / MO / PO lookups ────────
 //

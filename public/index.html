@@ -1623,7 +1623,32 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
           </label>
           <span style="margin-left:auto;display:flex;align-items:center;gap:8px;">
             <button class="btn btn-sm" onclick="exportMrpOutlayCsv()">↓ Export outlay pivot CSV</button>
+            <button class="btn btn-sm" onclick="openMrpOutlayGSheetsModal()" title="Set up your financial model to pull this outlay pivot directly via Apps Script.">⚙ Google Sheets pull</button>
           </span>
+        </div>
+
+        <!-- Google Sheets pull setup modal -->
+        <div id="mrp-outlay-gsheets-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+          <div style="background:var(--vf-surface-raised);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-lg);padding:var(--vf-space-4);width:760px;max-width:92vw;max-height:90vh;overflow-y:auto;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:var(--vf-space-3);">
+              <h3 style="margin:0;color:var(--vf-text-primary);">Financial model → pull outlay via Apps Script</h3>
+              <button class="btn btn-sm" onclick="closeMrpOutlayGSheetsModal()" style="padding:2px 8px;">×</button>
+            </div>
+            <div style="font-size:13px;color:var(--vf-text-secondary);line-height:1.5;">
+              <p><strong>What this does:</strong> your financial model sheet pulls the current MRP capital outlay projection from Voyage on demand (or on a schedule) and writes it into a dedicated <code>MRP Outlay</code> tab. Your P&amp;L formulas reference that tab, so re-running the pull refreshes the model automatically. Reuses the same <code>PIPELINE_WEBHOOK_SECRET</code> env var for auth.</p>
+              <ol style="padding-left:22px;">
+                <li>Open your <em>financial model</em> Google Sheet → <strong>Extensions → Apps Script</strong>.</li>
+                <li>Delete the sample and paste the code below.</li>
+                <li>Replace <code>WEBHOOK_SECRET</code> with your <code>PIPELINE_WEBHOOK_SECRET</code>. Tweak the scenario params in <code>PULL_PARAMS</code> if you want (defaults match the smoothed/pipeline-included view).</li>
+                <li>Save, then <strong>Run → pullMrpOutlayToVoyage</strong>. Authorize when prompted. A new tab named <code>MRP Outlay</code> will appear (or be overwritten if it exists).</li>
+                <li>In your P&amp;L: <code>=SUMIFS('MRP Outlay'!<em>month_col</em>, 'MRP Outlay'!$A:$A, "&lt;>TOTAL")</code> gives you the total projected outlay for that month across all SKUs. Or filter by category using column C.</li>
+                <li>Optionally run <strong>installOutlayDailyTrigger</strong> once to schedule a daily refresh.</li>
+              </ol>
+              <p style="margin-top:12px;"><strong>Apps Script code:</strong></p>
+              <pre id="mrp-outlay-gsheets-script" style="background:var(--vf-surface-sunken);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);padding:10px;font-size:11px;font-family:monospace;overflow-x:auto;white-space:pre;max-height:360px;overflow-y:auto;user-select:text;"></pre>
+              <p style="margin-top:12px;color:var(--vf-text-tertiary);font-size:12px;">Freight, tariffs, and other manual overrides stay wherever you keep them today — this only pulls the raw-materials projection from MRP. Everything above/below the MRP Outlay tab is untouched on each refresh.</p>
+            </div>
+          </div>
         </div>
         <div style="overflow-x:auto;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-md);max-height:520px;overflow-y:auto;">
           <table class="status-table" id="mrp-outlay-table" style="margin-top:0;">
@@ -4146,6 +4171,146 @@ function renderMrpOutlayTable() {
         </tr>`;
       }).join('');
   }
+}
+
+// Open the Apps Script setup modal for the financial model's pull-mode
+// integration. Injects the app's own base URL + the current MRP toggles
+// as the default scenario so the user's model reflects the same scenario
+// they're looking at in the UI (they can edit before pasting).
+function openMrpOutlayGSheetsModal() {
+  const base = window.location.origin;
+  // Pass through the same MRP toggle state so the pull matches the
+  // scenario the user is currently viewing.
+  const params = new URLSearchParams();
+  if (document.getElementById('mrp-include-unconfirmed').checked) params.set('includeUnconfirmed', '1');
+  if (document.getElementById('mrp-include-drafts').checked) params.set('includeDrafts', '1');
+  if (document.getElementById('mrp-include-upside').checked) params.set('includeUpsideOnly', '1');
+  if (document.getElementById('mrp-include-companions').checked) params.set('includeCompanions', '1');
+  const hz = parseInt(document.getElementById('mrp-horizon-days').value, 10);
+  if (isFinite(hz)) params.set('horizonDays', String(hz));
+  const po = parseInt(document.getElementById('mrp-po-horizon-days').value, 10);
+  if (isFinite(po) && po >= 0) params.set('poHorizonDays', String(po));
+  const eb = (document.getElementById('mrp-exclude-before').value || '').trim();
+  if (eb) params.set('excludeBefore', eb);
+  params.set('mode', _mrpOutlayMode || 'smoothed');
+
+  const script = `// Voyage MRP capital outlay → financial model pull
+// Paste into your financial model sheet's Extensions -> Apps Script.
+// Fills a tab named 'MRP Outlay' with SKU × month pivot on every run.
+
+const WEBHOOK_URL    = ${JSON.stringify(base + '/api/mrp/capital-outlay.json')};
+const WEBHOOK_SECRET = 'REPLACE-WITH-YOUR-SECRET';  // <-- same as PIPELINE_WEBHOOK_SECRET on Railway
+const TAB_NAME       = 'MRP Outlay';
+
+// Scenario params — locks in exactly what MRP scenario this pull reflects.
+// Defaults below mirror the UI toggle state at the moment you opened this
+// modal. Edit to lock in a different scenario for the model's baseline.
+const PULL_PARAMS = ${JSON.stringify(Object.fromEntries(params.entries()), null, 2)};
+
+function pullMrpOutlayToVoyage() {
+  const query = Object.entries(PULL_PARAMS)
+    .map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v))
+    .join('&');
+  const url = WEBHOOK_URL + (query ? '?' + query : '');
+
+  const resp = UrlFetchApp.fetch(url, {
+    method: 'get',
+    headers: { 'X-Webhook-Secret': WEBHOOK_SECRET },
+    muteHttpExceptions: true
+  });
+  const code = resp.getResponseCode();
+  const bodyText = resp.getContentText();
+  if (code !== 200) throw new Error('Pull failed: ' + code + ' ' + bodyText.substring(0, 500));
+
+  const j = JSON.parse(bodyText);
+  const outlay = j.outlay || {};
+  const months = outlay.months || [];
+  const rows = outlay.rows || [];
+  const totalByMonth = outlay.totalByMonth || {};
+
+  const ss = SpreadsheetApp.getActive();
+  let sheet = ss.getSheetByName(TAB_NAME);
+  if (!sheet) sheet = ss.insertSheet(TAB_NAME);
+  sheet.clear();
+
+  // Row 1: metadata banner so anyone opening the tab can tell when it
+  // was refreshed and which scenario it reflects.
+  const settings = j.settings || {};
+  const scenarioBits = [];
+  if (settings.includeDrafts) scenarioBits.push('pipeline');
+  if (settings.includeUpsideOnly) scenarioBits.push('upside-only');
+  if (settings.includeCompanions) scenarioBits.push('companions');
+  scenarioBits.push('mode=' + (outlay.mode || 'smoothed'));
+  scenarioBits.push('horizon=' + (settings.horizonDays || '?') + 'd');
+  scenarioBits.push('poHorizon=' + (settings.poHorizonDays || '?') + 'd');
+  sheet.getRange(1, 1).setValue(
+    'MRP Capital Outlay · Pulled ' + new Date().toISOString() +
+    ' · Scenario: ' + scenarioBits.join(', ') +
+    ' · Grand total: $' + Math.round(outlay.grandTotal || 0).toLocaleString() +
+    (outlay.missingCostCount ? ' · ' + outlay.missingCostCount + ' PO(s) excluded (no Cin7 cost)' : '')
+  );
+  sheet.getRange(1, 1).setFontStyle('italic').setFontColor('#666666');
+
+  // Row 2: column headers — SKU / Product / Category / …months… / Total
+  const header = ['SKU', 'Product', 'Category', 'Pay anchor', 'Pay terms (days)']
+    .concat(months)
+    .concat(['Total']);
+  sheet.getRange(2, 1, 1, header.length).setValues([header]).setFontWeight('bold').setBackground('#f0f0f0');
+
+  // Row 3+: SKU rows sorted by total desc
+  if (rows.length) {
+    const dataRows = rows.map(function (r) {
+      const monthVals = months.map(function (m) { return r.byMonth[m] || 0; });
+      return [r.sku, r.name || '', r.category || '', r.payAnchor || '', (r.payTermsDays == null ? '' : r.payTermsDays)]
+        .concat(monthVals)
+        .concat([r.total || 0]);
+    });
+    sheet.getRange(3, 1, dataRows.length, header.length).setValues(dataRows);
+  }
+
+  // Totals row at the bottom
+  const totalsRowIdx = 3 + rows.length;
+  const totalsRow = ['TOTAL', '', '', '', '']
+    .concat(months.map(function (m) { return totalByMonth[m] || 0; }))
+    .concat([outlay.grandTotal || 0]);
+  sheet.getRange(totalsRowIdx, 1, 1, header.length).setValues([totalsRow]).setFontWeight('bold').setBackground('#e8e8e8');
+
+  // Currency format for month + total columns
+  if (rows.length || true) {
+    const firstMonthCol = 6;                       // A=1, so months start at col 6 (F)
+    const lastCol = 5 + months.length + 1;         // …plus Total
+    const numRows = 2 + rows.length + 1;           // header + data + totals
+    sheet.getRange(3, firstMonthCol, Math.max(1, rows.length + 1), months.length + 1)
+      .setNumberFormat('$#,##0');
+  }
+
+  // Freeze the two-row header so scrolling stays anchored
+  sheet.setFrozenRows(2);
+  sheet.autoResizeColumns(1, 5);
+
+  Logger.log('Wrote ' + rows.length + ' SKU rows across ' + months.length + ' months. Grand total $' + Math.round(outlay.grandTotal).toLocaleString());
+  return { skuCount: rows.length, months: months.length, grandTotal: outlay.grandTotal };
+}
+
+// Optional: install a daily refresh at 7am sheet time. Run once.
+function installOutlayDailyTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'pullMrpOutlayToVoyage') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('pullMrpOutlayToVoyage')
+    .timeBased()
+    .everyDays(1)
+    .atHour(7)
+    .create();
+  Logger.log('Daily 7am trigger installed.');
+}
+`;
+  document.getElementById('mrp-outlay-gsheets-script').textContent = script;
+  document.getElementById('mrp-outlay-gsheets-modal').style.display = 'flex';
+}
+
+function closeMrpOutlayGSheetsModal() {
+  document.getElementById('mrp-outlay-gsheets-modal').style.display = 'none';
 }
 
 function exportMrpOutlayCsv() {
