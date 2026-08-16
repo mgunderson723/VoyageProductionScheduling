@@ -3052,6 +3052,13 @@ function switchTab(t){
   if(t==='yield-setup'&&(!currentUser||currentUser.role!=='admin'))return;
   if(t==='pipeline'&&(!currentUser||currentUser.role!=='admin'))return;
   if(t==='mrp'&&(!currentUser||currentUser.role==='viewer'))return;
+  // Close any position:fixed modals that may be lingering from a previous
+  // tab. Without this, opening the Google Sheets sync modal on Pipeline
+  // and then navigating to MRP left the modal covering the MRP view.
+  ['pipeline-gsheets-modal','mrp-outlay-gsheets-modal','companion-rule-modal'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el && el.style.display !== 'none') el.style.display = 'none';
+  });
   ['calendar','orders','pipeline','capacity','traceability','expiring-lots','lot-report','mo-status','live-inv','error-reporting','production-output','yield','mrp','mrp-setup','yield-setup','admin'].forEach(k=>{const el=document.getElementById('tab-'+k);if(el)el.style.display=k===t?'':'none';});
   document.querySelectorAll('.tab').forEach(el=>{
     const tabName=el.textContent.trim().toLowerCase();
