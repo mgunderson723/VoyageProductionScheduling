@@ -4199,8 +4199,12 @@ function openMrpOutlayGSheetsModal() {
   if (isFinite(hz)) params.set('horizonDays', String(hz));
   const po = parseInt(document.getElementById('mrp-po-horizon-days').value, 10);
   if (isFinite(po) && po >= 0) params.set('poHorizonDays', String(po));
-  const eb = (document.getElementById('mrp-exclude-before').value || '').trim();
-  if (eb) params.set('excludeBefore', eb);
+  // NOTE: excludeBefore is deliberately NOT baked into PULL_PARAMS.
+  // The Apps Script sets it to today's date at run time so daily/scheduled
+  // pulls always exclude past-start orders (in-progress WIP whose RMs are
+  // already consumed) without needing to update a hardcoded date. Users
+  // who want a fixed date can add "excludeBefore": "YYYY-MM-DD" to
+  // PULL_PARAMS after the fact.
   params.set('mode', _mrpOutlayMode || 'smoothed');
   params.set('scenarios', 'base,upside');
 
@@ -4220,6 +4224,13 @@ const OUTLAY_TAB     = 'MRP Outlay';
 const PULL_PARAMS = ${JSON.stringify(Object.fromEntries(params.entries()), null, 2)};
 
 function pullMrpOutlayToVoyage() {
+  // Always exclude orders whose start date is before today. Anything with
+  // a past start is almost certainly in-progress WIP — MRP shouldn't re-
+  // count its RM demand (already committed / consumed). If you want to
+  // pin a specific cutoff date instead, add "excludeBefore": "YYYY-MM-DD"
+  // to PULL_PARAMS above and delete this line.
+  PULL_PARAMS.excludeBefore = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+
   const query = Object.entries(PULL_PARAMS)
     .map(function (kv) { return encodeURIComponent(kv[0]) + '=' + encodeURIComponent(kv[1]); })
     .join('&');
