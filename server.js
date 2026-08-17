@@ -1696,6 +1696,8 @@ async function executeAITool(name, input, context) {
         // Cin7 native UOM (Kg, g, Each, case, etc.) — surfaced so callers
         // don't have to reason about whether qtyToOrder is in kg or grams.
         po.uom = (c && c.uom) || null;
+        // Name fallback — see the same block in computeMrpRun for the why.
+        if (!po.name && c && c.name) po.name = c.name;
         // Capital outlay: bucket line cost by cash-out date. Receipt-anchor
         // for typical net-30 supplies; PO-issue-anchor for pay-upfront items
         // (CBE fats, grapeseeds, etc. — configured per-SKU in supply settings).
@@ -6244,6 +6246,12 @@ function computeMrpRun(query) {
     po.lineCost = unitCost != null ? unitCost * po.qtyToOrder : null;
     po.costMissing = unitCost == null;
     po.uom = (c && c.uom) || null;
+    // Name fallback: allocateAndPlan pulls name from the on-hand cache
+    // (Cin7 ProductAvailability), which skips zero-stock SKUs. The
+    // product-costs cache (/product) is comprehensive — use it when we
+    // have no name from on-hand. Common for packaging SKUs we haven't
+    // procured yet but need to (e.g. PK-220010-00).
+    if (!po.name && c && c.name) po.name = c.name;
     const pay = computePayDate(po, supply);
     po.payDate = pay.payDate;
     po.payAnchor = pay.payAnchor;
@@ -6276,6 +6284,11 @@ function computeMrpRun(query) {
   }
   const dollarsByMonthArr = Object.values(dollarsByMonth).sort((a, b) => a.month.localeCompare(b.month));
 
+  // Same name fallback for skuResults (drives the "All SKUs" drill-down
+  // and the exported outlay pivot rows).
+  for (const r of skuResults) {
+    if (!r.name && costsBySku[r.sku] && costsBySku[r.sku].name) r.name = costsBySku[r.sku].name;
+  }
   return {
     ok: true,
     runAt: new Date().toISOString(),
