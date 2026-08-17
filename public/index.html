@@ -1635,13 +1635,15 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
               <button class="btn btn-sm" onclick="closeMrpOutlayGSheetsModal()" style="padding:2px 8px;">×</button>
             </div>
             <div style="font-size:13px;color:var(--vf-text-secondary);line-height:1.5;">
-              <p><strong>What this does:</strong> your financial model sheet pulls the current MRP capital outlay projection from Voyage on demand (or on a schedule) and writes it into a dedicated <code>MRP Outlay</code> tab. Your P&amp;L formulas reference that tab, so re-running the pull refreshes the model automatically. Reuses the same <code>PIPELINE_WEBHOOK_SECRET</code> env var for auth.</p>
+              <p><strong>What this does:</strong> your financial model sheet pulls the current MRP capital outlay projection from Voyage — <strong>both the base scenario AND the upside scenario</strong> in one pull — and writes them into a dedicated <code>MRP Outlay</code> tab. Column A is the scenario name (<code>base</code> or <code>upside</code>). Your P&amp;L uses <code>SUMIFS</code> with a scenario criterion driven by your upside-toggle cell, so flipping the toggle shifts raw-materials from the base view to the upside view in-formula. Reuses <code>PIPELINE_WEBHOOK_SECRET</code> for auth.</p>
               <ol style="padding-left:22px;">
                 <li>Open your <em>financial model</em> Google Sheet → <strong>Extensions → Apps Script</strong>.</li>
-                <li>Delete the sample and paste the code below.</li>
-                <li>Replace <code>WEBHOOK_SECRET</code> with your <code>PIPELINE_WEBHOOK_SECRET</code>. Tweak the scenario params in <code>PULL_PARAMS</code> if you want (defaults match the smoothed/pipeline-included view).</li>
-                <li>Save, then <strong>Run → pullMrpOutlayToVoyage</strong>. Authorize when prompted. A new tab named <code>MRP Outlay</code> will appear (or be overwritten if it exists).</li>
-                <li>In your P&amp;L: <code>=SUMIFS('MRP Outlay'!<em>month_col</em>, 'MRP Outlay'!$A:$A, "&lt;>TOTAL")</code> gives you the total projected outlay for that month across all SKUs. Or filter by category using column C.</li>
+                <li>Delete the sample and paste the code below (or add alongside your existing pipeline-push code — see below re: naming).</li>
+                <li>Replace <code>OUTLAY_SECRET</code> with your <code>PIPELINE_WEBHOOK_SECRET</code>. Tweak <code>PULL_PARAMS</code> if you want to lock in different filters (drafts/companions/horizons/mode). Upside is always both — no need to set it there.</li>
+                <li>Save, then <strong>Run → pullMrpOutlayToVoyage</strong>. Authorize when prompted. A <code>MRP Outlay</code> tab appears (or is overwritten). Both scenarios' rows land in it, tagged by column A.</li>
+                <li>In your P&amp;L, given an upside toggle in cell <code>Assumptions!B2</code> (TRUE/FALSE):<br>
+                <code>=SUMIFS('MRP Outlay'!G:G, 'MRP Outlay'!$A:$A, IF(Assumptions!B2, "upside", "base"))</code><br>
+                where column G is whatever month you're computing. Toggle B2 = upside changes the raw-materials outlay to reflect the upside deals landing.</li>
                 <li>Optionally run <strong>installOutlayDailyTrigger</strong> once to schedule a daily refresh.</li>
               </ol>
               <p style="margin-top:12px;"><strong>Apps Script code:</strong></p>
@@ -4186,12 +4188,12 @@ function renderMrpOutlayTable() {
 // they're looking at in the UI (they can edit before pasting).
 function openMrpOutlayGSheetsModal() {
   const base = window.location.origin;
-  // Pass through the same MRP toggle state so the pull matches the
-  // scenario the user is currently viewing.
+  // Pass through the OTHER MRP toggles (drafts, companions, mode,
+  // horizons, excludeBefore). Do NOT include includeUpsideOnly —
+  // scenarios=base,upside overrides that per-scenario.
   const params = new URLSearchParams();
   if (document.getElementById('mrp-include-unconfirmed').checked) params.set('includeUnconfirmed', '1');
   if (document.getElementById('mrp-include-drafts').checked) params.set('includeDrafts', '1');
-  if (document.getElementById('mrp-include-upside').checked) params.set('includeUpsideOnly', '1');
   if (document.getElementById('mrp-include-companions').checked) params.set('includeCompanions', '1');
   const hz = parseInt(document.getElementById('mrp-horizon-days').value, 10);
   if (isFinite(hz)) params.set('horizonDays', String(hz));
@@ -4200,29 +4202,32 @@ function openMrpOutlayGSheetsModal() {
   const eb = (document.getElementById('mrp-exclude-before').value || '').trim();
   if (eb) params.set('excludeBefore', eb);
   params.set('mode', _mrpOutlayMode || 'smoothed');
+  params.set('scenarios', 'base,upside');
 
   const script = `// Voyage MRP capital outlay → financial model pull
 // Paste into your financial model sheet's Extensions -> Apps Script.
-// Fills a tab named 'MRP Outlay' with SKU × month pivot on every run.
+// Fills a tab named 'MRP Outlay' with SKU × month pivot for BOTH the
+// base and upside scenarios. Financial model uses SUMIFS with a
+// scenario criterion driven by your upside toggle cell.
 
-const WEBHOOK_URL    = ${JSON.stringify(base + '/api/mrp/capital-outlay.json')};
-const WEBHOOK_SECRET = 'REPLACE-WITH-YOUR-SECRET';  // <-- same as PIPELINE_WEBHOOK_SECRET on Railway
-const TAB_NAME       = 'MRP Outlay';
+const OUTLAY_URL     = ${JSON.stringify(base + '/api/mrp/capital-outlay.json')};
+const OUTLAY_SECRET  = 'REPLACE-WITH-YOUR-SECRET';  // <-- same as PIPELINE_WEBHOOK_SECRET on Railway
+const OUTLAY_TAB     = 'MRP Outlay';
 
-// Scenario params — locks in exactly what MRP scenario this pull reflects.
-// Defaults below mirror the UI toggle state at the moment you opened this
-// modal. Edit to lock in a different scenario for the model's baseline.
+// Scenario params — locks in the OTHER MRP filters (drafts, companions,
+// mode, horizons, excludeBefore). Upside is handled by scenarios=base,upside
+// so BOTH scenarios come back in one call and land in the same tab.
 const PULL_PARAMS = ${JSON.stringify(Object.fromEntries(params.entries()), null, 2)};
 
 function pullMrpOutlayToVoyage() {
   const query = Object.entries(PULL_PARAMS)
-    .map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v))
+    .map(function (kv) { return encodeURIComponent(kv[0]) + '=' + encodeURIComponent(kv[1]); })
     .join('&');
-  const url = WEBHOOK_URL + (query ? '?' + query : '');
+  const url = OUTLAY_URL + (query ? '?' + query : '');
 
   const resp = UrlFetchApp.fetch(url, {
     method: 'get',
-    headers: { 'X-Webhook-Secret': WEBHOOK_SECRET },
+    headers: { 'X-Webhook-Secret': OUTLAY_SECRET },
     muteHttpExceptions: true
   });
   const code = resp.getResponseCode();
@@ -4230,77 +4235,95 @@ function pullMrpOutlayToVoyage() {
   if (code !== 200) throw new Error('Pull failed: ' + code + ' ' + bodyText.substring(0, 500));
 
   const j = JSON.parse(bodyText);
-  const outlay = j.outlay || {};
-  const months = outlay.months || [];
-  const rows = outlay.rows || [];
-  const totalByMonth = outlay.totalByMonth || {};
+  const scenarios = j.scenarios || [];
+  if (!scenarios.length) throw new Error('No scenarios in response — expected base + upside');
+
+  // Union months across scenarios (upside may have months base doesn't
+  // when upside deals push into new months).
+  const monthSet = {};
+  scenarios.forEach(function (s) {
+    ((s.outlay && s.outlay.months) || []).forEach(function (m) { monthSet[m] = true; });
+  });
+  const months = Object.keys(monthSet).sort();
 
   const ss = SpreadsheetApp.getActive();
-  let sheet = ss.getSheetByName(TAB_NAME);
-  if (!sheet) sheet = ss.insertSheet(TAB_NAME);
+  let sheet = ss.getSheetByName(OUTLAY_TAB);
+  if (!sheet) sheet = ss.insertSheet(OUTLAY_TAB);
   sheet.clear();
 
-  // Row 1: metadata banner so anyone opening the tab can tell when it
-  // was refreshed and which scenario it reflects.
-  const settings = j.settings || {};
+  // Row 1: metadata banner — includes both grand totals + delta so the
+  // model reader can eyeball the upside contribution without running math.
+  const baseSc = scenarios.filter(function (s) { return s.name === 'base'; })[0];
+  const upSc   = scenarios.filter(function (s) { return s.name === 'upside'; })[0];
+  const baseTotal = (baseSc && baseSc.outlay && baseSc.outlay.grandTotal) || 0;
+  const upTotal   = (upSc && upSc.outlay && upSc.outlay.grandTotal) || 0;
+  const delta     = upTotal - baseTotal;
+  const commonSettings = (baseSc && baseSc.settings) || (upSc && upSc.settings) || {};
   const scenarioBits = [];
-  if (settings.includeDrafts) scenarioBits.push('pipeline');
-  if (settings.includeUpsideOnly) {
-    scenarioBits.push('upside-only INCLUDED');
-  } else if (settings.upsideOnlyExcluded > 0) {
-    scenarioBits.push(settings.upsideOnlyExcluded + ' upside-only draft(s) EXCLUDED');
-  }
-  if (settings.includeCompanions) scenarioBits.push('companions');
-  scenarioBits.push('mode=' + (outlay.mode || 'smoothed'));
-  scenarioBits.push('horizon=' + (settings.horizonDays || '?') + 'd');
-  scenarioBits.push('poHorizon=' + (settings.poHorizonDays || '?') + 'd');
+  if (commonSettings.includeDrafts) scenarioBits.push('pipeline');
+  if (commonSettings.includeCompanions) scenarioBits.push('companions');
+  scenarioBits.push('mode=' + ((baseSc && baseSc.outlay && baseSc.outlay.mode) || 'smoothed'));
+  scenarioBits.push('horizon=' + (commonSettings.horizonDays || '?') + 'd');
+  scenarioBits.push('poHorizon=' + (commonSettings.poHorizonDays || '?') + 'd');
   sheet.getRange(1, 1).setValue(
     'MRP Capital Outlay · Pulled ' + new Date().toISOString() +
-    ' · Scenario: ' + scenarioBits.join(', ') +
-    ' · Grand total: $' + Math.round(outlay.grandTotal || 0).toLocaleString() +
-    (outlay.missingCostCount ? ' · ' + outlay.missingCostCount + ' PO(s) excluded (no Cin7 cost)' : '')
+    ' · Filters: ' + scenarioBits.join(', ') +
+    ' · Base: $' + Math.round(baseTotal).toLocaleString() +
+    ' · Upside: $' + Math.round(upTotal).toLocaleString() +
+    ' · Delta: $' + (delta >= 0 ? '+' : '') + Math.round(delta).toLocaleString()
   );
   sheet.getRange(1, 1).setFontStyle('italic').setFontColor('#666666');
 
-  // Row 2: column headers — SKU / Product / Category / …months… / Total
-  const header = ['SKU', 'Product', 'Category', 'Pay anchor', 'Pay terms (days)']
+  // Row 2: column headers — Scenario column added as first column so P&L
+  // can SUMIFS with scenario criterion driven by the upside toggle cell.
+  const header = ['Scenario', 'SKU', 'Product', 'Category', 'Pay anchor', 'Pay terms (days)']
     .concat(months)
     .concat(['Total']);
   sheet.getRange(2, 1, 1, header.length).setValues([header]).setFontWeight('bold').setBackground('#f0f0f0');
 
-  // Row 3+: SKU rows sorted by total desc
-  if (rows.length) {
-    const dataRows = rows.map(function (r) {
+  // Row 3+: data rows for each scenario, then TOTAL row for each scenario
+  const dataRows = [];
+  scenarios.forEach(function (s) {
+    const rows = (s.outlay && s.outlay.rows) || [];
+    rows.forEach(function (r) {
       const monthVals = months.map(function (m) { return r.byMonth[m] || 0; });
-      return [r.sku, r.name || '', r.category || '', r.payAnchor || '', (r.payTermsDays == null ? '' : r.payTermsDays)]
+      dataRows.push([s.name, r.sku, r.name || '', r.category || '', r.payAnchor || '', (r.payTermsDays == null ? '' : r.payTermsDays)]
         .concat(monthVals)
-        .concat([r.total || 0]);
+        .concat([r.total || 0]));
     });
-    sheet.getRange(3, 1, dataRows.length, header.length).setValues(dataRows);
+  });
+  if (dataRows.length) sheet.getRange(3, 1, dataRows.length, header.length).setValues(dataRows);
+
+  // Per-scenario TOTAL rows at the bottom (visually distinct, formula-visible)
+  const totalsRows = scenarios.map(function (s) {
+    const totalByMonth = (s.outlay && s.outlay.totalByMonth) || {};
+    return ['TOTAL · ' + s.name, '', '', '', '', '']
+      .concat(months.map(function (m) { return totalByMonth[m] || 0; }))
+      .concat([(s.outlay && s.outlay.grandTotal) || 0]);
+  });
+  if (totalsRows.length) {
+    const totalsStart = 3 + dataRows.length;
+    sheet.getRange(totalsStart, 1, totalsRows.length, header.length).setValues(totalsRows)
+      .setFontWeight('bold').setBackground('#e8e8e8');
   }
 
-  // Totals row at the bottom
-  const totalsRowIdx = 3 + rows.length;
-  const totalsRow = ['TOTAL', '', '', '', '']
-    .concat(months.map(function (m) { return totalByMonth[m] || 0; }))
-    .concat([outlay.grandTotal || 0]);
-  sheet.getRange(totalsRowIdx, 1, 1, header.length).setValues([totalsRow]).setFontWeight('bold').setBackground('#e8e8e8');
-
-  // Currency format for month + total columns
-  if (rows.length || true) {
-    const firstMonthCol = 6;                       // A=1, so months start at col 6 (F)
-    const lastCol = 5 + months.length + 1;         // …plus Total
-    const numRows = 2 + rows.length + 1;           // header + data + totals
-    sheet.getRange(3, firstMonthCol, Math.max(1, rows.length + 1), months.length + 1)
+  // Currency format on month + total columns
+  const firstMonthCol = 7;  // A..F = Scenario, SKU, Product, Category, Anchor, Terms → months start col 7 (G)
+  const dataAndTotalsHeight = dataRows.length + totalsRows.length;
+  if (dataAndTotalsHeight > 0) {
+    sheet.getRange(3, firstMonthCol, dataAndTotalsHeight, months.length + 1)
       .setNumberFormat('$#,##0');
   }
 
-  // Freeze the two-row header so scrolling stays anchored
   sheet.setFrozenRows(2);
-  sheet.autoResizeColumns(1, 5);
+  sheet.setFrozenColumns(1);
+  sheet.autoResizeColumns(1, 6);
 
-  Logger.log('Wrote ' + rows.length + ' SKU rows across ' + months.length + ' months. Grand total $' + Math.round(outlay.grandTotal).toLocaleString());
-  return { skuCount: rows.length, months: months.length, grandTotal: outlay.grandTotal };
+  Logger.log('Wrote ' + dataRows.length + ' rows across ' + scenarios.length + ' scenarios (' +
+    months.length + ' months). Base $' + Math.round(baseTotal).toLocaleString() +
+    ' · Upside $' + Math.round(upTotal).toLocaleString() +
+    ' · Delta $' + Math.round(delta).toLocaleString());
+  return { scenarios: scenarios.length, dataRows: dataRows.length, months: months.length, baseTotal: baseTotal, upsideTotal: upTotal, delta: delta };
 }
 
 // Optional: install a daily refresh at 7am sheet time. Run once.

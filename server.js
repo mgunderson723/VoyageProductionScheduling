@@ -6409,6 +6409,38 @@ app.get("/api/mrp/capital-outlay.json", (req, res) => {
   const provided = req.get("X-Webhook-Secret") || req.query.secret || "";
   if (provided !== expected) return res.status(401).json({ ok: false, error: "Invalid webhook secret" });
   try {
+    // Multi-scenario mode: ?scenarios=base,upside runs MRP once per named
+    // scenario, keeping all other filters identical. Base = current toggle
+    // state minus upside-only deals; upside = same plus upside deals. The
+    // financial model then holds both in one tab and toggles between them
+    // in-formula. Backward-compat: no ?scenarios param → single-scenario
+    // response shape (existing consumers unaffected).
+    const scenariosParam = String(req.query.scenarios || "").trim();
+    if (scenariosParam) {
+      const names = scenariosParam.split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+      const scenarios = [];
+      for (const name of names) {
+        const q = Object.assign({}, req.query);
+        // Override includeUpsideOnly per scenario; everything else inherits
+        // whatever the caller set (mode, horizons, includeDrafts, etc.).
+        if (name === "base") q.includeUpsideOnly = "0";
+        else if (name === "upside") q.includeUpsideOnly = "1";
+        else return res.status(400).json({ ok: false, error: `Unknown scenario '${name}'. Supported: base, upside` });
+        // Strip scenarios param so computeMrpRun doesn't see it (harmless
+        // but keeps the settings.echo clean).
+        delete q.scenarios;
+        const run = computeMrpRun(q);
+        const outlay = bucketOutlayForExport(run, req.query.mode);
+        scenarios.push({ name, settings: run.settings, outlay });
+      }
+      return res.json({
+        ok: true,
+        runAt: new Date().toISOString(),
+        today: new Date().toISOString().slice(0, 10),
+        scenarios,
+      });
+    }
+    // Single-scenario legacy shape
     const run = computeMrpRun(req.query);
     const outlay = bucketOutlayForExport(run, req.query.mode);
     res.json({
