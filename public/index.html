@@ -1178,6 +1178,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
         <button class="trace-view-tab" data-view="lineage" onclick="setTraceView('lineage')">Lineage tree</button>
         <button class="trace-view-tab" data-view="forward" onclick="setTraceView('forward')">Forward trace</button>
         <button class="trace-view-tab" data-view="ledger" onclick="setTraceView('ledger')">Ledger + balance</button>
+        <button class="trace-view-tab" data-view="ledger_summary" onclick="setTraceView('ledger_summary')" title="Auditor-friendly view: line-level receipts + consumption, but transfers and stock adjustments collapsed to single net-total lines. Whole-number qtys.">Ledger + balance summary</button>
         <button class="btn btn-sm btn-ghost" onclick="downloadTraceViewCsv()" title="Download current view as CSV (auditor-friendly, opens in Excel)" style="margin-left:auto;">⬇ Download CSV</button>
       </div>
       <div id="trace-view-body"></div>
@@ -6022,6 +6023,46 @@ function downloadTraceViewCsv() {
     headers = ['movement_date', 'ref_type', 'reference', 'ref_number', 'movement_type', 'sku', 'product', 'unit', 'qty_in', 'qty_out', 'running_balance', 'cost_in', 'cost_out', 'batch', 'location', 'expiry_date', 'document_reference', 'dq_notes'];
     meta.push(`final_balance: ${rm.final_balance}`);
     if (!rows.length) { alert('No ledger rows to export.'); return; }
+  } else if (view === 'ledger_summary') {
+    // Auditor-friendly export: line-level receipts + consumption with
+    // whole-number qtys, then two summary rows for net ST + TR. Matches
+    // what the on-screen view shows.
+    const rm = extra.rm;
+    if (!rm || !rm.timeline) { alert('Ledger unavailable to export.'); return; }
+    const g = rm.grouped || {};
+    const round = v => v == null || v === '' ? '' : Math.round(Number(v) || 0);
+    const roundRow = r => {
+      const out = _flattenMovementRow(r);
+      out.qty_in = round(out.qty_in);
+      out.qty_out = round(out.qty_out);
+      out.running_balance = round(out.running_balance);
+      return out;
+    };
+    const receipts = (g.receipts || []).map(roundRow);
+    const consumptions = (g.consumptions || []).map(roundRow);
+    const netRow = (label, rowList) => {
+      const totalIn = rowList.reduce((s, r) => s + (Number(r.qty_in) || 0), 0);
+      const totalOut = rowList.reduce((s, r) => s + (Number(r.qty_out) || 0), 0);
+      return {
+        movement_date: 'NET TOTAL', ref_type: label,
+        reference: '(' + rowList.length + ' rows collapsed)',
+        ref_number: '', movement_type: '', sku: '', product: '', unit: '',
+        qty_in: Math.round(totalIn), qty_out: Math.round(totalOut),
+        running_balance: Math.round(totalIn - totalOut),
+        cost_in: '', cost_out: '', batch: '', location: '',
+        expiry_date: '', document_reference: '', dq_notes: '',
+      };
+    };
+    rows = [
+      ...receipts,
+      ...consumptions,
+      netRow('ST (Adjustments)', g.adjustments || []),
+      netRow('TR (Transfers)',   g.transfers   || []),
+    ];
+    headers = ['movement_date', 'ref_type', 'reference', 'ref_number', 'movement_type', 'sku', 'product', 'unit', 'qty_in', 'qty_out', 'running_balance', 'cost_in', 'cost_out', 'batch', 'location', 'expiry_date', 'document_reference', 'dq_notes'];
+    meta.push(`final_balance: ${rm.final_balance}`);
+    meta.push(`view_note: ST and TR rows collapsed to net totals; qtys rounded to whole numbers`);
+    if (!rows.length) { alert('No ledger rows to export.'); return; }
   } else if (view === 'lineage') {
     const upstream = extra.lineage && extra.lineage.upstream;
     if (!upstream) { alert('Lineage unavailable to export.'); return; }
@@ -6268,6 +6309,7 @@ function updateTraceViewTabs(kind, primary, extra) {
       );
     }
     if (view === 'ledger') enabled = !!extra.rm && (extra.rm.timeline || []).length > 0;
+    if (view === 'ledger_summary') enabled = !!extra.rm && (extra.rm.timeline || []).length > 0;
     if (view === 'balance') enabled = kind === 'lot' && !!extra.balance;
     t.disabled = !enabled;
     t.classList.toggle('active', view === _traceState.view);
@@ -6296,6 +6338,7 @@ function renderTraceView() {
   else if (s.view === 'lineage') body.innerHTML = renderLineageView(extra.lineage);
   else if (s.view === 'forward') body.innerHTML = renderForwardView(extra.forward);
   else if (s.view === 'ledger') body.innerHTML = renderLedgerView(extra.rm);
+  else if (s.view === 'ledger_summary') body.innerHTML = renderLedgerSummaryView(extra.rm);
 }
 
 // 6-field lot balance card + reconciliation footer. Anchored around the
@@ -6678,6 +6721,107 @@ function renderLedgerView(rm) {
     ${section('Transfers (TR)', g.transfers, 'No transfers in the timeline.')}
     ${g.other && g.other.length ? section('Other movements', g.other, '') : ''}
   `;
+}
+
+// Auditor-facing summary: same shape as ledger + balance, but transfers
+// and stock adjustments collapse to a single net-total line each so an
+// external auditor sees the aggregates without every individual ST/TR
+// dated row to nitpick. Quantities round to whole numbers throughout.
+function renderLedgerSummaryView(rm) {
+  if (!rm || !rm.timeline) return `<div class="trace-empty">Ledger unavailable.</div>`;
+  const timeline = rm.timeline;
+  const chart = renderBalanceChart(timeline);
+  const g = rm.grouped || {};
+
+  // Detailed sections (line-by-line, same as ledger view) but with whole-
+  // number qtys via the rounded timeline renderer.
+  const section = (title, rows, emptyMsg) => {
+    if (!rows || !rows.length) return `<div class="trace-ledger-group"><h4>${title}</h4><div style="color:var(--vf-text-tertiary);font-size:12px;">${emptyMsg}</div></div>`;
+    return `<div class="trace-ledger-group"><h4>${title} (${rows.length})</h4>${renderTimelineTableRounded(rows)}</div>`;
+  };
+
+  // Collapse ST + TR into one summary line each (net of ins and outs)
+  const netLine = (title, rows, emptyMsg) => {
+    if (!rows || !rows.length) {
+      return `<div class="trace-ledger-group"><h4>${title}</h4><div style="color:var(--vf-text-tertiary);font-size:12px;">${emptyMsg}</div></div>`;
+    }
+    let totalIn = 0, totalOut = 0;
+    for (const r of rows) {
+      totalIn  += Number(r.qty_in)  || 0;
+      totalOut += Number(r.qty_out) || 0;
+    }
+    const net = totalIn - totalOut;
+    const netFmt = Math.round(net).toLocaleString();
+    const inFmt  = Math.round(totalIn).toLocaleString();
+    const outFmt = Math.round(totalOut).toLocaleString();
+    const netColor = net > 0.5 ? 'var(--vf-success-text)' : net < -0.5 ? 'var(--vf-danger-text)' : 'var(--vf-text-tertiary)';
+    return `
+      <div class="trace-ledger-group">
+        <h4>${title}</h4>
+        <div class="trace-scroll-box"><table class="trace-table">
+          <thead><tr>
+            <th>Metric</th>
+            <th style="text-align:right;">Total in</th>
+            <th style="text-align:right;">Total out</th>
+            <th style="text-align:right;">Net</th>
+            <th>Row count</th>
+          </tr></thead>
+          <tbody><tr>
+            <td>${title}</td>
+            <td style="text-align:right;color:var(--vf-success-text);">${inFmt}</td>
+            <td style="text-align:right;color:var(--vf-danger-text);">${outFmt}</td>
+            <td style="text-align:right;font-weight:600;color:${netColor};">${netFmt}</td>
+            <td style="color:var(--vf-text-tertiary);font-size:11px;">${rows.length} rows collapsed</td>
+          </tr></tbody>
+        </table></div>
+      </div>`;
+  };
+
+  return `
+    <div class="trace-balance-chart">
+      <div style="font-size:12px;color:var(--vf-text-secondary);text-transform:uppercase;letter-spacing:0.05em;font-weight:600;margin-bottom:4px;">Running on-hand balance</div>
+      ${chart}
+    </div>
+    ${section('Receipts (PO)', g.receipts, 'No purchase-order receipts in the timeline.')}
+    ${section('Consumptions (MO)', g.consumptions, 'No production consumption in the timeline.')}
+    ${netLine('Adjustments (ST) — net total', g.adjustments, 'No stock adjustments in the timeline.')}
+    ${netLine('Transfers (TR) — net total', g.transfers, 'No transfers in the timeline.')}
+    ${g.other && g.other.length ? section('Other movements', g.other, '') : ''}
+  `;
+}
+
+// Same shape as renderTimelineTable but qtys + balances round to whole
+// numbers. Used only in the ledger-summary view where cleaner numbers
+// are the point.
+function renderTimelineTableRounded(movements) {
+  if (!movements.length) return `<div class="trace-empty">No movements match.</div>`;
+  const rows = movements.map(m => {
+    const dq = renderDqBadges(m.dq_notes);
+    const rt = m.ref_type || 'null';
+    const qIn  = m.qty_in  && Number(m.qty_in)  > 0 ? Math.round(Number(m.qty_in)).toLocaleString()  : '';
+    const qOut = m.qty_out && Number(m.qty_out) > 0 ? Math.round(Number(m.qty_out)).toLocaleString() : '';
+    const bal  = m.running_balance != null ? Math.round(Number(m.running_balance)).toLocaleString() : '';
+    return `<tr>
+      <td style="white-space:nowrap;">${escapeHtml(String(m.movement_date || '').slice(0,10))}</td>
+      <td><span class="trace-reftype-pill trace-reftype-${rt}">${rt}</span></td>
+      <td style="white-space:nowrap;">${escapeHtml(m.reference || '')}${dq}</td>
+      <td>${escapeHtml(m.sku || '')}</td>
+      <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(m.product || '')}">${escapeHtml((m.product || '').slice(0, 40))}</td>
+      <td style="text-align:right;color:var(--vf-success-text);">${qIn}</td>
+      <td style="text-align:right;color:var(--vf-danger-text);">${qOut}</td>
+      ${bal !== '' ? `<td style="text-align:right;">${bal}</td>` : '<td></td>'}
+      <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(m.location || '')}</td>
+      <td style="font-size:11px;">${escapeHtml(m.batch || '')}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="trace-scroll-box"><table class="trace-table">
+    <thead><tr>
+      <th>Date</th><th>Type</th><th>Reference</th><th>SKU</th><th>Product</th>
+      <th style="text-align:right;">In</th><th style="text-align:right;">Out</th>
+      <th style="text-align:right;">Bal</th><th>Location</th><th>Lot #</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
 }
 
 // Inline SVG balance chart — no dep. Sparkline-style with axis labels.
