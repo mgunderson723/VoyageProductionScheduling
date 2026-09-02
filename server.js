@@ -7354,12 +7354,22 @@ function buildForwardTree(idx, lot, depth, maxDepth, seen, sosByRef) {
 
   for (const m of outs) {
     if (m.ref_type === "MO") {
-      if (!byMo.has(m.reference)) {
-        byMo.set(m.reference, { mo: m.reference, date: m.movement_date, qty: 0, unit: m.unit || sample.unit || null });
+      // Aggregate by the base MO reference (strip /N batch suffix). Cin7
+      // records each production run's consumption + output rows with a
+      // /N-suffixed reference; keying by the full reference here + then
+      // looking up outputs by that same batch-scoped reference below
+      // meant multi-batch MOs only surfaced ONE output lot per batch
+      // instead of all batches' outputs. Normalizing to ref_number lets
+      // us walk the whole MO's output set regardless of how consumption
+      // and output rows are labeled across Cin7's per-batch conventions.
+      const moKey = m.ref_number || m.reference;
+      if (!byMo.has(moKey)) {
+        byMo.set(moKey, { mo: moKey, date: m.movement_date, qty: 0, unit: m.unit || sample.unit || null, batches_consumed: new Set() });
       }
-      const e = byMo.get(m.reference);
+      const e = byMo.get(moKey);
       e.qty += Number(m.qty_out || 0);
       if (!e.date || m.movement_date < e.date) e.date = m.movement_date;
+      if (m.reference && m.reference !== moKey) e.batches_consumed.add(m.reference);
     } else if (m.ref_type === "SO") {
       // Normalize the SO ref (strip any /N sub-line suffix) before lookup.
       const soRef = String(m.reference || "").replace(/\/.*$/, "");
@@ -7391,14 +7401,28 @@ function buildForwardTree(idx, lot, depth, maxDepth, seen, sosByRef) {
   }
 
   // For each consuming MO, find the outputs of that same MO and recurse.
+  // Look up outputs via byRefNumber (base MO) so multi-batch MOs surface
+  // ALL batches' output lots — not just the one batch that happens to
+  // share a reference with the consumption row. Dedupe by (batch, sku,
+  // date) so a Cin7 export that repeats an output row across per-batch
+  // references doesn't inflate the tree.
   const consumedByMos = [];
   for (const entry of byMo.values()) {
-    const outputs = (idx.byRef.get(entry.mo) || []).filter(m => m.movement_type === "In");
+    const outputsRaw = (idx.byRefNumber.get(entry.mo) || []).filter(m => m.movement_type === "In");
+    const seenOutputs = new Set();
+    const outputs = [];
+    for (const o of outputsRaw) {
+      const dedupeKey = (o.batch || "?") + "|" + (o.sku || "?") + "|" + (o.movement_date || "?") + "|" + Number(o.qty_in || 0);
+      if (seenOutputs.has(dedupeKey)) continue;
+      seenOutputs.add(dedupeKey);
+      outputs.push(o);
+    }
     const outputTrees = outputs.map(out => {
       if (!out.batch) {
         return {
           lot: null, sku: out.sku, product: out.product, unit: out.unit,
           date: out.movement_date, qty_produced: Number(out.qty_in || 0),
+          batch_ref: out.reference || null,
           note: "output row has no batch code — chain terminates here",
           consumed_by_mos: [], shipments: [], transfers_out: [], adjustments_out: [], assemblies: [], still_on_hand: null,
         };
@@ -7407,12 +7431,14 @@ function buildForwardTree(idx, lot, depth, maxDepth, seen, sosByRef) {
       return {
         lot: out.batch, sku: out.sku, product: out.product, unit: out.unit,
         date: out.movement_date, qty_produced: Number(out.qty_in || 0),
+        batch_ref: out.reference || null,
         category: skuCategory(out.sku),
         ...subtree,
       };
     });
     consumedByMos.push({
       mo: entry.mo, date: entry.date, qty_consumed: entry.qty, unit: entry.unit,
+      batches_consumed: [...entry.batches_consumed].sort(),
       produced_outputs: outputTrees,
     });
   }
