@@ -7220,32 +7220,35 @@ function findProducingMovement(idx, lot) {
   const rows = idx.byBatch.get(lot) || [];
   return rows.find(m => m.movement_type === "In" && m.ref_type === "MO") || null;
 }
+// Return EVERY MO 'In' row that landed under this lot. Voyage sometimes
+// runs multiple batches under one MO where all runs pool their output
+// into a single shared lot code (bulk WIP tanks, etc.). Each run
+// consumes its own inputs — we need every producing row's reference to
+// gather every sibling run's inputs. Missing this is the primary cause
+// of 'my WIP used 3 sugar lots but lineage only shows 1' bugs.
+function findProducingMovements(idx, lot) {
+  const rows = idx.byBatch.get(lot) || [];
+  return rows.filter(m => m.movement_type === "In" && m.ref_type === "MO");
+}
 function findOriginMovement(idx, lot) {
   const rows = idx.byBatch.get(lot) || [];
   return rows.find(m => m.movement_type === "In" && (m.ref_type === "PO" || m.ref_type === "ST")) || null;
 }
 function findMoInputs(idx, moRef) {
-  // Include:
-  //   1. Inputs whose reference EXACTLY matches the producing row's ref
-  //      (this batch's own per-run inputs, e.g. all rows on MO-00293/1
-  //      when tracing lineage of a lot produced by MO-00293/1)
-  //   2. Inputs on the base MO reference with NO /N suffix (bulk
-  //      consumption Cin7 sometimes records at the MO level rather than
-  //      per batch — e.g., a shared vessel of sugar drawn down across
-  //      the whole MO)
-  // Exclude:
-  //   3. Inputs on a DIFFERENT batch ref (e.g. MO-00293/2 rows when
-  //      tracing MO-00293/1's output) — that would over-attribute across
-  //      batches and could drive over-recall.
-  //
-  // Matt: 'we use lot specific inputs in production, and an MO can have
-  // multiple lots produced as part of it… over-attribution could
-  // inaccurately recall something.' This filter respects batch scope
-  // while still catching MO-level bulk rows that a strict batch-only
-  // lookup silently drops.
-  const baseRef = String(moRef || "").replace(/\/.*$/, "");
+  return findMoInputsForRuns(idx, [moRef]);
+}
+// Given the set of MO refs that actually produced a specific lot
+// (usually one; can be multiple when Voyage runs several batches
+// pooling into one shared output lot code), return every input row
+// attributable to any of those runs, plus MO-level bulk consumption
+// on the base MO ref. Excludes inputs on OTHER batch refs that did
+// NOT produce this lot — that's the over-recall guard matt flagged.
+function findMoInputsForRuns(idx, producingRefs) {
+  const producingSet = new Set((producingRefs || []).filter(Boolean));
+  if (!producingSet.size) return [];
+  const baseRef = String([...producingSet][0]).replace(/\/.*$/, "");
   const rows = (idx.byRefNumber.get(baseRef) || []).filter(m => m.movement_type === "Out");
-  const kept = rows.filter(m => m.reference === moRef || m.reference === baseRef);
+  const kept = rows.filter(m => producingSet.has(m.reference) || m.reference === baseRef);
   const seen = new Set();
   const out = [];
   for (const m of kept) {
@@ -7270,8 +7273,8 @@ function buildLineageTree(idx, lot, depth, maxDepth, seen, posByRef) {
   if (depth > maxDepth) return { lot, sku: null, note: "max depth reached", inputs: [] };
   if (seen.has(lot)) return { lot, sku: null, note: "cycle detected", inputs: [] };
   seen.add(lot);
-  const producing = findProducingMovement(idx, lot);
-  if (!producing) {
+  const producingRows = findProducingMovements(idx, lot);
+  if (!producingRows.length) {
     const origin = findOriginMovement(idx, lot);
     let supplier = null;
     if (origin && origin.ref_type === "PO" && posByRef) {
@@ -7291,7 +7294,12 @@ function buildLineageTree(idx, lot, depth, maxDepth, seen, posByRef) {
       inputs: [],
     };
   }
-  const inputMovements = findMoInputs(idx, producing.reference);
+  // Collect every producing run's reference — if multiple runs pooled
+  // into this lot code (bulk WIP tanks), we walk ALL of their inputs.
+  // Single-run MOs degrade gracefully: producingRefs = [one ref].
+  const producingRefs = producingRows.map(p => p.reference);
+  const producing = producingRows[0]; // representative for display
+  const inputMovements = findMoInputsForRuns(idx, producingRefs);
   const inputs = inputMovements.map(im => {
     if (!im.batch) {
       return { lot: null, sku: im.sku, product: im.product, category: skuCategory(im.sku), qty: im.qty_out, unit: im.unit, movement: im, inputs: [] };
@@ -7299,7 +7307,19 @@ function buildLineageTree(idx, lot, depth, maxDepth, seen, posByRef) {
     const subtree = buildLineageTree(idx, im.batch, depth + 1, maxDepth, seen, posByRef);
     return { lot: im.batch, sku: im.sku, product: im.product, category: skuCategory(im.sku), qty: im.qty_out, unit: im.unit, movement: im, ...subtree };
   });
-  return { lot, sku: producing.sku, product: producing.product, producing_mo: producing.reference, producing_date: producing.movement_date, producing_qty: producing.qty_in, unit: producing.unit, origin: producing, inputs };
+  return {
+    lot,
+    sku: producing.sku,
+    product: producing.product,
+    producing_mo: producing.ref_number || producing.reference.replace(/\/.*$/, ""),
+    producing_runs: producingRefs,
+    producing_run_count: producingRefs.length,
+    producing_date: producing.movement_date,
+    producing_qty: producingRows.reduce((s, p) => s + Number(p.qty_in || 0), 0),
+    unit: producing.unit,
+    origin: producing,
+    inputs,
+  };
 }
 
 function collectMovementsFromTree(node, acc = []) {
