@@ -7225,7 +7225,26 @@ function findOriginMovement(idx, lot) {
   return rows.find(m => m.movement_type === "In" && (m.ref_type === "PO" || m.ref_type === "ST")) || null;
 }
 function findMoInputs(idx, moRef) {
-  return (idx.byRef.get(moRef) || []).filter(m => m.movement_type === "Out");
+  // Look up inputs by the BASE MO reference (strip /N batch suffix) via
+  // byRefNumber. Cin7's input rows aren't always tagged with the same
+  // /N suffix as the producing output row — bulk RM consumption (sugar,
+  // fats) is often recorded at the MO level with no batch suffix, or
+  // on a different batch ref than the one that produced a specific
+  // output lot. Batch-specific lookup here silently drops those inputs
+  // so the lineage tree ends up missing legit upstream lots. Dedupe by
+  // (batch, sku, date, qty) so if Cin7 repeats an input row across
+  // per-batch references it doesn't inflate the tree.
+  const baseRef = String(moRef || "").replace(/\/.*$/, "");
+  const rows = (idx.byRefNumber.get(baseRef) || []).filter(m => m.movement_type === "Out");
+  const seen = new Set();
+  const out = [];
+  for (const m of rows) {
+    const k = (m.batch || "?") + "|" + (m.sku || "?") + "|" + (m.movement_date || "?") + "|" + Number(m.qty_out || 0);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(m);
+  }
+  return out;
 }
 function findDownstream(idx, lot) {
   return (idx.byBatch.get(lot) || []).filter(m => m.movement_type === "Out").slice().sort((a, b) => (a.movement_date || "").localeCompare(b.movement_date || ""));
