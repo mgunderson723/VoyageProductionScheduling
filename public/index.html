@@ -5653,7 +5653,7 @@ function renderExpiringLots() {
     return `<tr style="${rowColor}">
       <td><span class="mo-id">${escapeHtml(l.sku || '—')}</span><div style="font-size:10px;color:var(--vf-text-tertiary);max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(l.product || '')}</div></td>
       <td><a href="${escapeHtml(traceHref)}" onclick="event.preventDefault();switchTab('traceability');setTimeout(()=>runTraceabilitySearchWith('${escapeHtml(l.batch || '')}'),50);" style="color:var(--vf-info-text);text-decoration:none;">${escapeHtml(l.batch || '—')}</a></td>
-      <td style="text-align:right;font-variant-numeric:tabular-nums;">${(l.running_balance || 0).toLocaleString(undefined, {maximumFractionDigits: 3})} <span style="color:var(--vf-text-tertiary);font-size:11px;">${escapeHtml(l.unit || '')}</span></td>
+      <td style="text-align:right;font-variant-numeric:tabular-nums;">${(l.running_balance || 0).toLocaleString(undefined, {maximumFractionDigits: 2})} <span style="color:var(--vf-text-tertiary);font-size:11px;">${escapeHtml(l.unit || '')}</span></td>
       <td style="white-space:nowrap;font-variant-numeric:tabular-nums;">${escapeHtml(l.expiry_date || '—')}</td>
       <td style="text-align:right;">${dLabel}</td>
       <td style="font-size:11px;color:var(--vf-text-secondary);">${escapeHtml(l.last_location || '—')}</td>
@@ -6487,8 +6487,8 @@ function renderTimelineTable(movements) {
   const rows = movements.map(m => {
     const dq = renderDqBadges(m.dq_notes);
     const rt = m.ref_type || 'null';
-    const qIn = m.qty_in && Number(m.qty_in) > 0 ? Number(m.qty_in).toLocaleString(undefined,{maximumFractionDigits:3}) : '';
-    const qOut = m.qty_out && Number(m.qty_out) > 0 ? Number(m.qty_out).toLocaleString(undefined,{maximumFractionDigits:3}) : '';
+    const qIn = m.qty_in && Number(m.qty_in) > 0 ? Number(m.qty_in).toLocaleString(undefined,{maximumFractionDigits:2}) : '';
+    const qOut = m.qty_out && Number(m.qty_out) > 0 ? Number(m.qty_out).toLocaleString(undefined,{maximumFractionDigits:2}) : '';
     const bal = m.running_balance != null ? Number(m.running_balance).toLocaleString(undefined,{maximumFractionDigits:2}) : '';
     return `<tr>
       <td style="white-space:nowrap;">${escapeHtml(String(m.movement_date || '').slice(0,10))}</td>
@@ -6546,8 +6546,8 @@ function renderNodeLabel(node, isRoot) {
   const cat = node.category || (node.sku ? node.sku.split('-')[0] : '');
   const sku = node.sku || '—';
   const lot = node.lot ? `lot=${escapeHtml(node.lot)}` : '<i style="color:var(--vf-text-tertiary);">no lot</i>';
-  const qty = node.qty != null ? `qty=${Number(node.qty).toLocaleString(undefined,{maximumFractionDigits:3})} ${escapeHtml(node.unit || '')}` :
-              node.producing_qty != null ? `produced=${Number(node.producing_qty).toLocaleString(undefined,{maximumFractionDigits:3})} ${escapeHtml(node.unit || '')}` : '';
+  const qty = node.qty != null ? `qty=${Number(node.qty).toLocaleString(undefined,{maximumFractionDigits:2})} ${escapeHtml(node.unit || '')}` :
+              node.producing_qty != null ? `produced=${Number(node.producing_qty).toLocaleString(undefined,{maximumFractionDigits:2})} ${escapeHtml(node.unit || '')}` : '';
   const via = node.producing_mo ? `via <b>${escapeHtml(node.producing_mo)}</b> on ${escapeHtml((node.producing_date || '').slice(0,10))}` : '';
   const origin = node.origin && !node.producing_mo
     ? `<span class="trace-tree-node-origin">← ${escapeHtml(node.origin.reference || 'unknown')} on ${escapeHtml((node.origin.movement_date || '').slice(0,10))}</span>`
@@ -6599,7 +6599,7 @@ function renderForwardNode(node, isRoot) {
   if (consumed.length) {
     const consumedHtml = consumed.map(c => {
       const outputs = (c.produced_outputs || []).map(o => `<li>${renderForwardNode(o, false)}</li>`).join('');
-      const qtyStr = Number(c.qty_consumed || 0).toLocaleString(undefined,{maximumFractionDigits:3});
+      const qtyStr = Number(c.qty_consumed || 0).toLocaleString(undefined,{maximumFractionDigits:2});
       return `<li>
         <span class="trace-tree-node-cat">MO</span>
         <b>${escapeHtml(c.mo)}</b>
@@ -6619,7 +6619,7 @@ function renderForwardNodeLabel(node) {
   const sku = escapeHtml(node.sku || '—');
   const lot = node.lot ? `lot=${escapeHtml(node.lot)}` : '<i style="color:var(--vf-text-tertiary);">no lot</i>';
   const producedInfo = node.qty_produced != null
-    ? `produced ${Number(node.qty_produced).toLocaleString(undefined,{maximumFractionDigits:3})} ${escapeHtml(node.unit || '')} on ${escapeHtml((node.date || '').slice(0,10))}`
+    ? `produced ${Number(node.qty_produced).toLocaleString(undefined,{maximumFractionDigits:2})} ${escapeHtml(node.unit || '')} on ${escapeHtml((node.date || '').slice(0,10))}`
     : '';
   const soh = node.still_on_hand != null
     ? `<span style="color:${node.still_on_hand > 0 ? 'var(--vf-success-text)' : node.still_on_hand < 0 ? 'var(--vf-danger-text)' : 'var(--vf-text-tertiary)'};font-weight:500;">still ${Number(node.still_on_hand).toLocaleString(undefined,{maximumFractionDigits:2})} ${escapeHtml(node.unit || '')}</span>`
@@ -6638,7 +6638,7 @@ function renderForwardDestinations(node) {
   const transfers = node.transfers_out || [];
   const adjustments = node.adjustments_out || [];
   const assemblies = node.assemblies || [];
-  const fmt = n => Number(n || 0).toLocaleString(undefined, { maximumFractionDigits: 3 });
+  const fmt = n => Number(n || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
 
   if (shipments.length) {
     const items = shipments.map(s => {
