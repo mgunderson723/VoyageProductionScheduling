@@ -3763,6 +3763,12 @@ async function _performProductionRunSyncInner() {
   //    lands in the 7-day window. Then walk operations → components (Error
   //    Reporting) and Run.Output[] (Production Output).
   const flagged = [];
+  // Mass-balance flags: runs where sum(kg output) > sum(kg input actuals).
+  // Distinct from zero-actual: a run can have every component with SOME
+  // number entered and still be short overall — operator under-recorded
+  // consumption. Auditor asked for this because it catches under-reporting
+  // that would otherwise slip past the strict zero-actual check.
+  const flaggedMassBalance = [];
   const allCompletedRuns = [];
   let detailCallsMade = 0;
   let detailFailures = 0;
@@ -3888,6 +3894,32 @@ async function _performProductionRunSyncInner() {
         0,
       );
       const yieldPct = inputMassKg > 0 ? (outputMassKg / inputMassKg) * 100 : null;
+
+      // Mass-balance check. inputMassKg > 0 filter excludes runs where every
+      // component is measured in Each (packaging, small prep) — those are
+      // legit unbalanced against a kg output and would false-positive here.
+      // 1 gram threshold trims off pure rounding noise from the round-to-3
+      // storage of inputMassKg / outputMassKg.
+      if (inputMassKg > 0 && outputMassKg - inputMassKg > 0.001) {
+        const kgInputs = allComponentsOnRun.filter(c => String(c.unit).toLowerCase() === "kg");
+        const kgOutputs = outputRows.filter(o => String(o.unit).toLowerCase() === "kg");
+        flaggedMassBalance.push({
+          moRef,
+          orderNumber,
+          runNumber,
+          completionDate: runMeta.completionDate,
+          fgSKU: runMeta.productSKU,
+          fgProduct: runMeta.productName,
+          location: runMeta.locationName,
+          inputMassKg: Math.round(inputMassKg * 1000) / 1000,
+          outputMassKg: Math.round(outputMassKg * 1000) / 1000,
+          deficitKg: Math.round((outputMassKg - inputMassKg) * 1000) / 1000,
+          yieldPct: Math.round(yieldPct * 100) / 100,
+          kgInputs,
+          kgOutputs,
+        });
+      }
+
       const bucketSourceSku =
         (outputRows.find(o => String(o.unit).toLowerCase() === "kg") || outputRows[0] || {}).sku || runMeta.productSKU;
       const yieldBucket = bucketLookup(bucketSourceSku);
@@ -3921,8 +3953,9 @@ async function _performProductionRunSyncInner() {
     if (i < orderIDs.length - 1) await sleepMs(PRODUCTION_RUN_RATE_LIMIT_MS);
   }
 
-  // Sort both feeds newest first
+  // Sort all feeds newest first
   flagged.sort((a, b) => (b.completionDate || "").localeCompare(a.completionDate || ""));
+  flaggedMassBalance.sort((a, b) => (b.completionDate || "").localeCompare(a.completionDate || ""));
   allCompletedRuns.sort((a, b) => (b.completionDate || "").localeCompare(a.completionDate || ""));
 
   const blob = {
@@ -3943,7 +3976,9 @@ async function _performProductionRunSyncInner() {
     detailFailures,
     flaggedRunCount: flagged.length,
     flaggedLineCount: flagged.reduce((s, g) => s + g.flagged.length, 0),
+    flaggedMassBalanceCount: flaggedMassBalance.length,
     flagged,
+    flaggedMassBalance,
     allCompletedRuns,
   };
   writeData("production_run_errors_t7d", blob);
@@ -4314,7 +4349,9 @@ app.get("/api/error-reporting/zero-out-mo-bom", (req, res) => {
       detailFailures: 0,
       flaggedRunCount: 0,
       flaggedLineCount: 0,
+      flaggedMassBalanceCount: 0,
       flagged: [],
+      flaggedMassBalance: [],
     });
   }
 
@@ -4328,7 +4365,9 @@ app.get("/api/error-reporting/zero-out-mo-bom", (req, res) => {
     detailFailures: blob.detailFailures || 0,
     flaggedRunCount: blob.flaggedRunCount || 0,
     flaggedLineCount: blob.flaggedLineCount || 0,
+    flaggedMassBalanceCount: blob.flaggedMassBalanceCount || (Array.isArray(blob.flaggedMassBalance) ? blob.flaggedMassBalance.length : 0),
     flagged: blob.flagged,
+    flaggedMassBalance: Array.isArray(blob.flaggedMassBalance) ? blob.flaggedMassBalance : [],
   });
 });
 

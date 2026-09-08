@@ -6995,8 +6995,11 @@ async function loadErrorReporting() {
     meta.textContent = 'No production-run data yet — click Sync now or wait for the 07:00 UTC cron';
   }
 
-  if (!d.flagged || d.flagged.length === 0) {
-    content.innerHTML = `<div style="padding:16px;background:var(--vf-success-soft);border:1px solid var(--vf-success-base);border-radius:var(--vf-radius-sm);color:var(--vf-success-text);font-size:13px;">✓ No zero-utilization BOM inputs detected in the trailing 7 days of completed production runs.</div>`;
+  const mb = Array.isArray(d.flaggedMassBalance) ? d.flaggedMassBalance : [];
+  const zeroActualCount = (d.flagged || []).length;
+
+  if (zeroActualCount === 0 && mb.length === 0) {
+    content.innerHTML = `<div style="padding:16px;background:var(--vf-success-soft);border:1px solid var(--vf-success-base);border-radius:var(--vf-radius-sm);color:var(--vf-success-text);font-size:13px;">✓ No zero-utilization BOM inputs or output-exceeds-input runs detected in the trailing 7 days of completed production runs.</div>`;
     return;
   }
 
@@ -7004,16 +7007,19 @@ async function loadErrorReporting() {
   const summary = `
     <div style="display:flex;gap:var(--vf-space-3);margin-bottom:var(--vf-space-3);flex-wrap:wrap;">
       <div style="padding:8px 12px;background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:12px;color:var(--vf-danger-text);">
-        <strong>${d.flaggedRunCount}</strong> production run${d.flaggedRunCount === 1 ? '' : 's'} flagged
+        <strong>${d.flaggedRunCount}</strong> zero-actual run${d.flaggedRunCount === 1 ? '' : 's'}
       </div>
       <div style="padding:8px 12px;background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:12px;color:var(--vf-danger-text);">
         <strong>${d.flaggedLineCount}</strong> zero-actual BOM line${d.flaggedLineCount === 1 ? '' : 's'}
       </div>
+      <div style="padding:8px 12px;background:var(--vf-warning-soft);border-radius:var(--vf-radius-sm);font-size:12px;color:var(--vf-warning-text);">
+        <strong>${mb.length}</strong> output &gt; input run${mb.length === 1 ? '' : 's'}
+      </div>
     </div>`;
 
-  const fmtQty = q => (q == null || q === '') ? '—' : Number(q).toLocaleString(undefined, { maximumFractionDigits: 4 });
+  const fmtQty = q => (q == null || q === '') ? '—' : Number(q).toLocaleString(undefined, { maximumFractionDigits: 2 });
 
-  const cards = d.flagged.map(g => {
+  const cards = (d.flagged || []).map(g => {
     const renderRow = (l, flagged) => `
       <tr${flagged ? ' style="background:var(--vf-danger-soft);"' : ''}>
         <td><span class="mo-id">${escapeHtml(l.sku || '')}</span></td>
@@ -7058,7 +7064,81 @@ async function loadErrorReporting() {
       </div>`;
   }).join('');
 
-  content.innerHTML = summary + cards;
+  // Mass-balance section: runs where kg output > kg input actuals. Distinct
+  // audit signal from zero-actuals — the operator entered non-zero numbers
+  // on every line but the aggregate still comes up short.
+  let mbSection = '';
+  if (mb.length > 0) {
+    const mbCards = mb.map(g => {
+      const inputRows = (g.kgInputs || []).map(l => `
+        <tr>
+          <td><span class="mo-id">${escapeHtml(l.sku || '')}</span></td>
+          <td style="font-size:12px;color:var(--vf-text-secondary);max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(l.product || '')}">${escapeHtml(l.product || '—')}</td>
+          <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(l.batch || '—')}</td>
+          <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(l.workCenter || '—')}</td>
+          <td style="text-align:right;font-variant-numeric:tabular-nums;">${fmtQty(l.actual)}</td>
+          <td style="text-align:right;font-variant-numeric:tabular-nums;color:var(--vf-text-tertiary);">${fmtQty(l.expected)}</td>
+        </tr>`).join('');
+      const outputRows2 = (g.kgOutputs || []).map(o => `
+        <tr style="background:var(--vf-warning-soft);">
+          <td><span class="mo-id">${escapeHtml(o.sku || '')}</span></td>
+          <td style="font-size:12px;color:var(--vf-text-secondary);max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(o.product || '')}">${escapeHtml(o.product || '—')}</td>
+          <td style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(o.batch || '—')}</td>
+          <td style="font-size:11px;color:var(--vf-text-tertiary);">produced</td>
+          <td style="text-align:right;font-variant-numeric:tabular-nums;font-weight:600;color:var(--vf-warning-text);">${fmtQty(o.qty)}</td>
+          <td style="text-align:right;font-variant-numeric:tabular-nums;color:var(--vf-text-tertiary);">—</td>
+        </tr>`).join('');
+      const fgLabel = (g.fgSKU || g.fgProduct)
+        ? `<span style="font-size:11px;color:var(--vf-text-secondary);">${escapeHtml(g.fgSKU || '')}${g.fgProduct ? ' · ' + escapeHtml(g.fgProduct) : ''}</span>`
+        : '';
+      return `
+        <div style="margin-bottom:var(--vf-space-3);border:1px solid var(--vf-warning-base);border-radius:var(--vf-radius-sm);overflow:hidden;">
+          <div style="padding:10px 14px;background:var(--vf-surface-raised);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+              <strong style="font-size:14px;color:var(--vf-text-primary);">${escapeHtml(g.moRef || '')}</strong>
+              <span style="font-size:11px;padding:2px 8px;background:var(--vf-warning-soft);color:var(--vf-warning-text);border-radius:10px;">output ${fmtQty(g.outputMassKg)} kg &gt; input ${fmtQty(g.inputMassKg)} kg · deficit ${fmtQty(g.deficitKg)} kg · yield ${(g.yieldPct != null ? g.yieldPct.toFixed(1) : '—')}%</span>
+              ${fgLabel}
+            </div>
+            <span style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(g.completionDate || '—')}</span>
+          </div>
+          <table class="status-table" style="margin:0;">
+            <thead>
+              <tr>
+                <th>SKU</th>
+                <th>Product</th>
+                <th>Batch #</th>
+                <th>Work center / role</th>
+                <th style="text-align:right;">Actual kg</th>
+                <th style="text-align:right;">Expected kg</th>
+              </tr>
+            </thead>
+            <tbody>${outputRows2}${inputRows}</tbody>
+          </table>
+        </div>`;
+    }).join('');
+    mbSection = `
+      <div style="margin-top:var(--vf-space-4);margin-bottom:var(--vf-space-2);font-size:13px;font-weight:600;color:var(--vf-text-primary);">
+        Output exceeds recorded input (kg)
+      </div>
+      <div style="margin-bottom:var(--vf-space-3);font-size:11px;color:var(--vf-text-tertiary);">
+        Sum of kg components consumed on the run is less than kg finished-good produced. Non-kg inputs (packaging, small prep) excluded from the balance.
+      </div>
+      ${mbCards}`;
+  }
+
+  // Existing zero-actual section header (only when there are any to show)
+  let zaHeader = '';
+  if (zeroActualCount > 0) {
+    zaHeader = `
+      <div style="margin-bottom:var(--vf-space-2);font-size:13px;font-weight:600;color:var(--vf-text-primary);">
+        Zero-actual BOM lines
+      </div>
+      <div style="margin-bottom:var(--vf-space-3);font-size:11px;color:var(--vf-text-tertiary);">
+        Component had a non-zero expected quantity on the BOM but the operator recorded zero actual consumption.
+      </div>`;
+  }
+
+  content.innerHTML = summary + zaHeader + cards + mbSection;
 }
 
 // Manual sync trigger — admin and operator+ can use this; takes ~1 minute
