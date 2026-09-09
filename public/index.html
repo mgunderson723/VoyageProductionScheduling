@@ -6970,6 +6970,39 @@ function renderLiveInventory() {
 // least one component line where ExpectedQuantity > 0 && Quantity === 0.
 // Sibling lines on the same run render alongside for operator context.
 
+// Filter state for the two flag classes on the Error Reporting tab.
+// 'all' shows both sections; 'zero' hides mass-balance; 'mb' hides
+// zero-actual. Click an active chip again to return to 'all'.
+let _errRepFilter = 'all';
+
+function setErrRepFilter(f) {
+  _errRepFilter = (_errRepFilter === f) ? 'all' : f;
+  applyErrRepFilter();
+}
+
+function applyErrRepFilter() {
+  const zeroSec = document.getElementById('err-rep-zero-section');
+  const mbSec = document.getElementById('err-rep-mb-section');
+  if (zeroSec) zeroSec.style.display = (_errRepFilter === 'mb') ? 'none' : '';
+  if (mbSec) mbSec.style.display = (_errRepFilter === 'zero') ? 'none' : '';
+  // Active-state styling on the chips
+  document.querySelectorAll('.err-rep-chip').forEach(el => {
+    const kind = el.getAttribute('data-kind');
+    // 'all' = no chip highlighted; otherwise highlight the matching one and
+    // dim the others so it's clear a filter is active.
+    if (_errRepFilter === 'all') {
+      el.style.opacity = '1';
+      el.style.outline = 'none';
+    } else if (kind === _errRepFilter) {
+      el.style.opacity = '1';
+      el.style.outline = '2px solid var(--vf-text-primary)';
+    } else {
+      el.style.opacity = '0.5';
+      el.style.outline = 'none';
+    }
+  });
+}
+
 async function loadErrorReporting() {
   const meta = document.getElementById('err-rep-meta');
   const content = document.getElementById('err-rep-content');
@@ -6984,6 +7017,8 @@ async function loadErrorReporting() {
     content.innerHTML = `<div style="padding:20px;color:var(--vf-danger-text);background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:13px;">Failed to load: ${escapeHtml(e.message)}</div>`;
     return;
   }
+  // Fresh load — filter defaults back to showing everything.
+  _errRepFilter = 'all';
 
   // Header meta
   if (d.lastSync) {
@@ -7003,18 +7038,21 @@ async function loadErrorReporting() {
     return;
   }
 
-  // Summary strip
+  // Summary strip — chips are clickable filters. Click one to isolate that
+  // section, click the active one again to return to showing everything.
+  // data-kind ties each chip to its section id for applyErrRepFilter().
   const summary = `
-    <div style="display:flex;gap:var(--vf-space-3);margin-bottom:var(--vf-space-3);flex-wrap:wrap;">
-      <div style="padding:8px 12px;background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:12px;color:var(--vf-danger-text);">
+    <div style="display:flex;gap:var(--vf-space-3);margin-bottom:var(--vf-space-3);flex-wrap:wrap;align-items:center;">
+      <div class="err-rep-chip" data-kind="zero" onclick="setErrRepFilter('zero')" title="Show only zero-actual runs" style="padding:8px 12px;background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:12px;color:var(--vf-danger-text);cursor:pointer;transition:opacity 0.1s;user-select:none;">
         <strong>${d.flaggedRunCount}</strong> zero-actual run${d.flaggedRunCount === 1 ? '' : 's'}
       </div>
-      <div style="padding:8px 12px;background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:12px;color:var(--vf-danger-text);">
+      <div class="err-rep-chip" data-kind="zero" onclick="setErrRepFilter('zero')" title="Show only zero-actual runs" style="padding:8px 12px;background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:12px;color:var(--vf-danger-text);cursor:pointer;transition:opacity 0.1s;user-select:none;">
         <strong>${d.flaggedLineCount}</strong> zero-actual BOM line${d.flaggedLineCount === 1 ? '' : 's'}
       </div>
-      <div style="padding:8px 12px;background:var(--vf-warning-soft);border-radius:var(--vf-radius-sm);font-size:12px;color:var(--vf-warning-text);">
+      <div class="err-rep-chip" data-kind="mb" onclick="setErrRepFilter('mb')" title="Show only output-exceeds-input runs" style="padding:8px 12px;background:var(--vf-warning-soft);border-radius:var(--vf-radius-sm);font-size:12px;color:var(--vf-warning-text);cursor:pointer;transition:opacity 0.1s;user-select:none;">
         <strong>${mb.length}</strong> output &gt; input run${mb.length === 1 ? '' : 's'}
       </div>
+      <span id="err-rep-filter-hint" style="font-size:11px;color:var(--vf-text-tertiary);">Click a chip to filter · click again to clear</span>
     </div>`;
 
   const fmtQty = q => (q == null || q === '') ? '—' : Number(q).toLocaleString(undefined, { maximumFractionDigits: 2 });
@@ -7117,28 +7155,35 @@ async function loadErrorReporting() {
         </div>`;
     }).join('');
     mbSection = `
-      <div style="margin-top:var(--vf-space-4);margin-bottom:var(--vf-space-2);font-size:13px;font-weight:600;color:var(--vf-text-primary);">
-        Output exceeds recorded input (kg)
-      </div>
-      <div style="margin-bottom:var(--vf-space-3);font-size:11px;color:var(--vf-text-tertiary);">
-        Sum of kg components consumed on the run is less than kg finished-good produced. Non-kg inputs (packaging, small prep) excluded from the balance.
-      </div>
-      ${mbCards}`;
-  }
-
-  // Existing zero-actual section header (only when there are any to show)
-  let zaHeader = '';
-  if (zeroActualCount > 0) {
-    zaHeader = `
-      <div style="margin-bottom:var(--vf-space-2);font-size:13px;font-weight:600;color:var(--vf-text-primary);">
-        Zero-actual BOM lines
-      </div>
-      <div style="margin-bottom:var(--vf-space-3);font-size:11px;color:var(--vf-text-tertiary);">
-        Component had a non-zero expected quantity on the BOM but the operator recorded zero actual consumption.
+      <div id="err-rep-mb-section">
+        <div style="margin-top:var(--vf-space-4);margin-bottom:var(--vf-space-2);font-size:13px;font-weight:600;color:var(--vf-text-primary);">
+          Output exceeds recorded input (kg)
+        </div>
+        <div style="margin-bottom:var(--vf-space-3);font-size:11px;color:var(--vf-text-tertiary);">
+          Sum of kg components consumed on the run is less than kg finished-good produced. Non-kg inputs (packaging, small prep) excluded from the balance.
+        </div>
+        ${mbCards}
       </div>`;
   }
 
-  content.innerHTML = summary + zaHeader + cards + mbSection;
+  // Existing zero-actual section — header + cards, wrapped in an id'd
+  // container so the summary-chip filter can hide the whole block at once.
+  let zaSection = '';
+  if (zeroActualCount > 0) {
+    zaSection = `
+      <div id="err-rep-zero-section">
+        <div style="margin-bottom:var(--vf-space-2);font-size:13px;font-weight:600;color:var(--vf-text-primary);">
+          Zero-actual BOM lines
+        </div>
+        <div style="margin-bottom:var(--vf-space-3);font-size:11px;color:var(--vf-text-tertiary);">
+          Component had a non-zero expected quantity on the BOM but the operator recorded zero actual consumption.
+        </div>
+        ${cards}
+      </div>`;
+  }
+
+  content.innerHTML = summary + zaSection + mbSection;
+  applyErrRepFilter();
 }
 
 // Manual sync trigger — admin and operator+ can use this; takes ~1 minute
