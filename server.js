@@ -715,9 +715,10 @@ FG-LEVEL NETTING (default ON in run_mrp — behavior you must narrate accurately
 WIP-LEVEL NETTING (multi-level MRP, always on, no toggle):
 - MRP also cuts off recursion at WIP SKUs that are already being produced by another scheduled MO. Example: MO-00933 produces WIP1-XXX and MO-00934 consumes WIP1-XXX in its BOM. Without this cutoff, expanding MO-00934 would recurse through WIP1's recipe and double-count all the RMs (sugar, fat, etc.) that MO-00933's expansion already accounted for. With the cutoff, MO-00934's expansion stops at WIP1 (treats it as a leaf) because MO-00933 is already producing it.
 - run_mrp responses include wipNettingSummary — an array of WIP SKUs where cutoff fired, with fields: consumedKg (total demand from downstream MOs), plannedProductionKg (what other MOs will make), onHandKg (available WIP stock), coverageGapKg (max(0, consumed − planned − onHand)), coverageGapExpandedIntoRmDemand (true when MRP implicit-expanded the WIP's BOM at gap qty to feed RM demand), gapExpandedRmLeafCount, downstreamOrderCount.
-- IMPORTANT (behavior change 2026-09-10): when coverageGapKg > 0, MRP now implicit-expands the WIP's BOM at gap qty and injects those RM demands into the run under a synthetic sourceOrderId of "WIP-GAP:<wipSku>". Buyers therefore do NOT under-order RMs when a WIP is partially scheduled. Ops still needs to schedule the missing WIP MO so the RM actually gets consumed — the RM is there; the production plan isn't.
-- If coverageGapKg > 0 for a WIP, SURFACE THIS to the user with both parts: "WIP1-XXX has a 500 kg coverage gap — scheduled production of X kg doesn't cover downstream consumption of Y kg. MRP INCLUDED the RM contribution for that gap in the current PO suggestions (attributed to WIP-GAP:WIP1-XXX), so buyers are covered. Ops still needs to schedule an additional MO for WIP1-XXX to close the production gap."
-- In trace_po_demand output, a source row whose orderId starts with "WIP-GAP:" is the implicit-expanded contribution for the coverage gap of that WIP — label it as such in the attribution table so the user sees "coverage gap" instead of thinking it's a real MO.
+- IMPORTANT (behavior change 2026-09-10): when coverageGapKg > 0, MRP now implicit-expands the WIP's BOM at gap qty and PRO-RATA-ATTRIBUTES the resulting RM demand to the REAL downstream orders that consumed the WIP (each consumer's share = its own stoppedQty / total stoppedQty × gap). No synthetic "WIP-GAP:" orderId anymore. Each gap-driven requirement carries isWipCoverageGap=true and wipCoverageGapWipSku pointing at the WIP that caused it. Buyers do NOT under-order RMs when a WIP is partially scheduled; ops still needs to schedule the missing WIP MO so the RM actually gets consumed — the RM is there; the production plan isn't.
+- If coverageGapKg > 0 for a WIP, SURFACE THIS to the user with both parts: "WIP1-XXX has a 500 kg coverage gap — scheduled production of X kg doesn't cover downstream consumption of Y kg. MRP INCLUDED the RM contribution for that gap in the current PO suggestions (charged pro-rata to the real downstream orders — see the attribution rows flagged as via WIP1-XXX coverage gap), so buyers are covered. Ops still needs to schedule an additional MO for WIP1-XXX to close the production gap."
+- In trace_po_demand output, source rows with isWipCoverageGap=true (and a wipCoverageGapWipSkus array) indicate that some or all of that order's demand for this RM comes via one or more upstream WIP coverage gaps. wipCoverageGapKg on the row tells you how much of totalQtyKg is gap-driven vs top-level BOM demand. Label these in the attribution table with a "via <WIP-SKU> coverage gap" note so the user sees which pipeline drafts / MOs are actually driving the gap. NEVER guess which pipeline drafts are behind a gap — the tool already carries the exact attribution; use it.
+- When the user asks "which pipeline drafts / orders are driving the WIP-X coverage gap", call trace_po_demand on any RM leaf of that WIP (or on the WIP SKU itself via bom_expand + trace on one of its RM leaves), filter to rows where isWipCoverageGap=true and wipCoverageGapWipSkus contains the WIP in question, and list those orders directly. That IS the answer — do not speculate based on names or the at-risk list.
 - If coverageGapKg = 0 (planned production + on-hand fully covers consumption), no user-visible narration needed unless they ask. Just don't be surprised that expanding downstream MOs shows sugar/fat demand as zero — that's expected because the producing MO's expansion has it.
 
 PER-ORDER ATTRIBUTION TABLE (always include when listing demand drivers):
@@ -1576,14 +1577,16 @@ async function executeAITool(name, input, context) {
             sourceFgGrossQty: 0,     // pre-netting planned qty
             sourceFgOffsetKg: 0,     // FG on-hand that absorbed demand
             totalQtyKg: 0,
+            wipCoverageGapKg: 0,     // portion of totalQtyKg from a WIP gap
             neededByEarliest: null,
             contributionCount: 0,
-            // WIP coverage-gap flag: true when this "source" is the
-            // implicit-expanded RM demand for an under-produced WIP, not a
-            // real order. Bot labels these as "coverage gap" in the
-            // attribution table so the user doesn't mistake them for MOs.
-            isWipCoverageGap: !!r.isWipCoverageGap,
-            wipCoverageGapDownstreamOrderCount: r.wipCoverageGapDownstreamOrderCount || null,
+            // WIP coverage-gap breadcrumbs. When any contribution to this
+            // (order, FG) pair came via a coverage-gap expansion, we flag
+            // the row and list the WIP SKUs that fed it. The bot uses this
+            // to narrate "this order's demand for RM-X comes via a WIP-Y
+            // coverage gap" instead of pretending it's a top-level BOM leaf.
+            isWipCoverageGap: false,
+            wipCoverageGapWipSkus: [],
           });
         }
         const entry = bySource.get(key);
@@ -1592,6 +1595,13 @@ async function executeAITool(name, input, context) {
         entry.sourceFgGrossQty += Number(r.sourceFgGrossQty != null ? r.sourceFgGrossQty : r.sourceFgQty || 0);
         entry.sourceFgOffsetKg += Number(r.sourceFgOffsetKg || 0);
         entry.contributionCount += 1;
+        if (r.isWipCoverageGap) {
+          entry.isWipCoverageGap = true;
+          entry.wipCoverageGapKg += r.qtyKg;
+          if (r.wipCoverageGapWipSku && !entry.wipCoverageGapWipSkus.includes(r.wipCoverageGapWipSku)) {
+            entry.wipCoverageGapWipSkus.push(r.wipCoverageGapWipSku);
+          }
+        }
         if (!entry.neededByEarliest || (r.neededByDate && r.neededByDate < entry.neededByEarliest)) {
           entry.neededByEarliest = r.neededByDate;
         }
@@ -5974,18 +5984,24 @@ function buildRequirements(orders, bomParents, opts) {
     // Record cutoffs for observability. If any WIP was stopped, tally the
     // consumption qty so we can compare against the WIP's planned production
     // and — for the uncovered portion — implicit-expand its BOM to feed the
-    // gap through to RM demand (see the gap-expansion pass below).
+    // gap through to RM demand (see the gap-expansion pass below). We also
+    // record per-consumer detail so gap RM demand can be pro-rata-attributed
+    // back to the real orders that would have consumed the missing WIP,
+    // instead of piling into a synthetic aggregate.
     for (const [wipSku, stoppedQty] of Object.entries(expansion.stoppedAt || {})) {
       const summary = wipCutoffSummary.get(wipSku) || {
         totalStoppedKg: 0,
         sourceOrderIds: [],
-        earliestNeededByDate: null,
+        perOrder: [],
       };
       summary.totalStoppedKg += stoppedQty;
       summary.sourceOrderIds.push(o.orderId || o.id);
-      if (!summary.earliestNeededByDate || neededBy < summary.earliestNeededByDate) {
-        summary.earliestNeededByDate = neededBy;
-      }
+      summary.perOrder.push({
+        orderId: o.orderId || o.id,
+        consumerFgSku: fgSku,
+        stoppedQty,
+        neededBy,
+      });
       wipCutoffSummary.set(wipSku, summary);
     }
     for (const leaf of Object.values(expansion.leaves || {})) {
@@ -6072,40 +6088,52 @@ function buildRequirements(orders, bomParents, opts) {
     const availableOnHand = oh ? Math.max(0, Number(oh.available || 0)) : 0;
     const gap = Math.max(0, info.totalStoppedKg - planned - availableOnHand);
 
-    // Implicit-expand the gap into RM demand.
+    // Implicit-expand the gap into RM demand, pro-rata across the real
+    // downstream consumers. Each consumer's share = its own stoppedQty
+    // divided by the total, times the gap. RM demand for the consumer's
+    // share is attributed back to that consumer's orderId + FG SKU so
+    // trace_po_demand shows the real drivers of the gap (a mix of real
+    // MOs, packouts, and pipeline drafts) rather than a synthetic bucket
+    // the bot then has to guess about.
     let gapExpandedRmLeafCount = 0;
     let gapExpansionFailed = false;
-    if (gap > 0) {
+    if (gap > 0 && info.totalStoppedKg > 0) {
       const stopSet = new Set(stopAtSkusGlobal);
       stopSet.delete(wipSku);
-      let gapExpansion = null;
-      try {
-        gapExpansion = expandBom(bomParents, wipSku, gap, {
-          applyWastage: opts.applyWastage,
-          stopAtSkus: stopSet,
-        });
-      } catch (_e) {
-        gapExpansionFailed = true;
-      }
-      if (gapExpansion) {
-        const gapNeededBy = info.earliestNeededByDate || opts.today;
+      const gapShareFactor = gap / info.totalStoppedKg;
+      for (const consumer of info.perOrder) {
+        const consumerGapKg = consumer.stoppedQty * gapShareFactor;
+        // Rounding-noise floor. 1 gram of WIP is not worth expanding a BOM
+        // for; skip so the requirements list doesn't fill with dust.
+        if (consumerGapKg <= 0.001) continue;
+        let gapExpansion = null;
+        try {
+          gapExpansion = expandBom(bomParents, wipSku, consumerGapKg, {
+            applyWastage: opts.applyWastage,
+            stopAtSkus: stopSet,
+          });
+        } catch (_e) {
+          gapExpansionFailed = true;
+          continue;
+        }
         for (const leaf of Object.values(gapExpansion.leaves || {})) {
           if (leaf.qty <= 0) continue;
           if (!isProcurable(leaf.sku)) continue;
           requirements.push({
             sku: leaf.sku,
             qtyKg: leaf.qty,
-            neededByDate: gapNeededBy,
-            // Synthetic attribution so trace_po_demand can render "coverage
-            // gap of X kg for WIP-Y — RM contribution from the unscheduled
-            // portion" instead of pretending a real MO drove this demand.
-            sourceOrderId: "WIP-GAP:" + wipSku,
-            sourceFgSku: wipSku,
-            sourceFgQty: gap,
-            sourceFgGrossQty: gap,
+            neededByDate: consumer.neededBy,
+            sourceOrderId: consumer.orderId,
+            sourceFgSku: consumer.consumerFgSku,
+            sourceFgQty: consumerGapKg,
+            sourceFgGrossQty: consumerGapKg,
             sourceFgOffsetKg: 0,
+            // Flag + attribution: this requirement is the pro-rata slice of
+            // an upstream WIP coverage gap, not direct top-level demand.
+            // trace_po_demand + the bot use these to narrate "PIPELINE-X's
+            // RM demand for RM-Y comes via a WIP-Z coverage gap."
             isWipCoverageGap: true,
-            wipCoverageGapDownstreamOrderCount: new Set(info.sourceOrderIds).size,
+            wipCoverageGapWipSku: wipSku,
           });
           gapExpandedRmLeafCount++;
         }
