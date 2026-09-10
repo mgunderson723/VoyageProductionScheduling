@@ -701,8 +701,11 @@ UOM AWARENESS (critical for VC-* and other non-kg SKUs):
 - If uom is null/missing, note that in your response ("UOM not synced yet — verify against Cin7 before ordering") rather than assuming kg.
 
 FG-LEVEL NETTING (default ON in run_mrp — behavior you must narrate accurately):
-- run_mrp now nets FG on-hand against planned production BEFORE expanding BOMs. If a scheduled MO or pipeline draft would produce FG-XXX and there is already FG-XXX.available in stock, the RM demand for that draft is expanded on the NET production qty (planned minus what stock covers), not the gross planned qty. This is real MRP behavior and matches how a scheduler would think.
-- run_mrp responses include an fgNettingSummary array — FG SKUs where on-hand stock offset planned production. When it is non-empty, SURFACE THIS in your reply. Each row has these distinct fields you MUST report correctly:
+- run_mrp nets TWO supply sources against FG demand BEFORE expanding BOMs, in this order:
+  (1) FG on-hand stock offsets any order (firm or pipeline) FIFO by need-by-date.
+  (2) IMPORTANT (behavior added 2026-09-10): firm scheduled production (non-pipeline, non-companion MOs) then offsets PIPELINE-DRAFT and COMPANION demand for the same FG. Without this step, a packout MO producing 21,500 kg of FG-X double-counted: once via its own BOM expansion AND again inside an 80,000 kg pipeline draft for FG-X. The fix: pipeline draft residual = 80,000 − 21,500 = 58,500 kg drives additional RM demand; the 21,500 kg is only counted once via the packout MO's own expansion. Firm MOs are NEVER netted against each other (each represents a committed production plan with its own RM needs).
+- Each fgNettingSummary offsetBreakdown row now carries an offsetSource field: "fgOnHand" (from step 1) or "firmScheduledProduction" (from step 2). Report the mix in your narration when both fired for the same FG: "PIPELINE-Mondelez-2026-10 · 40,000 kg planned → 500 kg offset by FG on-hand → 21,500 kg offset by scheduled packouts MO-00984 through MO-00988 → 18,000 kg net drives additional RM demand."
+- run_mrp responses include an fgNettingSummary array — FG SKUs where on-hand stock OR scheduled firm production offset pipeline / companion demand. When it is non-empty, SURFACE THIS in your reply. Each row has these distinct fields you MUST report correctly:
     rawOnHandKg              — total physical inventory in Cin7
     allocatedToSalesOrdersKg — qty already committed to open SOs (unavailable for netting)
     startingAvailableKg      — rawOnHand minus allocated; THE POOL FOR FUTURE NETTING
@@ -5836,14 +5839,16 @@ function buildRequirements(orders, bomParents, opts) {
       byFg.get(fg).push({ order: o, fgSku: fg, plannedQty, needBy });
     }
     for (const [fg, entries] of byFg) {
-      const oh = opts.onHandBySku[fg];
-      if (!oh) continue;
-      let available = Math.max(0, Number(oh.available || 0));
-      if (available <= 0) continue;
       entries.sort((a, b) => String(a.needBy || "").localeCompare(String(b.needBy || "")));
+      const oh = opts.onHandBySku[fg];
+      let available = oh ? Math.max(0, Number(oh.available || 0)) : 0;
       const consumedByOrder = new Map();
       const offsetBreakdown = []; // audit trail: which order got which slice
       let totalConsumed = 0;
+
+      // ── Step 1: FG on-hand offsets any order FIFO ──
+      // Anything already on the shelf can cover the nearest need first —
+      // firm or pipeline, doesn't matter. This is the original behavior.
       for (const e of entries) {
         if (available <= 0) break;
         const take = Math.min(available, e.plannedQty);
@@ -5858,13 +5863,65 @@ function buildRequirements(orders, bomParents, opts) {
           netPlannedKg: e.plannedQty - take,
           isPipelineDraft: !!e.order.__fromPipelineDraft,
           isCompanionDemand: !!e.order.__fromCompanionRule,
+          offsetSource: "fgOnHand",
         });
         available -= take;
         totalConsumed += take;
         e.netPlannedQty = e.plannedQty - take;
         e.fgOffsetKg = take;
       }
-      fgNetted.set(fg, { totalConsumed, availableRemaining: available, consumedByOrder, offsetBreakdown });
+
+      // ── Step 2: scheduled firm production offsets pipeline / companion
+      // demand for the same FG ──
+      // Without this, a packout MO producing 21,500 kg of FG-X counts
+      // twice: once via its own BOM expansion (correct) AND again inside
+      // an 80,000 kg pipeline draft for FG-X (wrong — those packouts are
+      // fulfilling part of that pipeline demand, not adding to it).
+      // Firm MOs themselves are NOT netted here; only pipeline draft /
+      // companion synth demand is reduced. Firm production's own material
+      // plan comes from its own BOM expansion in the main loop.
+      let firmProdKg = 0;
+      for (const e of entries) {
+        if (e.order.__fromPipelineDraft || e.order.__fromCompanionRule) continue;
+        firmProdKg += e.plannedQty;
+      }
+      if (firmProdKg > 0) {
+        const pipelineEntries = entries.filter(e =>
+          e.order.__fromPipelineDraft || e.order.__fromCompanionRule
+        );
+        let remaining = firmProdKg;
+        for (const e of pipelineEntries) {
+          if (remaining <= 0) break;
+          const currentNet = e.netPlannedQty != null ? e.netPlannedQty : e.plannedQty;
+          const take = Math.min(remaining, currentNet);
+          if (take <= 0) continue;
+          e.netPlannedQty = currentNet - take;
+          e.fgOffsetKg = (e.fgOffsetKg || 0) + take;
+          totalConsumed += take;
+          offsetBreakdown.push({
+            orderId: e.order.orderId || e.order.id,
+            orderInternalId: e.order.id,
+            needBy: e.needBy,
+            grossPlannedKg: e.plannedQty,
+            offsetKg: take,
+            netPlannedKg: e.netPlannedQty,
+            isPipelineDraft: !!e.order.__fromPipelineDraft,
+            isCompanionDemand: !!e.order.__fromCompanionRule,
+            offsetSource: "firmScheduledProduction",
+          });
+          remaining -= take;
+        }
+      }
+
+      if (offsetBreakdown.length > 0 || totalConsumed > 0) {
+        fgNetted.set(fg, {
+          totalConsumed,
+          availableRemaining: available,
+          consumedByOrder,
+          offsetBreakdown,
+          firmProductionKg: firmProdKg,
+        });
+      }
     }
     // Build a fast lookup: order.id → { netPlannedQty, fgOffsetKg }
     opts._perOrderNet = new Map();
