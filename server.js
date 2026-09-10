@@ -253,6 +253,7 @@ const SESSION_BYPASS_PATHS = new Set([
   "/cin7/inventory-movements",     // Apps Script auto-sync, gated by X-VF-Sync-Secret
   "/pipeline/webhook",             // Apps Script pipeline push, gated by X-Webhook-Secret
   "/mrp/capital-outlay.json",      // Apps Script pull from financial model, gated by X-Webhook-Secret
+  "/traceability/movements/export.csv",  // Apps Script mirror to Drive/Claude Project, gated by X-Webhook-Secret
 ]);
 app.use("/api", (req, res, next) => {
   if (SESSION_BYPASS_PATHS.has(req.path)) return next();
@@ -6641,6 +6642,43 @@ app.get("/api/traceability/summary", (_req, res) => {
     by_ref_type: Object.entries(byType).map(([ref_type, n]) => ({ ref_type, n })).sort((a, b) => b.n - a.n),
     last_import: blob.last_import || null,
   });
+});
+
+// GET /api/traceability/movements/export.csv — pull-mode CSV export of the
+// full vf_inventory_movements history. Used by a Google Apps Script mirror
+// that keeps a Drive folder (connected to matt's Claude Project) in sync
+// with what the app is holding, so ad-hoc due-diligence queries don't
+// require re-uploading the report each time. Auth: X-Webhook-Secret
+// header matching PIPELINE_WEBHOOK_SECRET (reused; if you want a separate
+// secret later we can split them). Session bypass required — see
+// SESSION_BYPASS_PATHS.
+app.get("/api/traceability/movements/export.csv", (req, res) => {
+  const expected = process.env.PIPELINE_WEBHOOK_SECRET;
+  if (!expected) return res.status(503).json({ ok: false, error: "PIPELINE_WEBHOOK_SECRET not configured on the server" });
+  const provided = req.get("X-Webhook-Secret") || req.query.secret || "";
+  if (provided !== expected) return res.status(401).json({ ok: false, error: "Invalid webhook secret" });
+  const idx = getMovementIndex();
+  const rows = idx.all;
+  const cols = [
+    "movement_date", "location", "reference", "ref_type", "ref_number",
+    "sku", "product", "unit", "expiry_date", "batch", "movement_type",
+    "qty_in", "qty_out", "cost_in", "cost_out",
+    "source_file", "source_upload_at",
+  ];
+  // Standard RFC 4180 CSV escaping: quote when the field contains a
+  // comma, double-quote, CR, or LF, doubling any internal quotes.
+  const esc = v => {
+    if (v == null) return "";
+    const s = String(v);
+    if (/[",\r\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+    return s;
+  };
+  const lines = [cols.join(",")];
+  for (const r of rows) lines.push(cols.map(c => esc(r[c])).join(","));
+  const dateStamp = new Date().toISOString().slice(0, 10);
+  res.set("content-type", "text/csv; charset=utf-8");
+  res.set("content-disposition", `attachment; filename="voyage-movements-${dateStamp}.csv"`);
+  res.send(lines.join("\n"));
 });
 
 // GET /api/traceability/stale-lots — lot-level triage for floor counts.
