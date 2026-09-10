@@ -767,8 +767,30 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
 #ai-messages { flex: 1; overflow-y: auto; padding: var(--vf-space-3) var(--vf-space-4); display: flex; flex-direction: column; gap: var(--vf-space-3); }
 .ai-msg { max-width: 88%; font-size: var(--vf-text-sm); line-height: var(--vf-leading-normal); }
 .ai-msg.user      { align-self: flex-end;   background: var(--vf-brand-orange); color: var(--vf-text-inverse); border-radius: var(--vf-radius-md) var(--vf-radius-md) 2px var(--vf-radius-md); padding: var(--vf-space-2) var(--vf-space-3); }
-.ai-msg.assistant { align-self: flex-start; background: var(--vf-surface-sunken);  color: var(--vf-text-primary); border-radius: var(--vf-radius-md) var(--vf-radius-md) var(--vf-radius-md) 2px; padding: var(--vf-space-2) var(--vf-space-3); white-space: pre-wrap; border-left: 2px solid var(--vf-brand-orange); }
-.ai-msg.error     { align-self: flex-start; background: var(--vf-danger-soft);     color: var(--vf-danger-text);  border-radius: var(--vf-radius-md); padding: var(--vf-space-2) var(--vf-space-3); }
+/* Assistant messages get 96% so tables have more room. Rich-markdown
+   rendering inside .ai-md handles its own whitespace, so we no longer
+   need pre-wrap on the bubble itself. */
+.ai-msg.assistant { align-self: flex-start; max-width: 96%; background: var(--vf-surface-sunken);  color: var(--vf-text-primary); border-radius: var(--vf-radius-md) var(--vf-radius-md) var(--vf-radius-md) 2px; padding: var(--vf-space-2) var(--vf-space-3); border-left: 2px solid var(--vf-brand-orange); }
+.ai-msg.error     { align-self: flex-start; background: var(--vf-danger-soft);     color: var(--vf-danger-text);  border-radius: var(--vf-radius-md); padding: var(--vf-space-2) var(--vf-space-3); white-space: pre-wrap; }
+
+/* Rendered-markdown wrapper for assistant messages. Tables, headings,
+   bold, code, and lists all render inline. Tables get their own
+   overflow-x wrapper so a wide GFM table can scroll horizontally
+   within the (narrow) chat panel instead of blowing out layout. */
+.ai-md p { margin: 0 0 6px; }
+.ai-md p:last-child { margin-bottom: 0; }
+.ai-md h1, .ai-md h2, .ai-md h3, .ai-md h4 { margin: 8px 0 4px; font-size: 13px; font-weight: 600; color: var(--vf-text-primary); }
+.ai-md ul, .ai-md ol { margin: 4px 0 8px 18px; padding: 0; }
+.ai-md li { margin: 2px 0; }
+.ai-md strong { font-weight: 600; }
+.ai-md code { background: var(--vf-surface-raised); padding: 1px 4px; border-radius: 3px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+.ai-md pre { background: var(--vf-surface-raised); padding: 6px 8px; border-radius: var(--vf-radius-sm); font-size: 11px; overflow-x: auto; margin: 6px 0; }
+.ai-md pre code { background: transparent; padding: 0; font-size: 11px; }
+.ai-md .ai-md-table-wrap { margin: 6px 0; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.ai-md table { border-collapse: collapse; font-size: 11px; min-width: 100%; }
+.ai-md th { text-align: left; padding: 4px 6px; background: var(--vf-surface-raised); border-bottom: 1px solid var(--vf-border-default); font-weight: 600; white-space: nowrap; }
+.ai-md td { padding: 3px 6px; border-bottom: 1px solid var(--vf-border-subtle); vertical-align: top; white-space: nowrap; }
+.ai-md td.ai-md-td-wrap { white-space: normal; min-width: 140px; }
 .ai-typing {
   align-self: flex-start;
   display: flex; gap: var(--vf-space-3); align-items: center;
@@ -8328,6 +8350,95 @@ function aiInputResize(el) {
   el.style.height = Math.min(el.scrollHeight, 100) + 'px';
 }
 
+// Tiny, safe markdown renderer for assistant chat messages. Handles
+// GitHub-flavored pipe tables (the main pain point in the chat panel),
+// headings, bullet lists, **bold**, `inline code`, fenced ```code``` and
+// paragraph breaks. Everything else falls through as escaped text.
+// Not a general-purpose markdown parser — deliberately narrow so it stays
+// small and doesn't invite HTML-injection surface.
+function renderChatMarkdown(rawText) {
+  if (rawText == null) return '';
+  let text = escapeHtml(rawText);
+
+  // Extract fenced code blocks first so their content is not treated as
+  // markdown (protects table pipes / stars inside code from being parsed).
+  const codeBlocks = [];
+  text = text.replace(/```([\s\S]*?)```/g, (_m, code) => {
+    codeBlocks.push(code.replace(/^\n/, ''));
+    return ' CODE' + (codeBlocks.length - 1) + ' ';
+  });
+
+  // Split into blocks by blank lines. A block is a run of non-blank lines
+  // that renders as one element (paragraph, table, list, etc).
+  const rawLines = text.split(/\r?\n/);
+  const blocks = [];
+  let cur = [];
+  for (const line of rawLines) {
+    if (line.trim() === '') {
+      if (cur.length) { blocks.push(cur); cur = []; }
+    } else {
+      cur.push(line);
+    }
+  }
+  if (cur.length) blocks.push(cur);
+
+  const renderInline = s => s
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>');
+
+  const isTableSeparator = s => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/.test(s);
+
+  const splitRow = line => {
+    let s = line.trim();
+    if (s.startsWith('|')) s = s.slice(1);
+    if (s.endsWith('|')) s = s.slice(0, -1);
+    return s.split('|').map(c => c.trim());
+  };
+
+  const renderBlock = block => {
+    // Pipe table: at least a header + separator row.
+    if (block.length >= 2 && /\|/.test(block[0]) && isTableSeparator(block[1])) {
+      const header = splitRow(block[0]);
+      const rows = block.slice(2).map(splitRow);
+      const thead = '<thead><tr>' + header.map(h => '<th>' + renderInline(h) + '</th>').join('') + '</tr></thead>';
+      // The last column often carries free-form notes ("Firm MO",
+      // "Pipeline draft, ships Dec '26") — let those wrap instead of
+      // forcing every column to nowrap.
+      const lastIdx = header.length - 1;
+      const tbody = '<tbody>' + rows.map(r =>
+        '<tr>' + r.map((c, i) => {
+          const cls = (i === lastIdx && header.length > 2) ? ' class="ai-md-td-wrap"' : '';
+          return '<td' + cls + '>' + renderInline(c) + '</td>';
+        }).join('') + '</tr>'
+      ).join('') + '</tbody>';
+      return '<div class="ai-md-table-wrap"><table>' + thead + tbody + '</table></div>';
+    }
+    // Heading: `#`, `##`, `###`, `####`.
+    if (block.length === 1 && /^#{1,6}\s+/.test(block[0])) {
+      const m = block[0].match(/^(#{1,6})\s+(.*)$/);
+      const level = Math.min(m[1].length + 2, 6); // shift so # renders as h3
+      return '<h' + level + '>' + renderInline(m[2]) + '</h' + level + '>';
+    }
+    // Unordered list: every line starts with "- " or "* ".
+    if (block.every(l => /^\s*[-*]\s+/.test(l))) {
+      const items = block.map(l => '<li>' + renderInline(l.replace(/^\s*[-*]\s+/, '')) + '</li>').join('');
+      return '<ul>' + items + '</ul>';
+    }
+    // Ordered list: every line starts with "N. ".
+    if (block.every(l => /^\s*\d+\.\s+/.test(l))) {
+      const items = block.map(l => '<li>' + renderInline(l.replace(/^\s*\d+\.\s+/, '')) + '</li>').join('');
+      return '<ol>' + items + '</ol>';
+    }
+    // Default: paragraph. Preserve intentional line breaks inside a block.
+    return '<p>' + block.map(renderInline).join('<br>') + '</p>';
+  };
+
+  let html = blocks.map(renderBlock).join('');
+  // Restore fenced code blocks.
+  html = html.replace(/ CODE(\d+) /g, (_m, i) => '<pre><code>' + codeBlocks[+i] + '</code></pre>');
+  return html;
+}
+
 function renderAIMessages(displayHistory) {
   const container = document.getElementById('ai-messages');
   if (!displayHistory.length) {
@@ -8336,7 +8447,12 @@ function renderAIMessages(displayHistory) {
   }
   container.innerHTML = displayHistory.map((m, i) => {
     const cls = m.role === 'user' ? 'user' : (m.error ? 'error' : 'assistant');
-    let body = escapeHtml(m.text);
+    // User + error messages stay plain (respect their exact text). Assistant
+    // messages go through the small markdown renderer so pipe-tables and
+    // bold/code/lists come through as real HTML instead of pipe soup.
+    let body = (cls === 'assistant')
+      ? '<div class="ai-md">' + renderChatMarkdown(m.text) + '</div>'
+      : escapeHtml(m.text);
     if (m.jumpToDate) {
       body += `<div style="margin-top:6px;"><button class="btn btn-sm btn-primary" onclick="aiJumpToDate('${m.jumpToDate}')" style="font-size:11px;padding:4px 10px;">Jump to ${m.jumpToDate}</button></div>`;
     }
