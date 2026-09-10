@@ -738,6 +738,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
 #ai-fab:hover { background: var(--vf-brand-orange-hover); transform: scale(1.06); }
 #ai-fab svg { width: 22px; height: 22px; }
 #ai-panel {
+  position: relative;
   width: 360px;
   background: var(--vf-surface-raised);
   border: 1px solid var(--vf-border-default);
@@ -747,6 +748,29 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
   max-height: 520px;
   overflow: hidden;
 }
+/* Custom resize handle. The panel is anchored bottom-right by its
+   parent flex container, so a native resize:both control would grow
+   in the wrong direction. This handle sits in the top-left corner
+   and drives width + max-height from a pointer drag. */
+#ai-resize-handle {
+  position: absolute;
+  top: 0; left: 0;
+  width: 16px; height: 16px;
+  cursor: nwse-resize;
+  z-index: 2;
+  touch-action: none;
+}
+#ai-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 4px; left: 4px;
+  width: 8px; height: 8px;
+  border-top: 2px solid var(--vf-border-default);
+  border-left: 2px solid var(--vf-border-default);
+  border-top-left-radius: 3px;
+  transition: border-color 0.15s;
+}
+#ai-resize-handle:hover::after { border-color: var(--vf-brand-orange); }
 .ai-panel-header {
   display: flex; align-items: center; justify-content: space-between;
   padding: var(--vf-space-3) var(--vf-space-4);
@@ -8292,6 +8316,7 @@ async function confirmImport(){
 <!-- AI CHAT WIDGET -->
 <div id="ai-widget" style="display:none;">
   <div id="ai-panel" style="display:none;">
+    <div id="ai-resize-handle" title="Drag to resize"></div>
     <div class="ai-panel-header">
       <div class="ai-panel-title">
         <span class="ai-dot"></span>
@@ -8328,6 +8353,65 @@ let aiLoading = false;
 
 function showAIWidget() {
   document.getElementById('ai-widget').style.display = 'flex';
+  initAiPanelResize();
+}
+
+// Drag-to-resize on the top-left corner handle. Restores the last size
+// from localStorage on load, saves on pointer release. Enforces a
+// sensible min (320×400) so the panel can't become unusably small, and
+// a viewport-aware max so it can't cover the entire screen.
+let _aiPanelResizeInit = false;
+function initAiPanelResize() {
+  if (_aiPanelResizeInit) return;
+  const panel = document.getElementById('ai-panel');
+  const handle = document.getElementById('ai-resize-handle');
+  if (!panel || !handle) return;
+  _aiPanelResizeInit = true;
+
+  try {
+    const saved = JSON.parse(localStorage.getItem('vf_ai_panel_size') || 'null');
+    if (saved && saved.w) panel.style.width = Math.max(320, saved.w) + 'px';
+    if (saved && saved.h) panel.style.maxHeight = Math.max(400, saved.h) + 'px';
+  } catch (_e) { /* ignore corrupted saved size */ }
+
+  let dragging = false;
+  let startX = 0, startY = 0, startW = 0, startH = 0;
+  handle.addEventListener('pointerdown', e => {
+    dragging = true;
+    startX = e.clientX;
+    startY = e.clientY;
+    const rect = panel.getBoundingClientRect();
+    startW = rect.width;
+    startH = rect.height;
+    handle.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  handle.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    // Panel anchors bottom-right; growing width/height visually extends
+    // toward the top-left. So a leftward/upward drag INCREASES size.
+    const dw = startX - e.clientX;
+    const dh = startY - e.clientY;
+    const maxW = Math.max(360, window.innerWidth  - 60);
+    const maxH = Math.max(400, window.innerHeight - 60);
+    const newW = Math.max(320, Math.min(maxW, startW + dw));
+    const newH = Math.max(400, Math.min(maxH, startH + dh));
+    panel.style.width = newW + 'px';
+    panel.style.maxHeight = newH + 'px';
+  });
+  const stop = () => {
+    if (!dragging) return;
+    dragging = false;
+    try {
+      const rect = panel.getBoundingClientRect();
+      localStorage.setItem('vf_ai_panel_size', JSON.stringify({
+        w: Math.round(rect.width),
+        h: Math.round(rect.height),
+      }));
+    } catch (_e) { /* ignore quota errors */ }
+  };
+  handle.addEventListener('pointerup', stop);
+  handle.addEventListener('pointercancel', stop);
 }
 
 function toggleAIPanel() {
