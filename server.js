@@ -5204,6 +5204,21 @@ async function performCin7BomsSync() {
     rowCount,
   };
   writeData("vf_boms", blob);
+
+  // Auto-seed Supply Settings for any BOM parent that doesn't already have
+  // an entry. Every ~few weeks new SKUs land in Cin7; without this hook a
+  // buyer would miss them until MRP produced a suspicious ratio (see
+  // FG-608-102-00 in Sep 2026 — 10x sunflower demand from a missing
+  // kgPerUnit). Seeded entries carry needsReview:true so the UI can
+  // surface them at the top and the buyer knows to fill in kgPerUnit,
+  // lead time, etc. before ordering. We don't overwrite existing entries.
+  let supplySettingsSeededCount = 0;
+  try {
+    supplySettingsSeededCount = seedSupplySettingsFromBoms(parents);
+  } catch (e) {
+    console.error("[BOM sync] Supply Settings seeding failed:", e.message);
+  }
+
   return {
     ok: true,
     lastSync: now,
@@ -5214,7 +5229,43 @@ async function performCin7BomsSync() {
     rowCount,
     failureCount: failures.length,
     firstFailures: failures.slice(0, 10),
+    supplySettingsSeededCount,
   };
+}
+
+// Add any BOM parent SKU that isn't in Supply Settings yet, with default
+// lead time and needsReview:true. Existing entries are left alone so a
+// buyer's manual configuration is never clobbered by a nightly sync.
+// Returns the count of newly-seeded SKUs.
+function seedSupplySettingsFromBoms(parents) {
+  const supplyBlob = readData("vf_supply_settings") || { defaults: {}, perSku: {} };
+  const defaults = supplyBlob.defaults || { leadTimeDays: 30, safetyStockDays: 14, packagingDefaultDays: 14 };
+  const perSku = supplyBlob.perSku || {};
+  let added = 0;
+  const nowIso = new Date().toISOString();
+  for (const sku of Object.keys(parents)) {
+    if (!sku) continue;
+    if (perSku[sku]) continue; // already configured — don't touch
+    perSku[sku] = {
+      leadTimeDays: defaults.leadTimeDays || 30,
+      isContract: false,
+      isAlias: false,
+      needsReview: true,
+      seededAt: nowIso,
+      seededSource: "bom-sync",
+      raw: "(auto-seeded from BOM sync — review kgPerUnit / lead time / payment terms)",
+    };
+    added++;
+  }
+  if (added > 0) {
+    writeData("vf_supply_settings", {
+      lastImport: nowIso,
+      defaults,
+      perSku,
+    });
+    console.log(`[BOM sync] Auto-seeded ${added} new SKU(s) into Supply Settings (needsReview:true)`);
+  }
+  return added;
 }
 
 // Fire-and-forget: BOM sync runs 2–5 minutes; can't hold an HTTP request that
@@ -5562,6 +5613,13 @@ app.put("/api/supply-settings", requireAdmin, (req, res) => {
         const n = parseInt(v.paymentTermsDays, 10);
         if (isFinite(n) && n >= 0) entry.paymentTermsDays = n;
       }
+      // Preserve auto-seed metadata across saves. The client's "Mark
+      // reviewed" action posts back a perSku with these fields DELETED,
+      // so they only survive here if the client is explicitly keeping
+      // them (which it does when the buyer hasn't reviewed yet).
+      if (v.needsReview) entry.needsReview = true;
+      if (v.seededAt) entry.seededAt = String(v.seededAt);
+      if (v.seededSource) entry.seededSource = String(v.seededSource);
       // If isContract or isAlias, leadTimeDays may be null. If neither and
       // the value is null, the SKU effectively falls back to the default.
       cleanSku[sku] = entry;

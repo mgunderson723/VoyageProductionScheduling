@@ -1830,7 +1830,9 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
           <option value="explicit">Explicit</option>
           <option value="alias">Alias</option>
           <option value="contract">Contract</option>
+          <option value="needsReview">Needs review</option>
         </select>
+        <span id="mrp-supply-needsreview-chip" style="display:none;padding:4px 10px;background:var(--vf-warning-soft);color:var(--vf-warning-text);border-radius:var(--vf-radius-sm);font-size:12px;font-weight:600;cursor:pointer;" onclick="filterMrpSupplyToNeedsReview()"></span>
         <span style="margin-left:auto;font-size:var(--vf-text-xs);color:var(--vf-text-tertiary);">Click any cell to edit · changes auto-save</span>
         <button class="btn btn-sm btn-primary" onclick="openAddSkuRow()">+ Add SKU</button>
       </div>
@@ -5087,11 +5089,31 @@ function renderMrpSupply() {
     sku, ...v,
     source: v.isContract ? 'contract' : v.isAlias ? 'alias' : v.leadTimeDays != null ? 'explicit' : 'default',
   }));
+
+  // "Needs review" summary chip. Auto-seeded SKUs from the BOM sync land
+  // with needsReview:true so buyers know to fill in kgPerUnit + payment
+  // terms before ordering. Chip is clickable to filter down to just those.
+  const needsReviewCount = rows.filter(r => r.needsReview).length;
+  const chip = document.getElementById('mrp-supply-needsreview-chip');
+  if (chip) {
+    if (needsReviewCount > 0) {
+      chip.style.display = '';
+      chip.textContent = '⚠ ' + needsReviewCount + ' new SKU' + (needsReviewCount === 1 ? '' : 's') + ' need review';
+    } else {
+      chip.style.display = 'none';
+    }
+  }
+
   const filtered = rows.filter(r => {
-    if (sourceFilter && r.source !== sourceFilter) return false;
+    if (sourceFilter === 'needsReview') { if (!r.needsReview) return false; }
+    else if (sourceFilter && r.source !== sourceFilter) return false;
     if (search && !r.sku.toLowerCase().includes(search)) return false;
     return true;
-  }).sort((a,b) => a.sku.localeCompare(b.sku));
+  }).sort((a, b) => {
+    // needsReview first, then alphabetical — buyers see the new stuff on top.
+    if (!!a.needsReview !== !!b.needsReview) return a.needsReview ? -1 : 1;
+    return a.sku.localeCompare(b.sku);
+  });
   tbody.innerHTML = filtered.length === 0 ? `<tr><td colspan="8" class="empty">No SKUs match.</td></tr>` :
     filtered.map(r => {
       const sku = escapeHtml(r.sku);
@@ -5105,7 +5127,11 @@ function renderMrpSupply() {
         ${sources.map(s => `<option value="${s}"${s===r.source?' selected':''}>${s}</option>`).join('')}
       </select>`;
       let notesCell = '';
-      if (r.isAlias) {
+      if (r.needsReview) {
+        const seededOn = r.seededAt ? new Date(r.seededAt).toLocaleDateString() : 'BOM sync';
+        notesCell = `<span style="font-size:11px;color:var(--vf-warning-text);font-weight:600;">⚠ Auto-seeded ${escapeHtml(seededOn)}</span>
+          <button class="btn btn-sm" onclick="markSupplySkuReviewed('${sku}')" style="margin-left:6px;padding:2px 8px;font-size:11px;">Mark reviewed</button>`;
+      } else if (r.isAlias) {
         notesCell = `<span style="font-size:11px;color:var(--vf-text-tertiary);">aliased to </span>
           <input type="text" value="${escapeHtml(r.aliasOf||'')}" onblur="onMrpAliasChange('${sku}', this.value)" onkeydown="if(event.key==='Enter')this.blur()" style="width:140px;padding:2px 6px;font-size:11px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;">`;
       } else if (r.isContract) {
@@ -5115,7 +5141,8 @@ function renderMrpSupply() {
       } else {
         notesCell = `<span style="font-size:11px;color:var(--vf-text-tertiary);">—</span>`;
       }
-      return `<tr>
+      const rowStyle = r.needsReview ? ' style="background:var(--vf-warning-soft);"' : '';
+      return `<tr${rowStyle}>
         <td><span class="mo-id">${sku}</span></td>
         <td style="text-align:right;">
           <input type="number" min="0" value="${leadValue}" ${leadDisabled?'disabled':''} onblur="onMrpLeadChange('${sku}', this.value)" onkeydown="if(event.key==='Enter')this.blur()" style="width:70px;padding:3px 6px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:${leadDisabled?'var(--vf-surface-sunken)':'var(--vf-surface-raised)'};color:var(--vf-text-primary);font-family:inherit;text-align:right;font-variant-numeric:tabular-nums;">
@@ -5148,6 +5175,23 @@ function onMrpKgPerUnitChange(sku, value) {
   const v = parseFloat(value);
   if (isFinite(v) && v > 0) entry.kgPerUnit = v;
   else delete entry.kgPerUnit;
+  saveMrpSupply();
+}
+
+function filterMrpSupplyToNeedsReview() {
+  const sel = document.getElementById('mrp-supply-source-filter');
+  if (sel) { sel.value = 'needsReview'; renderMrpSupply(); }
+}
+
+// Clear the needsReview flag on a SKU that a buyer has just checked. The
+// row loses its yellow highlight and drops out of the "needs review"
+// filter. Save is fire-and-forget (existing pattern for this table).
+function markSupplySkuReviewed(sku) {
+  const entry = mrpSupplyData.perSku[sku];
+  if (!entry) return;
+  delete entry.needsReview;
+  delete entry.seededAt;
+  delete entry.seededSource;
   saveMrpSupply();
 }
 
