@@ -715,6 +715,12 @@ FG-LEVEL NETTING (default ON in run_mrp — behavior you must narrate accurately
 - trace_po_demand rows now include sourceFgGrossQty (pre-netting), sourceFgQty (net, drives RM), and sourceFgOffsetKg (FG on-hand absorbed). If gross does not equal net for a row, mention it in your attribution table: "PIPELINE-Cargill US-2026-12 · FG-888-858 · 15,000 kg planned → 5,136 kg offset by FG on-hand → 9,864 kg net → 3,156 kg RM contribution."
 - Only set netFgOnHand=false if the user explicitly asks for a "gross production plan" or "what would we need to buy if the FG shelf were empty" scenario. Never disable it silently.
 
+BOM RATIO SANITY CHECK (always on, surface prominently):
+- run_mrp responses include a bomRatioWarnings array. Each entry flags a (sourceOrderId, fgSku) pair whose total RM mass exceeds 3x the FG mass being produced — a strong signal that the FG's BOM was authored per-case / per-batch-of-fixed-mass and Supply Settings is missing a kgPerUnit override (or has a wrong one). This is a repeat foot-gun (PFS in April 2026, FG-608-102-00 in September 2026).
+- Fields per warning: sourceOrderId, fgSku, fgQtyKg, totalRmKg, rmToFgRatio, hasKgPerUnitOverride (boolean), likelyCause (human-readable).
+- If bomRatioWarnings is non-empty, SURFACE IT AT THE TOP of your reply — before the demand table, before the PO summary. Sample narration: "⚠ Heads up: MRP flagged FG-608-102-00 with a 10.4:1 RM-to-FG mass ratio on MO-00913. This looks like a per-case BOM without a kgPerUnit override in Supply Settings. The RM demand for that order is likely inflated ~10x. Fix: open Supply Settings, find FG-608-102-00, and set kgPerUnit to its case weight in kg. Then re-run MRP."
+- Never bury this in the tail of the reply. If it fires, the user's PO recommendations are almost certainly wrong and they need to fix it before ordering.
+
 WIP-LEVEL NETTING (multi-level MRP, always on, no toggle):
 - MRP also cuts off recursion at WIP SKUs that are already being produced by another scheduled MO. Example: MO-00933 produces WIP1-XXX and MO-00934 consumes WIP1-XXX in its BOM. Without this cutoff, expanding MO-00934 would recurse through WIP1's recipe and double-count all the RMs (sugar, fat, etc.) that MO-00933's expansion already accounted for. With the cutoff, MO-00934's expansion stops at WIP1 (treats it as a leaf) because MO-00933 is already producing it.
 - run_mrp responses include wipNettingSummary — an array of WIP SKUs where cutoff fired, with fields: consumedKg (total demand from downstream MOs), plannedProductionKg (what other MOs will make), onHandKg (available WIP stock), coverageGapKg (max(0, consumed − planned − onHand)), coverageGapExpandedIntoRmDemand (true when MRP implicit-expanded the WIP's BOM at gap qty to feed RM demand), gapExpandedRmLeafCount, downstreamOrderCount.
@@ -1700,7 +1706,7 @@ async function executeAITool(name, input, context) {
       }
 
       const netFgOnHand = pickBool(input.netFgOnHand, userSettings.netFgOnHand, true);
-      const { requirements, skipped, packoutSkippedExamples, fgNettingSummary, wipNettingSummary } = buildRequirements(mrpOrders, bomParents, {
+      const { requirements, skipped, packoutSkippedExamples, fgNettingSummary, wipNettingSummary, bomRatioWarnings } = buildRequirements(mrpOrders, bomParents, {
         today, horizonDays, includeUnconfirmed, applyWastage: true, excludeBeforeDate, supply,
         onHandBySku, netFgOnHand,
       });
@@ -1777,6 +1783,7 @@ async function executeAITool(name, input, context) {
         },
         fgNettingSummary: fgNettingSummary || [],
         wipNettingSummary: wipNettingSummary || [],
+        bomRatioWarnings: bomRatioWarnings || [],
         packoutSkipped: {
           count: skipped.packoutFormulaOnly || 0,
           examples: packoutSkippedExamples || [],
@@ -6209,7 +6216,52 @@ function buildRequirements(orders, bomParents, opts) {
       downstreamOrderCount: new Set(info.sourceOrderIds).size,
     });
   }
-  return { requirements, skipped, noBomExamples, packoutSkippedExamples, fgNettingSummary, wipNettingSummary };
+  // BOM ratio sanity check. If a single source's total RM mass exceeds a
+  // multiple of the FG mass being produced, the FG's BOM was almost
+  // certainly authored per-case (or per-batch-of-fixed-mass) and Supply
+  // Settings is missing a kgPerUnit override. Same class of bug as PFS
+  // (April 2026): a 1,050-kg pouching order against a qtyToProduce=1
+  // BOM is misread as 1,050 cases and material need is inflated by
+  // ~case-weight. Surface it so the bot flags it up front instead of
+  // the user manually noticing a 10x sunflower ratio.
+  const bomRatioWarnings = [];
+  const byOrderFg = new Map();
+  for (const r of requirements) {
+    if (r.isWipCoverageGap) continue; // WIP-gap rows can legitimately spike
+    const fg = r.sourceFgSku;
+    if (!fg || !r.sourceOrderId) continue;
+    const key = r.sourceOrderId + "|" + fg;
+    if (!byOrderFg.has(key)) {
+      byOrderFg.set(key, {
+        sourceOrderId: r.sourceOrderId,
+        fgSku: fg,
+        totalRmKg: 0,
+        fgQtyKg: Number(r.sourceFgQty || 0),
+      });
+    }
+    byOrderFg.get(key).totalRmKg += Number(r.qtyKg || 0);
+  }
+  const RATIO_WARN_THRESHOLD = 3; // 3x FG mass — well above any real recipe loss
+  for (const info of byOrderFg.values()) {
+    if (info.fgQtyKg <= 0) continue;
+    const ratio = info.totalRmKg / info.fgQtyKg;
+    if (ratio < RATIO_WARN_THRESHOLD) continue;
+    const hasOverride = !!(opts.supply && opts.supply.perSku &&
+                          opts.supply.perSku[info.fgSku] &&
+                          opts.supply.perSku[info.fgSku].kgPerUnit);
+    bomRatioWarnings.push({
+      sourceOrderId: info.sourceOrderId,
+      fgSku: info.fgSku,
+      fgQtyKg: Math.round(info.fgQtyKg * 1000) / 1000,
+      totalRmKg: Math.round(info.totalRmKg * 1000) / 1000,
+      rmToFgRatio: Math.round(ratio * 100) / 100,
+      hasKgPerUnitOverride: hasOverride,
+      likelyCause: hasOverride
+        ? "kgPerUnit is set for " + info.fgSku + " but the ratio is still " + Math.round(ratio * 10) / 10 + "x — verify the value matches Cin7's actual batch size, or check for a nested WIP with the same issue."
+        : "BOM for " + info.fgSku + " likely authored per-case; add kgPerUnit override in Supply Settings (case weight in kg).",
+    });
+  }
+  return { requirements, skipped, noBomExamples, packoutSkippedExamples, fgNettingSummary, wipNettingSummary, bomRatioWarnings };
 }
 
 // A BOM leaf is "procurable" if it looks like a real RM, packaging, or
@@ -6415,7 +6467,7 @@ function computeMrpRun(query) {
   }
 
   const netFgOnHandFlag = query.netFgOnHand !== "false";
-  const { requirements, skipped, noBomExamples, packoutSkippedExamples, fgNettingSummary, wipNettingSummary } = buildRequirements(mrpOrders, bomParents, {
+  const { requirements, skipped, noBomExamples, packoutSkippedExamples, fgNettingSummary, wipNettingSummary, bomRatioWarnings } = buildRequirements(mrpOrders, bomParents, {
     today, horizonDays, includeUnconfirmed, applyWastage, excludeBeforeDate, supply,
     onHandBySku, netFgOnHand: netFgOnHandFlag,
   });
@@ -6489,6 +6541,7 @@ function computeMrpRun(query) {
     settings: { includeUnconfirmed, applyWastage, horizonDays, excludeBeforeDate, includeDrafts, draftsCount, includeCompanions, companionsCount, includeUpsideOnly, upsideOnlyExcluded, poHorizonDays, poHorizonEndDate, netFgOnHand: netFgOnHandFlag },
     fgNettingSummary: fgNettingSummary || [],
     wipNettingSummary: wipNettingSummary || [],
+    bomRatioWarnings: bomRatioWarnings || [],
     summary: {
       ordersConsidered: mrpOrders.length - (skipped.unconfirmed + skipped.complete + skipped.noStart + skipped.outsideHorizon + skipped.noBom + skipped.excludedByDate + (skipped.packoutFormulaOnly || 0)),
       ordersSkipped: skipped,
