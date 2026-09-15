@@ -910,6 +910,13 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
      Stays sticky at top so user can't miss it. persist() is no-op'd while
      __vfLoadFailed is true, so without this banner edits silently fail to
      save (root cause of the May 21 2026 shiaocatjam incident). -->
+<!-- Full-viewport click-blocking overlay. Sits at z-index 9998, one below
+     the banner (9999), so the banner's buttons stay clickable but any
+     click on the calendar / topbar / chat panel bounces off. Prevents
+     the "keep editing into a void" failure mode: with the overlay up,
+     the operator cannot drag orders or type edits that will be silently
+     discarded. Toggled from showSaveBlockedBanner / hideSaveBlockedBanner. -->
+<div id="save-blocked-overlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:9998;background:rgba(0,0,0,0.35);cursor:not-allowed;" onclick="event.stopPropagation();"></div>
 <div id="save-blocked-banner" style="display:none;position:fixed;top:0;left:0;right:0;z-index:9999;background:var(--vf-danger-base);color:#fff;padding:12px 20px;font-size:14px;font-weight:500;text-align:center;box-shadow:0 2px 12px rgba(0,0,0,0.3);font-family:var(--vf-font-body);">
   <span id="save-blocked-text">⚠ Lost connection to server — your edits are NOT being saved.</span>
   <button id="save-blocked-retry-btn" type="button" onclick="retryInit()" style="margin-left:12px;padding:4px 12px;background:#fff;color:#7A1F1F;border:none;border-radius:4px;font-weight:600;cursor:pointer;font-size:13px;">Retry now</button>
@@ -2772,12 +2779,23 @@ function showSaveBlockedBanner(text, options) {
   banner.style.display = 'block';
   // Push body content down so the banner doesn't cover the topbar
   document.body.style.paddingTop = banner.offsetHeight + 'px';
+  // Hard read-only mode: while the load is failed, put a click-blocking
+  // overlay over the app so operators can't edit into a void. The overlay
+  // hides once we're either recovered (success) or waiting on a reload
+  // (which is still a read-only state, but the user has explicit control
+  // via the Reload button — clicks on the calendar would fetch state from
+  // the server anyway on reload, so blocking further edits until they
+  // click Reload keeps the pattern consistent).
+  const overlay = document.getElementById('save-blocked-overlay');
+  if (overlay) overlay.style.display = options.success ? 'none' : 'block';
 }
 
 function hideSaveBlockedBanner() {
   const banner = document.getElementById('save-blocked-banner');
   if (banner) banner.style.display = 'none';
   document.body.style.paddingTop = '';
+  const overlay = document.getElementById('save-blocked-overlay');
+  if (overlay) overlay.style.display = 'none';
 }
 
 function startSaveBlockedRetryLoop() {
@@ -2859,7 +2877,7 @@ async function init(){
       // can't miss the blocked state (replaces the easily-overlooked #notice
       // element this path used to set).
       showSaveBlockedBanner(
-        '⚠ Lost connection to server (status ' + (fetched.status||'network') + ') — your edits are NOT being saved. Auto-retrying every 30s.',
+        '⚠ Lost connection to server (status ' + (fetched.status||'network') + ') — the schedule is READ-ONLY until the connection is restored. Auto-retrying every 30s.',
         {}
       );
       startSaveBlockedRetryLoop();
@@ -2870,7 +2888,7 @@ async function init(){
     window.__vfLoadFailed = true;
     console.error('[init] vf_orders load threw', e);
     showSaveBlockedBanner(
-      '⚠ Couldn\'t load orders (' + (e.message || 'parse error') + ') — your edits are NOT being saved. Auto-retrying every 30s.',
+      '⚠ Couldn\'t load orders (' + (e.message || 'parse error') + ') — the schedule is READ-ONLY until the connection is restored. Auto-retrying every 30s.',
       {}
     );
     startSaveBlockedRetryLoop();
