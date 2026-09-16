@@ -2346,10 +2346,13 @@ async function doLogin(){
       return;
     }
     const j=await r.json();
-    await loadUsers();
-    currentUser=users.find(u=>u.id===j.user.id)||j.user;
+    // Reload the page so init() runs again with a valid session. Without
+    // this, orders stays [] (init already ran while unauthenticated) and
+    // the app shows an empty schedule until the user manually refreshes.
+    // The cost is ~1s of load flash; the win is that everything downstream
+    // (orders, on-hand cache, MRP data) loads correctly for the new user.
     errEl.textContent='';
-    showApp();
+    location.reload();
   }catch(e){
     errEl.textContent='Could not reach server. Try again.';
   }
@@ -2865,6 +2868,16 @@ async function init(){
       orders = raw ? JSON.parse(raw) : JSON.parse(JSON.stringify(SEED));
       if(!orders.length) orders = JSON.parse(JSON.stringify(SEED));
       await persist('seed');
+    } else if (fetched.status === 401) {
+      // Not authenticated — session cookie expired or user never logged
+      // in. This is NOT a server failure and MUST NOT trigger the
+      // read-only overlay (which would cover the login form and lock
+      // the user out entirely — Greg K on 2026-09-16). Just skip order
+      // loading; tryResumeSession() below will 401 too and drop us into
+      // the login screen. After doLogin succeeds we reload the page so
+      // this init runs again cleanly with a valid session.
+      orders = [];
+      console.warn('[init] vf_orders returned 401 — will show login');
     } else {
       // Transient fetch failure (offline, redeploy, 5xx). Show the user a
       // clear error and DO NOT write anything to the server. Loading SEED
