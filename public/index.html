@@ -2782,15 +2782,14 @@ function showSaveBlockedBanner(text, options) {
   banner.style.display = 'block';
   // Push body content down so the banner doesn't cover the topbar
   document.body.style.paddingTop = banner.offsetHeight + 'px';
-  // Hard read-only mode: while the load is failed, put a click-blocking
-  // overlay over the app so operators can't edit into a void. The overlay
-  // hides once we're either recovered (success) or waiting on a reload
-  // (which is still a read-only state, but the user has explicit control
-  // via the Reload button — clicks on the calendar would fetch state from
-  // the server anyway on reload, so blocking further edits until they
-  // click Reload keeps the pattern consistent).
+  // 2026-09-16: click-blocking overlay removed. It was too aggressive —
+  // a single Railway blip could freeze the whole team's UI for hours
+  // (see Greg's 401 lockout, Shiao's "out of date" issue). Instead we
+  // now stash unsaved edits to sessionStorage and flush them once the
+  // server comes back, so nothing is silently lost even while the
+  // banner is up. Overlay div is left in the DOM but never shown.
   const overlay = document.getElementById('save-blocked-overlay');
-  if (overlay) overlay.style.display = options.success ? 'none' : 'block';
+  if (overlay) overlay.style.display = 'none';
 }
 
 function hideSaveBlockedBanner() {
@@ -2819,17 +2818,50 @@ async function retryInit() {
   try {
     const fetched = await serverGetEx('vf_orders');
     if (fetched.ok) {
-      // Connection restored. Don't auto-replace orders[] — the user may have
-      // made in-memory edits during the blocked period, and silently
-      // overwriting them is exactly the failure mode this banner exists to
-      // prevent. Prompt them to reload instead.
       stopSaveBlockedRetryLoop();
+      // NEW 2026-09-16: if we have a sessionStorage stash of pending
+      // edits, push them to the server before anything else. This is the
+      // whole point of the stash — nobody's Monday-afternoon work gets
+      // silently discarded because a blip happened. If flush succeeds
+      // we replace in-memory orders/collapsed with the pushed versions
+      // and re-render; if it fails, we keep the stash and let the user
+      // Reload as before.
+      const pending = readPending();
+      if (pending && Array.isArray(pending.orders)) {
+        const ok1 = await serverPut('vf_orders', pending.orders, {source: 'offline-flush'});
+        const ok2 = pending.collapsed != null
+          ? await serverPut('vf_collapsed', pending.collapsed)
+          : true;
+        if (ok1 && ok2) {
+          orders = pending.orders;
+          if (pending.collapsed != null) collapsed = pending.collapsed;
+          clearPending();
+          window.__vfLoadFailed = false;
+          updatePendingIndicator();
+          try { renderCal(); } catch (_) {}
+          hideSaveBlockedBanner();
+          const ind = document.getElementById('save-ind');
+          if (ind) {
+            ind.style.color = 'var(--vf-success-text)';
+            ind.textContent = '✓ Synced ' + pending.orders.length + ' orders from local queue';
+            ind.style.opacity = '1';
+            setTimeout(() => { ind.style.opacity = '0'; ind.style.color = ''; }, 5000);
+          }
+          return;
+        }
+        // Flush failed — leave stash in place, tell user to reload manually.
+        showSaveBlockedBanner(
+          '✓ Connection restored, but couldn\'t sync your ' + pending.orders.length + ' queued edit(s). Reload to try again — your local changes are preserved.',
+          { success: true, hideRetry: true, showReload: true }
+        );
+        return;
+      }
+      // No pending edits — clean recovery, prompt reload as before.
       showSaveBlockedBanner(
-        '✓ Connection restored. Reload the page to refresh data and resume saving. Any unsaved edits from this session will be lost.',
+        '✓ Connection restored. Reload the page to refresh data and resume saving.',
         { success: true, hideRetry: true, showReload: true }
       );
     } else {
-      // Still failing — leave banner up, reset button so user can manually retry
       if (btn) { btn.disabled = false; btn.textContent = 'Retry now'; }
     }
   } catch (e) {
@@ -2860,6 +2892,42 @@ async function init(){
       orders = fetched.value;
       // Don't re-PUT on every load; the only persist on init was historical
       // and is the bug. Subsequent saves (via persist()) carry source tags.
+      //
+      // NEW 2026-09-16: if a prior tab session left a pending stash in
+      // sessionStorage, prompt the user to sync it. Without this, edits
+      // made during a connectivity-blocked window would still be lost
+      // on the next page load. sessionStorage is per-tab, so this only
+      // fires when the same tab that made the pending edits is loading.
+      const pending = readPending();
+      if (pending && Array.isArray(pending.orders) && pending.orders.length) {
+        const stashedTime = pending.stashedAt
+          ? new Date(pending.stashedAt).toLocaleString()
+          : 'earlier';
+        const choice = window.confirm(
+          'You have ' + pending.orders.length + ' order(s) with unsaved changes from ' + stashedTime + '.\n\n' +
+          'Click OK to sync your local changes to the server (replacing the current server state).\n' +
+          'Click Cancel to discard them and use the server\'s current data.'
+        );
+        if (choice) {
+          try {
+            const ok1 = await serverPut('vf_orders', pending.orders, {source: 'offline-flush-init'});
+            const ok2 = pending.collapsed != null
+              ? await serverPut('vf_collapsed', pending.collapsed)
+              : true;
+            if (ok1 && ok2) {
+              orders = pending.orders;
+              if (pending.collapsed != null) collapsed = pending.collapsed;
+              clearPending();
+            } else {
+              alert('Sync failed. Your local edits are still saved — refresh in a minute to try again.');
+            }
+          } catch (e) {
+            alert('Sync failed: ' + (e.message || 'network error') + '. Your local edits are still saved.');
+          }
+        } else {
+          clearPending();
+        }
+      }
     } else if (fetched.ok && (fetched.value == null || (Array.isArray(fetched.value) && !fetched.value.length))) {
       // Server confirmed: no data. Safe to seed from localStorage / SEED.
       let raw;
@@ -2890,7 +2958,7 @@ async function init(){
       // can't miss the blocked state (replaces the easily-overlooked #notice
       // element this path used to set).
       showSaveBlockedBanner(
-        '⚠ Lost connection to server (status ' + (fetched.status||'network') + ') — the schedule is READ-ONLY until the connection is restored. Auto-retrying every 30s.',
+        '⚠ Lost connection to server (status ' + (fetched.status||'network') + ') — edits are being queued locally and will sync when the connection restores. Auto-retrying every 30s.',
         {}
       );
       startSaveBlockedRetryLoop();
@@ -2901,7 +2969,7 @@ async function init(){
     window.__vfLoadFailed = true;
     console.error('[init] vf_orders load threw', e);
     showSaveBlockedBanner(
-      '⚠ Couldn\'t load orders (' + (e.message || 'parse error') + ') — the schedule is READ-ONLY until the connection is restored. Auto-retrying every 30s.',
+      '⚠ Couldn\'t load orders (' + (e.message || 'parse error') + ') — edits are being queued locally and will sync when the connection restores. Auto-retrying every 30s.',
       {}
     );
     startSaveBlockedRetryLoop();
@@ -2933,33 +3001,83 @@ async function init(){
   window.addEventListener('vf-supply-settings-updated', () => { loadKgPerUnitOverrides(); });
 }
 
+// Pending-edits sessionStorage safety net.
+//
+// When persist() can't reach the server (load-failed, or serverPut errors
+// mid-session), we stash the current orders + collapsed snapshot in
+// sessionStorage under this key. Two ways it flushes:
+//   1. retryInit() sees the connection is back → push stash to server.
+//   2. Next successful init() sees a stash from a prior tab session →
+//      prompt the user to sync or discard.
+// Prevents the "27-hour silent data loss" pattern from 2026-09-14/16.
+const PENDING_KEY = 'vf_pending_edits_v1';
+
+function stashPending(ordersSnap, collapsedSnap, note){
+  try{
+    sessionStorage.setItem(PENDING_KEY, JSON.stringify({
+      orders: ordersSnap,
+      collapsed: collapsedSnap,
+      stashedAt: new Date().toISOString(),
+      note: note || null,
+    }));
+  }catch(e){
+    console.error('[stashPending] sessionStorage write failed', e);
+  }
+}
+function readPending(){
+  try{
+    const raw = sessionStorage.getItem(PENDING_KEY);
+    return raw ? JSON.parse(raw) : null;
+  }catch(e){ return null; }
+}
+function clearPending(){
+  try{ sessionStorage.removeItem(PENDING_KEY); }catch(e){}
+}
+function updatePendingIndicator(){
+  const ind = document.getElementById('save-ind');
+  if (!ind) return;
+  const p = readPending();
+  if (p) {
+    ind.textContent = '⏳ ' + (Array.isArray(p.orders) ? p.orders.length : 0) + ' orders queued — waiting for server';
+    ind.style.opacity = '1';
+    ind.style.color = 'var(--vf-warning-text)';
+  } else {
+    ind.style.color = '';
+  }
+}
+
 async function persist(source){
-  // Refuse to overwrite the server when the initial load failed — otherwise
-  // we'd push a stale/empty `orders` array on top of live data. This is the
-  // failsafe for the May 2026 wipe scenario (init() couldn't fetch during a
-  // brief redeploy and would have written SEED on top of 130+ live orders).
+  const ind = document.getElementById('save-ind');
+  // When the initial load failed, we do NOT touch the server (avoid the
+  // May 2026 SEED-wipe). But — new since 2026-09-16 — we stash edits
+  // locally so they aren't silently lost. retryInit() flushes on recovery.
   if (window.__vfLoadFailed) {
-    console.warn('[persist] skipped — initial load failed; will not overwrite server data. Refresh the page.');
-    const ind=document.getElementById('save-ind');
-    if (ind) { ind.textContent='⚠ Save blocked — refresh page'; ind.style.opacity='1'; setTimeout(()=>{ind.style.opacity='0';},4000); }
+    stashPending(orders, collapsed, 'load-failed');
+    updatePendingIndicator();
     return;
   }
-  const ind=document.getElementById('save-ind');
-  ind.textContent='Saving…';ind.style.opacity='1';
+  if (ind) { ind.textContent = 'Saving…'; ind.style.opacity = '1'; ind.style.color = ''; }
   try{
-    const ok1=await serverPut('vf_orders',orders,source?{source}:null);
-    const ok2=await serverPut('vf_collapsed',collapsed);
-    if(!ok1||!ok2){
-      if(window.storage){
-        await window.storage.set('vf_orders',JSON.stringify(orders));
-        await window.storage.set('vf_collapsed',JSON.stringify(collapsed));
-      }else{
-        localStorage.setItem('vf_orders',JSON.stringify(orders));
-        localStorage.setItem('vf_collapsed',JSON.stringify(collapsed));
+    const ok1 = await serverPut('vf_orders', orders, source ? {source} : null);
+    const ok2 = await serverPut('vf_collapsed', collapsed);
+    if (!ok1 || !ok2) {
+      // Server put failed mid-session (network blip, 5xx). Stash so the
+      // next successful save or retryInit picks these edits back up.
+      stashPending(orders, collapsed, 'put-failed');
+      updatePendingIndicator();
+    } else {
+      // Save succeeded — clear any leftover stash from prior failed puts.
+      clearPending();
+      if (ind) {
+        ind.style.color = '';
+        ind.textContent = 'Saved ✓';
+        setTimeout(() => { ind.style.opacity = '0'; }, 2000);
       }
     }
-    ind.textContent='Saved ✓';setTimeout(()=>{ind.style.opacity='0';},2000);
-  }catch(e){ind.textContent='Save failed';setTimeout(()=>{ind.style.opacity='0';},3000);}
+  }catch(e){
+    stashPending(orders, collapsed, 'exception:' + (e.message || 'unknown'));
+    updatePendingIndicator();
+  }
 }
 
 function esc(s){if(!s)return '';return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
