@@ -281,9 +281,38 @@ app.get("/api/data/:key", (req, res) => {
   res.json({ exists: true, value: data });
 });
 
+// Role requirements for writes to /api/data/:key. Any key not listed here
+// falls through to "authenticated user is fine" (e.g. vf_collapsed — a UI
+// preference blob that all roles legitimately update). Added 2026-09-16
+// after a viewer-role session was seen in the audit log triggering
+// auto-promote writes because there was NO role check on this endpoint —
+// UI hides edit affordances for viewers, but their browser can still fire
+// persist() (e.g. when auto-promote runs client-side on their tab). Fix
+// is defense-in-depth: block the write server-side.
+const KEY_ROLE_REQUIREMENTS = {
+  "vf_orders": "orderEdit", // admin or operator
+  "vf_users":  "admin",     // admin only
+};
+
+function userHasRole(userId, requirement) {
+  const users = readData("vf_users") || [];
+  const u = users.find(x => x && x.id === userId);
+  if (!u) return false;
+  if (requirement === "admin")     return u.role === "admin";
+  if (requirement === "orderEdit") return u.role === "admin" || u.role === "operator";
+  return true;
+}
+
 // PUT data by key
 app.put("/api/data/:key", (req, res) => {
   const key = req.params.key.replace(/[^a-z0-9_-]/gi, "");
+  const requirement = KEY_ROLE_REQUIREMENTS[key];
+  if (requirement && !userHasRole(req.userId, requirement)) {
+    return res.status(403).json({
+      ok: false,
+      error: "Your role is not authorized to write to '" + key + "'. Ask an admin.",
+    });
+  }
   try {
     // Audit: when vf_orders is updated, diff old vs new and append per-change
     // entries to vf_audit_log. Other keys are written through unchanged.

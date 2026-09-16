@@ -3057,8 +3057,17 @@ async function persist(source){
     return;
   }
   if (ind) { ind.textContent = 'Saving…'; ind.style.opacity = '1'; ind.style.color = ''; }
+  // Role-aware: viewer / planner roles can toggle vf_collapsed (their UI
+  // preference) but the server now 403s them on vf_orders. Skip the
+  // vf_orders write entirely for read-only roles so they don't queue
+  // forever in sessionStorage on a permission failure that will never
+  // resolve. Their in-memory orders array stays in sync with server on
+  // the next reload anyway.
+  const isEditor = canEditOrders();
   try{
-    const ok1 = await serverPut('vf_orders', orders, source ? {source} : null);
+    const ok1 = isEditor
+      ? await serverPut('vf_orders', orders, source ? {source} : null)
+      : true;
     const ok2 = await serverPut('vf_collapsed', collapsed);
     if (!ok1 || !ok2) {
       // Server put failed mid-session (network blip, 5xx). Stash so the
@@ -3187,7 +3196,15 @@ async function loadInventoryCompletion(){
       }
     });
     if(promoted > 0){
-      await persist('auto-promote');
+      // Only write if this session is allowed to. Viewer / planner roles
+      // would 403 on the server-side gate now that /api/data/vf_orders
+      // enforces order-edit. Without this guard, a viewer's browser
+      // would stash the auto-promoted state forever, never syncing.
+      // (Skipping the write is fine — auto-promote is idempotent; an
+      // editor's tab will re-derive the same completion state next time.)
+      if (canEditOrders()) {
+        await persist('auto-promote');
+      }
       if(typeof render === 'function') render();
       if(typeof renderCal === 'function') renderCal();
       console.log(`[auto-promote] ${promoted} order(s) promoted to complete based on uploaded inventory data.`);
