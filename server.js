@@ -4413,6 +4413,9 @@ app.get("/api/error-reporting/zero-out-mo-bom", (req, res) => {
     });
   }
 
+  const dismissedBlob = readData("production_run_errors_dismissed") || { dismissed: {} };
+  const dismissed = dismissedBlob.dismissed || {};
+
   res.json({
     ok: true,
     lastSync: blob.lastSync || null,
@@ -4426,7 +4429,46 @@ app.get("/api/error-reporting/zero-out-mo-bom", (req, res) => {
     flaggedMassBalanceCount: blob.flaggedMassBalanceCount || (Array.isArray(blob.flaggedMassBalance) ? blob.flaggedMassBalance.length : 0),
     flagged: blob.flagged,
     flaggedMassBalance: Array.isArray(blob.flaggedMassBalance) ? blob.flaggedMassBalance : [],
+    // Dismissed keyed by MO ref (e.g. "MO-00987/3"). Client filters these
+    // out of the main lists by default and shows them under a "Dismissed"
+    // toggle so ops can still audit what was cleared and by whom.
+    dismissed,
   });
+});
+
+// POST /api/error-reporting/dismiss — mark one MO's flags as reviewed so
+// they drop off the main list. Admin or operator only (viewers already
+// can't reach the tab). Body: { moRef, note? }. Idempotent — re-dismissing
+// the same moRef just updates the timestamp + actor.
+app.post("/api/error-reporting/dismiss", requireOrderEdit, (req, res) => {
+  const moRef = String((req.body && req.body.moRef) || "").trim();
+  const note = String((req.body && req.body.note) || "").trim().slice(0, 500);
+  if (!moRef) return res.status(400).json({ ok: false, error: "moRef required" });
+  const users = readData("vf_users") || [];
+  const u = users.find(x => x && x.id === req.userId);
+  const blob = readData("production_run_errors_dismissed") || { dismissed: {} };
+  if (!blob.dismissed) blob.dismissed = {};
+  blob.dismissed[moRef] = {
+    at: new Date().toISOString(),
+    userId: req.userId || null,
+    userName: u ? u.username : "(unknown)",
+    note: note || null,
+  };
+  writeData("production_run_errors_dismissed", blob);
+  res.json({ ok: true, moRef, entry: blob.dismissed[moRef] });
+});
+
+// POST /api/error-reporting/undismiss — restore a previously-dismissed MO
+// back onto the main list. Admin or operator only.
+app.post("/api/error-reporting/undismiss", requireOrderEdit, (req, res) => {
+  const moRef = String((req.body && req.body.moRef) || "").trim();
+  if (!moRef) return res.status(400).json({ ok: false, error: "moRef required" });
+  const blob = readData("production_run_errors_dismissed") || { dismissed: {} };
+  if (blob.dismissed && blob.dismissed[moRef]) {
+    delete blob.dismissed[moRef];
+    writeData("production_run_errors_dismissed", blob);
+  }
+  res.json({ ok: true, moRef });
 });
 
 // ── Production Output: trailing-7-day "what did we produce" feed ────────────

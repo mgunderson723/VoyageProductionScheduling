@@ -7230,6 +7230,57 @@ function renderLiveInventory() {
 // 'all' shows both sections; 'zero' hides mass-balance; 'mb' hides
 // zero-actual. Click an active chip again to return to 'all'.
 let _errRepFilter = 'all';
+// Dismissed-visibility toggle. Dismissed cards drop off the main list
+// by default (so ops sees only the current open items), but the
+// operator can click "Show dismissed" to review or restore them.
+let _errRepShowDismissed = false;
+// Full fetched payload so dismiss/restore/toggle can re-render without
+// hitting the server again.
+let _errRepData = null;
+
+async function dismissErrRepRun(moRef) {
+  if (!moRef) return;
+  try {
+    const r = await fetch('/api/error-reporting/dismiss', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ moRef }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    if (_errRepData) {
+      _errRepData.dismissed = _errRepData.dismissed || {};
+      _errRepData.dismissed[moRef] = j.entry;
+      renderErrorReporting();
+    }
+  } catch (e) {
+    alert('Dismiss failed: ' + e.message);
+  }
+}
+
+async function restoreErrRepRun(moRef) {
+  if (!moRef) return;
+  try {
+    const r = await fetch('/api/error-reporting/undismiss', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ moRef }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    if (_errRepData && _errRepData.dismissed) {
+      delete _errRepData.dismissed[moRef];
+      renderErrorReporting();
+    }
+  } catch (e) {
+    alert('Restore failed: ' + e.message);
+  }
+}
+
+function toggleErrRepDismissed() {
+  _errRepShowDismissed = !_errRepShowDismissed;
+  renderErrorReporting();
+}
 
 function setErrRepFilter(f) {
   _errRepFilter = (_errRepFilter === f) ? 'all' : f;
@@ -7260,7 +7311,6 @@ function applyErrRepFilter() {
 }
 
 async function loadErrorReporting() {
-  const meta = document.getElementById('err-rep-meta');
   const content = document.getElementById('err-rep-content');
   content.innerHTML = '<div style="padding:20px;color:var(--vf-text-tertiary);font-size:13px;">Loading…</div>';
   let d;
@@ -7275,6 +7325,18 @@ async function loadErrorReporting() {
   }
   // Fresh load — filter defaults back to showing everything.
   _errRepFilter = 'all';
+  _errRepShowDismissed = false;
+  _errRepData = d;
+  renderErrorReporting();
+}
+
+function renderErrorReporting() {
+  const meta = document.getElementById('err-rep-meta');
+  const content = document.getElementById('err-rep-content');
+  const d = _errRepData;
+  if (!d) return;
+  const dismissed = d.dismissed || {};
+  const isDismissed = moRef => !!dismissed[moRef];
 
   // Header meta
   if (d.lastSync) {
@@ -7286,34 +7348,57 @@ async function loadErrorReporting() {
     meta.textContent = 'No production-run data yet — click Sync now or wait for the 07:00 UTC cron';
   }
 
-  const mb = Array.isArray(d.flaggedMassBalance) ? d.flaggedMassBalance : [];
-  const zeroActualCount = (d.flagged || []).length;
+  const mbAll = Array.isArray(d.flaggedMassBalance) ? d.flaggedMassBalance : [];
+  const flaggedAll = Array.isArray(d.flagged) ? d.flagged : [];
+  const zeroActive = flaggedAll.filter(g => !isDismissed(g.moRef));
+  const zeroDismissed = flaggedAll.filter(g => isDismissed(g.moRef));
+  const mbActive = mbAll.filter(g => !isDismissed(g.moRef));
+  const mbDismissed = mbAll.filter(g => isDismissed(g.moRef));
+  const totalDismissed = zeroDismissed.length + mbDismissed.length;
+  // Recompute zero-actual line count from the ACTIVE (non-dismissed) set
+  // so the chip stays honest — dismissing a run should reduce the count.
+  const zeroActiveLineCount = zeroActive.reduce((s, g) => s + (g.flagged ? g.flagged.length : 0), 0);
+  const mb = mbActive; // aliased for the rest of the function which used `mb`
+  const zeroActualCount = zeroActive.length;
 
-  if (zeroActualCount === 0 && mb.length === 0) {
+  if (zeroActive.length === 0 && mbActive.length === 0 && totalDismissed === 0) {
     content.innerHTML = `<div style="padding:16px;background:var(--vf-success-soft);border:1px solid var(--vf-success-base);border-radius:var(--vf-radius-sm);color:var(--vf-success-text);font-size:13px;">✓ No zero-utilization BOM inputs or output-exceeds-input runs detected in the trailing 7 days of completed production runs.</div>`;
+    return;
+  }
+  // All-dismissed edge case: everything's dismissed → show a hint pointing at the toggle.
+  if (zeroActive.length === 0 && mbActive.length === 0 && totalDismissed > 0 && !_errRepShowDismissed) {
+    content.innerHTML = `<div style="padding:16px;background:var(--vf-success-soft);border:1px solid var(--vf-success-base);border-radius:var(--vf-radius-sm);color:var(--vf-success-text);font-size:13px;">✓ No open flags — all ${totalDismissed} flagged run${totalDismissed === 1 ? ' is' : 's are'} dismissed. <a href="#" onclick="event.preventDefault();toggleErrRepDismissed();" style="color:var(--vf-info-text);">Show dismissed</a>.</div>`;
     return;
   }
 
   // Summary strip — chips are clickable filters. Click one to isolate that
   // section, click the active one again to return to showing everything.
   // data-kind ties each chip to its section id for applyErrRepFilter().
+  // Counts reflect the ACTIVE (non-dismissed) sets — dismissing a run drops
+  // it out of both the count and the section.
+  const dismissedChip = totalDismissed > 0
+    ? `<span style="padding:8px 12px;background:var(--vf-surface-sunken);color:var(--vf-text-secondary);border-radius:var(--vf-radius-sm);font-size:12px;cursor:pointer;user-select:none;border:1px solid var(--vf-border-default);" onclick="toggleErrRepDismissed()" title="${_errRepShowDismissed ? 'Hide' : 'Show'} dismissed items">
+         <strong>${totalDismissed}</strong> dismissed · ${_errRepShowDismissed ? 'hide' : 'show'}
+       </span>`
+    : '';
   const summary = `
     <div style="display:flex;gap:var(--vf-space-3);margin-bottom:var(--vf-space-3);flex-wrap:wrap;align-items:center;">
       <div class="err-rep-chip" data-kind="zero" onclick="setErrRepFilter('zero')" title="Show only zero-actual runs" style="padding:8px 12px;background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:12px;color:var(--vf-danger-text);cursor:pointer;transition:opacity 0.1s;user-select:none;">
-        <strong>${d.flaggedRunCount}</strong> zero-actual run${d.flaggedRunCount === 1 ? '' : 's'}
+        <strong>${zeroActive.length}</strong> zero-actual run${zeroActive.length === 1 ? '' : 's'}
       </div>
       <div class="err-rep-chip" data-kind="zero" onclick="setErrRepFilter('zero')" title="Show only zero-actual runs" style="padding:8px 12px;background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:12px;color:var(--vf-danger-text);cursor:pointer;transition:opacity 0.1s;user-select:none;">
-        <strong>${d.flaggedLineCount}</strong> zero-actual BOM line${d.flaggedLineCount === 1 ? '' : 's'}
+        <strong>${zeroActiveLineCount}</strong> zero-actual BOM line${zeroActiveLineCount === 1 ? '' : 's'}
       </div>
       <div class="err-rep-chip" data-kind="mb" onclick="setErrRepFilter('mb')" title="Show only output-exceeds-input runs" style="padding:8px 12px;background:var(--vf-warning-soft);border-radius:var(--vf-radius-sm);font-size:12px;color:var(--vf-warning-text);cursor:pointer;transition:opacity 0.1s;user-select:none;">
-        <strong>${mb.length}</strong> output &gt; input run${mb.length === 1 ? '' : 's'}
+        <strong>${mbActive.length}</strong> output &gt; input run${mbActive.length === 1 ? '' : 's'}
       </div>
+      ${dismissedChip}
       <span id="err-rep-filter-hint" style="font-size:11px;color:var(--vf-text-tertiary);">Click a chip to filter · click again to clear</span>
     </div>`;
 
   const fmtQty = q => (q == null || q === '') ? '—' : Number(q).toLocaleString(undefined, { maximumFractionDigits: 2 });
 
-  const cards = (d.flagged || []).map(g => {
+  const renderZeroCard = (g, isDismissedCard) => {
     const renderRow = (l, flagged) => `
       <tr${flagged ? ' style="background:var(--vf-danger-soft);"' : ''}>
         <td><span class="mo-id">${escapeHtml(l.sku || '')}</span></td>
@@ -7330,16 +7415,30 @@ async function loadErrorReporting() {
     const fgLabel = (g.fgSKU || g.fgProduct)
       ? `<span style="font-size:11px;color:var(--vf-text-secondary);">${escapeHtml(g.fgSKU || '')}${g.fgProduct ? ' · ' + escapeHtml(g.fgProduct) : ''}</span>`
       : '';
+    const dInfo = isDismissedCard ? dismissed[g.moRef] : null;
+    const actionBtn = isDismissedCard
+      ? `<button class="btn btn-sm" onclick="restoreErrRepRun('${escapeHtml(g.moRef)}')" style="padding:2px 10px;font-size:11px;">↺ Restore</button>`
+      : `<button class="btn btn-sm" onclick="dismissErrRepRun('${escapeHtml(g.moRef)}')" style="padding:2px 10px;font-size:11px;">✓ Dismiss</button>`;
+    const dInfoLine = dInfo
+      ? `<div style="font-size:11px;color:var(--vf-text-tertiary);padding:6px 14px;background:var(--vf-surface-sunken);">Dismissed by ${escapeHtml(dInfo.userName || '(unknown)')} on ${escapeHtml((dInfo.at || '').slice(0, 10))}${dInfo.note ? ' · "' + escapeHtml(dInfo.note) + '"' : ''}</div>`
+      : '';
+    const cardStyle = isDismissedCard
+      ? 'margin-bottom:var(--vf-space-3);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);overflow:hidden;opacity:0.75;'
+      : 'margin-bottom:var(--vf-space-3);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);overflow:hidden;';
     return `
-      <div style="margin-bottom:var(--vf-space-3);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);overflow:hidden;">
+      <div style="${cardStyle}">
         <div style="padding:10px 14px;background:var(--vf-surface-raised);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
           <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
             <strong style="font-size:14px;color:var(--vf-text-primary);">${escapeHtml(g.moRef || '')}</strong>
             <span style="font-size:11px;padding:2px 8px;background:var(--vf-danger-soft);color:var(--vf-danger-text);border-radius:10px;">${g.flagged.length} flagged</span>
             ${fgLabel}
           </div>
-          <span style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(g.completionDate || '—')}</span>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(g.completionDate || '—')}</span>
+            ${actionBtn}
+          </div>
         </div>
+        ${dInfoLine}
         <table class="status-table" style="margin:0;">
           <thead>
             <tr>
@@ -7356,14 +7455,14 @@ async function loadErrorReporting() {
           <tbody>${flaggedRows}${siblingRows}</tbody>
         </table>
       </div>`;
-  }).join('');
+  };
+  const cards = zeroActive.map(g => renderZeroCard(g, false)).join('');
 
   // Mass-balance section: runs where kg output > kg input actuals. Distinct
   // audit signal from zero-actuals — the operator entered non-zero numbers
   // on every line but the aggregate still comes up short.
   let mbSection = '';
-  if (mb.length > 0) {
-    const mbCards = mb.map(g => {
+  const renderMbCard = (g, isDismissedCard) => {
       const inputRows = (g.kgInputs || []).map(l => `
         <tr>
           <td><span class="mo-id">${escapeHtml(l.sku || '')}</span></td>
@@ -7385,16 +7484,30 @@ async function loadErrorReporting() {
       const fgLabel = (g.fgSKU || g.fgProduct)
         ? `<span style="font-size:11px;color:var(--vf-text-secondary);">${escapeHtml(g.fgSKU || '')}${g.fgProduct ? ' · ' + escapeHtml(g.fgProduct) : ''}</span>`
         : '';
+      const dInfo = isDismissedCard ? dismissed[g.moRef] : null;
+      const actionBtn = isDismissedCard
+        ? `<button class="btn btn-sm" onclick="restoreErrRepRun('${escapeHtml(g.moRef)}')" style="padding:2px 10px;font-size:11px;">↺ Restore</button>`
+        : `<button class="btn btn-sm" onclick="dismissErrRepRun('${escapeHtml(g.moRef)}')" style="padding:2px 10px;font-size:11px;">✓ Dismiss</button>`;
+      const dInfoLine = dInfo
+        ? `<div style="font-size:11px;color:var(--vf-text-tertiary);padding:6px 14px;background:var(--vf-surface-sunken);">Dismissed by ${escapeHtml(dInfo.userName || '(unknown)')} on ${escapeHtml((dInfo.at || '').slice(0, 10))}${dInfo.note ? ' · "' + escapeHtml(dInfo.note) + '"' : ''}</div>`
+        : '';
+      const cardStyle = isDismissedCard
+        ? 'margin-bottom:var(--vf-space-3);border:1px solid var(--vf-warning-base);border-radius:var(--vf-radius-sm);overflow:hidden;opacity:0.75;'
+        : 'margin-bottom:var(--vf-space-3);border:1px solid var(--vf-warning-base);border-radius:var(--vf-radius-sm);overflow:hidden;';
       return `
-        <div style="margin-bottom:var(--vf-space-3);border:1px solid var(--vf-warning-base);border-radius:var(--vf-radius-sm);overflow:hidden;">
+        <div style="${cardStyle}">
           <div style="padding:10px 14px;background:var(--vf-surface-raised);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
             <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
               <strong style="font-size:14px;color:var(--vf-text-primary);">${escapeHtml(g.moRef || '')}</strong>
               <span style="font-size:11px;padding:2px 8px;background:var(--vf-warning-soft);color:var(--vf-warning-text);border-radius:10px;">output ${fmtQty(g.outputMassKg)} kg &gt; input ${fmtQty(g.inputMassKg)} kg · deficit ${fmtQty(g.deficitKg)} kg · yield ${(g.yieldPct != null ? g.yieldPct.toFixed(1) : '—')}%</span>
               ${fgLabel}
             </div>
-            <span style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(g.completionDate || '—')}</span>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span style="font-size:11px;color:var(--vf-text-tertiary);">${escapeHtml(g.completionDate || '—')}</span>
+              ${actionBtn}
+            </div>
           </div>
+          ${dInfoLine}
           <table class="status-table" style="margin:0;">
             <thead>
               <tr>
@@ -7409,7 +7522,9 @@ async function loadErrorReporting() {
             <tbody>${outputRows2}${inputRows}</tbody>
           </table>
         </div>`;
-    }).join('');
+  };
+  if (mbActive.length > 0) {
+    const mbCards = mbActive.map(g => renderMbCard(g, false)).join('');
     mbSection = `
       <div id="err-rep-mb-section">
         <div style="margin-top:var(--vf-space-4);margin-bottom:var(--vf-space-2);font-size:13px;font-weight:600;color:var(--vf-text-primary);">
@@ -7438,7 +7553,27 @@ async function loadErrorReporting() {
       </div>`;
   }
 
-  content.innerHTML = summary + zaSection + mbSection;
+  // Dismissed section — only rendered when the operator has clicked the
+  // "N dismissed · show" chip. Each dismissed card carries a Restore
+  // button + a caption showing who dismissed it and when.
+  let dismissedSection = '';
+  if (_errRepShowDismissed && totalDismissed > 0) {
+    const dismissedZeroCards = zeroDismissed.map(g => renderZeroCard(g, true)).join('');
+    const dismissedMbCards = mbDismissed.map(g => renderMbCard(g, true)).join('');
+    dismissedSection = `
+      <div id="err-rep-dismissed-section" style="margin-top:var(--vf-space-5);">
+        <div style="margin-bottom:var(--vf-space-2);font-size:13px;font-weight:600;color:var(--vf-text-primary);">
+          Dismissed (${totalDismissed})
+        </div>
+        <div style="margin-bottom:var(--vf-space-3);font-size:11px;color:var(--vf-text-tertiary);">
+          These runs were cleared by an operator so they wouldn't clutter the main list. Click Restore to bring one back.
+        </div>
+        ${dismissedZeroCards}
+        ${dismissedMbCards}
+      </div>`;
+  }
+
+  content.innerHTML = summary + zaSection + mbSection + dismissedSection;
   applyErrRepFilter();
 }
 
