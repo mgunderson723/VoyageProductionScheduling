@@ -5,9 +5,11 @@
 const Dims = require("./public/dims-engine");
 const seed = require("./lib/dims-seed.json");
 
+// Quantities in these tests are unit counts (cases / drums) unless a test
+// passes qtyMode: "kg".
 const run = (packId, quantity, overrides = {}) => {
   const d = Dims.defaultsFor(seed, packId, overrides.palletId);
-  return Dims.calculate(seed, Object.assign({ packId, quantity }, d, overrides));
+  return Dims.calculate(seed, Object.assign({ packId, quantity }, d, { qtyMode: "units" }, overrides));
 };
 
 describe("DIMs seed config", () => {
@@ -61,6 +63,46 @@ describe("Validation loads", () => {
     expect(Math.abs(r.doubleStack.maxHeightIn - 79)).toBeLessThan(1);
     expect(r.doubleStack.measuredHeightIn).toBe(79);
     expect(r.overhangIn).toBeCloseTo(1.3, 5);
+  });
+});
+
+describe("Quantity entered in kg", () => {
+  it("defaults to kg for every pack except PFS, which is entered in cases", () => {
+    expect(Dims.defaultsFor(seed, "cfc_bib_10kg").qtyMode).toBe("kg");
+    expect(Dims.defaultsFor(seed, "cfc_box_25kg").qtyMode).toBe("kg");
+    expect(Dims.defaultsFor(seed, "drum_55gal").qtyMode).toBe("kg");
+    expect(Dims.defaultsFor(seed, "pfs_case").qtyMode).toBe("units");
+  });
+
+  it("800 kg of CFC is exactly 80 cases and the 853.05 kg validation pallet", () => {
+    const r = run("cfc_bib_10kg", 800, { qtyMode: "kg" });
+    expect(r.quantity).toBe(80);
+    expect(r.conversion.roundedUp).toBe(false);
+    expect(r.totals.grossKg).toBeCloseTo(853.05, 2);
+  });
+
+  it("rounds a part-filled unit up", () => {
+    const r = run("cfc_bib_10kg", 805, { qtyMode: "kg" });
+    expect(r.quantity).toBe(81);
+    expect(r.conversion.unitsExact).toBeCloseTo(80.5, 6);
+    expect(r.conversion.roundedUp).toBe(true);
+  });
+
+  it("doesn't add a unit through floating-point noise on lb-denominated nets", () => {
+    const kg = 54 * 18.75 * Dims.LB_TO_KG; // 54 PFS cases expressed in kg
+    const r = run("pfs_case", kg, { qtyMode: "kg" });
+    expect(r.quantity).toBe(54);
+    expect(r.conversion.roundedUp).toBe(false);
+  });
+
+  it("1,575 kg of liquor is 7 drums", () => {
+    expect(run("drum_55gal", 1575, { qtyMode: "kg" }).quantity).toBe(7);
+  });
+
+  it("rejects a zero or blank kg quantity", () => {
+    const r = run("cfc_bib_10kg", 0, { qtyMode: "kg" });
+    expect(r.ok).toBe(false);
+    expect(r.errors.join(" ")).toMatch(/quantity in kg/);
   });
 });
 

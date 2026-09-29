@@ -66,11 +66,29 @@
       bulgeIn: toIn(pack.bulgePerLayer) || 0,
       doubleStack: false,
       units: pallet && pallet.defaultUnits === "imperial" ? "imperial" : "metric",
+      qtyMode: qtyModeFor(pack),
     };
   }
 
-  // input: { packId, quantity, palletId, perLayer, layers, slipSheets,
-  //          bulgeIn, doubleStack, containerId }
+  // How the quantity is entered by default: kg of net product (most packs —
+  // production asks are in kg) or whole units (e.g. PFS, counted in cases).
+  function qtyModeFor(pack) {
+    return pack && pack.qtyEntry === "units" ? "units" : "kg";
+  }
+
+  // Whole units needed to hold `kg` of net product. Rounds up (a part-filled
+  // unit still ships), with a small tolerance so lb-denominated nets don't turn
+  // an exact 54 cases into 55 through floating-point noise.
+  function unitsForKg(kg, netKgPerUnit) {
+    const exact = kg / netKgPerUnit;
+    const units = Math.max(1, Math.ceil(exact - 1e-9));
+    return { exact, units, roundedUp: units - exact > 1e-6 };
+  }
+
+  // input: { packId, quantity, qtyMode: "units"|"kg", palletId, perLayer,
+  //          layers, slipSheets, bulgeIn, doubleStack, containerId }
+  // With qtyMode "kg", quantity is kg of net product and is converted to
+  // whole units first.
   function calculate(config, input) {
     const errors = [];
     const warnings = [];
@@ -84,15 +102,27 @@
     const pallet = byId(config.pallets, input.palletId);
     const unitWord = pack.unitName || "unit";
 
-    const qty = Number(input.quantity);
-    if (!Number.isInteger(qty) || qty < 1) errors.push("Enter a whole number of " + plural(unitWord) + " (1 or more).");
+    const netKg = toKg(pack.net);
+    let qty = null;
+    let conversion = null;
+    if (input.qtyMode === "kg") {
+      const kg = Number(input.quantity);
+      if (!(kg > 0) || !isFinite(kg)) errors.push("Enter a quantity in kg above 0.");
+      else if (netKg) {
+        const c = unitsForKg(kg, netKg);
+        qty = c.units;
+        conversion = { enteredKg: kg, netKgPerUnit: netKg, unitsExact: c.exact, units: c.units, roundedUp: c.roundedUp };
+      }
+    } else {
+      qty = Number(input.quantity);
+      if (!Number.isInteger(qty) || qty < 1) errors.push("Enter a whole number of " + plural(unitWord) + " (1 or more).");
+    }
     if (!pallet) errors.push("Pick a pallet type.");
     const perLayer = posInt(input.perLayer);
     const layers = posInt(input.layers);
     if (!perLayer) errors.push(pack.label + ": " + plural(unitWord) + " per layer not set for this pallet.");
     if (!layers) errors.push(pack.label + ": layers per pallet not set for this pallet.");
 
-    const netKg = toKg(pack.net);
     const tareKg = toKg(pack.tare);
     const unitH = toIn(pack.H);
     if (netKg == null) errors.push(pack.label + ": net weight per " + unitWord + " not on file.");
@@ -271,7 +301,7 @@
 
     return {
       ok: true, errors, warnings, estimates,
-      pack, pallet, unitWord,
+      pack, pallet, unitWord, quantity: qty, conversion,
       unitsPerPallet, fullPallets,
       partial: remainder ? { units: remainder, layers: partialLayers } : null,
       palletCount, floorPositions, groups, rows, doubleStack, totals, container,
@@ -360,6 +390,7 @@
       if (!p || !p.id) return;
       const w = "Pack " + p.id;
       if (p.shape && ["box", "cylinder"].indexOf(p.shape) === -1) problems.push(w + ": shape must be box or cylinder.");
+      if (p.qtyEntry && ["kg", "units"].indexOf(p.qtyEntry) === -1) problems.push(w + ": default quantity entry must be kg or units.");
       ["L", "W", "H", "dia", "bulgePerLayer"].forEach(f => measure(p[f], w + " " + f, LENGTH_UNITS));
       ["net", "tare"].forEach(f => measure(p[f], w + " " + f, WEIGHT_UNITS));
       if (p.liner && !ids.components.has(p.liner)) problems.push(w + ": liner \"" + p.liner + "\" is not a configured component.");
@@ -389,6 +420,7 @@
 
   return {
     LB_TO_KG, IN_TO_MM, LENGTH_UNITS, WEIGHT_UNITS, PACKING_COLUMNS,
-    toIn, toKg, has, round, plural, footprintKey, patternFor, defaultsFor, calculate, packingList, validateConfig,
+    toIn, toKg, has, round, plural, footprintKey, patternFor, defaultsFor, qtyModeFor, unitsForKg,
+    calculate, packingList, validateConfig,
   };
 });

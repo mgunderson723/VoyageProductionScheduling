@@ -1602,7 +1602,14 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
           </div>
           <div class="field">
             <label for="dims-qty" id="dims-qty-label">Quantity</label>
-            <input id="dims-qty" type="number" min="1" step="1" placeholder="e.g. 80" oninput="runDims()">
+            <div style="display:flex;gap:6px;align-items:center;">
+              <input id="dims-qty" type="number" min="0" step="any" placeholder="e.g. 1000" oninput="runDims()" style="flex:1;min-width:0;">
+              <div class="dims-seg" style="flex-shrink:0;">
+                <button type="button" id="dims-qm-kg" onclick="setDimsQtyMode('kg')" style="height:30px;">kg</button>
+                <button type="button" id="dims-qm-units" onclick="setDimsQtyMode('units')" style="height:30px;">Cases</button>
+              </div>
+            </div>
+            <div class="dims-sub" id="dims-qty-conv"></div>
           </div>
           <div class="field">
             <label for="dims-pallet">Pallet</label>
@@ -7750,6 +7757,8 @@ let dimsMeta = { updatedAt: null, updatedBy: null, seeded: false };
 let dimsSection = 'calc';
 let dimsUnits = 'metric';
 let dimsUnitsTouched = false;
+let dimsQtyMode = 'kg';        // 'kg' of net product, or 'units' (cases/drums/…)
+let dimsPrevPackId = null;
 let dimsPackingTsv = '';
 let dimsEdit = null;
 
@@ -7839,13 +7848,45 @@ function applyDimsDefaults(palletId) {
     document.getElementById('dims-slip').checked = d.slipSheets;
     document.getElementById('dims-bulge').value = d.bulgeIn;
     document.getElementById('dims-ds').checked = false;
+    dimsQtyMode = d.qtyMode;
+    dimsPrevPackId = packId;
   }
   if (!dimsUnitsTouched) dimsUnits = d.units;
   updateDimsChrome();
   runDims();
 }
 
-function onDimsPackChange() { applyDimsDefaults(null); }
+// Re-express the typed quantity when the entry mode or pack changes, going
+// through kg of net product so "the same amount of product" carries over
+// (1,000 kg stays 1,000 kg; 54 PFS cases becomes 459.3 kg). Leaves the box
+// alone if a pack's net weight isn't on file.
+function convertDimsQty(oldPack, oldMode, newPack, newMode) {
+  const el = document.getElementById('dims-qty');
+  const v = Number(el.value);
+  if (el.value.trim() === '' || !(v > 0)) return;
+  const oldNet = oldPack ? DimsEngine.toKg(oldPack.net) : null;
+  const kg = oldMode === 'kg' ? v : (oldNet ? v * oldNet : null);
+  if (kg == null) return;
+  if (newMode === 'kg') { el.value = Math.round(kg * 10) / 10; return; }
+  const newNet = newPack ? DimsEngine.toKg(newPack.net) : null;
+  if (newNet) el.value = DimsEngine.unitsForKg(kg, newNet).units;
+}
+
+function onDimsPackChange() {
+  const oldPack = dimsById('packs', dimsPrevPackId);
+  const newPack = dimsById('packs', document.getElementById('dims-pack').value);
+  convertDimsQty(oldPack, dimsQtyMode, newPack, DimsEngine.qtyModeFor(newPack));
+  applyDimsDefaults(null);
+}
+
+function setDimsQtyMode(mode) {
+  if (mode === dimsQtyMode) return;
+  const pack = dimsById('packs', document.getElementById('dims-pack').value);
+  convertDimsQty(pack, dimsQtyMode, pack, mode);
+  dimsQtyMode = mode;
+  updateDimsChrome();
+  runDims();
+}
 function onDimsPalletChange() { applyDimsDefaults(document.getElementById('dims-pallet').value); }
 function onDimsPatternInput() { updateDimsChrome(); runDims(); }
 function setDimsUnits(u) { dimsUnits = u; dimsUnitsTouched = true; updateDimsChrome(); runDims(); }
@@ -7864,7 +7905,14 @@ function updateDimsChrome() {
   if (!dimsConfig) return;
   const pack = dimsById('packs', document.getElementById('dims-pack').value);
   const word = (pack && pack.unitName) || 'unit';
-  document.getElementById('dims-qty-label').textContent = `Quantity (${DimsEngine.plural(word)})`;
+  const kgMode = dimsQtyMode === 'kg';
+  document.getElementById('dims-qty-label').textContent = kgMode ? 'Quantity (kg of product)' : `Quantity (${DimsEngine.plural(word)})`;
+  document.getElementById('dims-qm-units').textContent = dimsCap(DimsEngine.plural(word));
+  document.getElementById('dims-qm-kg').classList.toggle('on', kgMode);
+  document.getElementById('dims-qm-units').classList.toggle('on', !kgMode);
+  const qtyEl = document.getElementById('dims-qty');
+  qtyEl.step = kgMode ? 'any' : '1';
+  qtyEl.placeholder = kgMode ? 'e.g. 1000' : 'e.g. 80';
   document.getElementById('dims-perlayer-label').textContent = `${dimsCap(DimsEngine.plural(word))} per layer`;
   const dsOk = !!(pack && pack.doubleStack && pack.doubleStack.allowed);
   document.getElementById('dims-ds-wrap').style.display = dsOk ? '' : 'none';
@@ -7889,6 +7937,7 @@ function readDimsInputs() {
   return {
     packId: v('dims-pack'),
     quantity: v('dims-qty').trim() === '' ? NaN : Number(v('dims-qty')),
+    qtyMode: dimsQtyMode,
     palletId: v('dims-pallet'),
     perLayer: v('dims-perlayer'),
     layers: v('dims-layers'),
@@ -7910,10 +7959,29 @@ const dimsDual = (fn, ...a) => `${fn(...a, dimsUnits)}<div class="dims-sub">${fn
 const dimsPlural = (n, w) => `${n} ${n === 1 ? w : DimsEngine.plural(w)}`;
 const dimsCap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
 
+// The line under the quantity box: how the typed amount maps to units / kg.
+function dimsConvText(pack, input) {
+  if (!pack) return '';
+  const netKg = DimsEngine.toKg(pack.net);
+  const word = pack.unitName || 'unit';
+  const v = Number(input.quantity);
+  if (!netKg || !(v > 0)) return '';
+  if (input.qtyMode === 'kg') {
+    const c = DimsEngine.unitsForKg(v, netKg);
+    const head = `${dimsNum(v, 1)} kg ÷ ${dimsNum(netKg, 2)} kg per ${escapeHtml(word)} = `;
+    return c.roundedUp
+      ? `${head}${dimsNum(c.exact, 2)} → <strong>${escapeHtml(dimsPlural(c.units, word))}</strong> (rounded up to ${dimsNum(c.units * netKg, 1)} kg)`
+      : `${head}<strong>${escapeHtml(dimsPlural(c.units, word))}</strong>`;
+  }
+  return `${escapeHtml(dimsPlural(v, word))} × ${dimsNum(netKg, 2)} kg = <strong>${dimsNum(v * netKg, 1)} kg</strong> of product`;
+}
+
 function runDims() {
   const out = document.getElementById('dims-results');
   if (!out || !dimsConfig) return;
   const input = readDimsInputs();
+  const conv = document.getElementById('dims-qty-conv');
+  if (conv) conv.innerHTML = isNaN(input.quantity) ? '' : dimsConvText(dimsById('packs', input.packId), input);
   if (isNaN(input.quantity)) {
     out.innerHTML = '<div class="dims-empty">Enter a quantity to see pallets, dims and gross weight.</div>';
     dimsPackingTsv = '';
@@ -8012,6 +8080,7 @@ const DIMS_FIELDS = {
     { k: 'id', label: 'ID', type: 'id', hint: 'Internal key; letters, digits, _ or -. Fixed once saved.' },
     { k: 'product', label: 'Product', type: 'text' },
     { k: 'unitName', label: 'Unit word', type: 'text', hint: 'case, drum, box, bag…' },
+    { k: 'qtyEntry', label: 'Default quantity entry', type: 'select', options: [['kg', 'kg of product'], ['units', 'Units (cases, drums…)']], hint: 'How the calculator asks for quantity; users can still switch.' },
     { k: 'shape', label: 'Shape', type: 'select', options: [['box', 'Box (L × W × H)'], ['cylinder', 'Drum / cylinder (diameter × H)']] },
     { k: 'L', label: 'Outside length', type: 'len', hint: 'Boxes' },
     { k: 'W', label: 'Outside width', type: 'len', hint: 'Boxes' },
@@ -8061,7 +8130,7 @@ const DIMS_FIELDS = {
 };
 
 const DIMS_BLANK = {
-  packs: () => ({ id: '', label: '', product: '', unitName: 'case', shape: 'box',
+  packs: () => ({ id: '', label: '', product: '', unitName: 'case', qtyEntry: 'kg', shape: 'box',
     L: { v: null, u: 'in' }, W: { v: null, u: 'in' }, H: { v: null, u: 'in' }, dia: { v: null, u: 'in' },
     net: { v: null, u: 'kg' }, tare: { v: null, u: 'kg' }, liner: null, defaultPallet: null, patterns: [],
     slipSheets: false, bulgePerLayer: { v: 0, u: 'in' },
@@ -8134,6 +8203,7 @@ function renderDimsRef() {
     const flags = [];
     const n = estCount(p);
     if (n) flags.push(`<span class="dims-est">${n} estimate${n === 1 ? '' : 's'}</span>`);
+    flags.push(`<div class="dims-sub">qty in ${p.qtyEntry === 'units' ? escapeHtml(DimsEngine.plural(p.unitName || 'unit')) : 'kg'}</div>`);
     if (p.doubleStack && p.doubleStack.allowed) flags.push('<div class="dims-sub">double-stack OK</div>');
     if (p.slipSheets) flags.push('<div class="dims-sub">slip sheets</div>');
     return `<tr><td><strong>${escapeHtml(p.label)}</strong>${note(p.source)}</td><td>${od}</td>
