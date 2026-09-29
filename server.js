@@ -1114,6 +1114,7 @@ function findAddOrderConflict(allOrders, input) {
   ) || null;
 }
 
+// Signed whole days from a to b (YYYY-MM-DD); negative when b is before a.
 function daysBetween(a, b) {
   const msPerDay = 86400000;
   return Math.floor((new Date(b + "T00:00:00Z") - new Date(a + "T00:00:00Z")) / msPerDay);
@@ -7162,13 +7163,15 @@ function computeLotIdleStats(idx, opts) {
   const results = [];
   for (const stat of byLot.values()) {
     stat.running_balance = Math.round((stat.total_in - stat.total_out) * 1000) / 1000;
-    stat.days_idle = daysBetween(stat.last_movement_date, today);
+    stat.days_idle = daysBetweenClamped(stat.last_movement_date, today);
     results.push(stat);
   }
   return results;
 }
 
-function daysBetween(fromIso, toIso) {
+// Like daysBetween, but null when either date is missing and never negative
+// (an as_of date earlier than a lot's last movement reads as 0 days idle).
+function daysBetweenClamped(fromIso, toIso) {
   if (!fromIso || !toIso) return null;
   const a = new Date(fromIso + "T00:00:00Z").getTime();
   const b = new Date(toIso + "T00:00:00Z").getTime();
@@ -7256,10 +7259,8 @@ app.get("/api/traceability/expiring-lots", (req, res) => {
   for (const s of stats) {
     if (!s.expiry_date) continue;
     if (s.running_balance < minBalance) continue;
-    // days_until_expiry: negative = already expired
-    s.days_until_expiry = daysBetween(today, s.expiry_date) != null
-      ? Math.floor((new Date(s.expiry_date + "T00:00:00Z").getTime() - new Date(today + "T00:00:00Z").getTime()) / 86400000)
-      : null;
+    // days_until_expiry: negative = already expired (expiry_date is set, see above)
+    s.days_until_expiry = daysBetween(today, s.expiry_date);
     bucketTotal++;
     if (s.days_until_expiry < 0) bucketExpired++;
     else if (s.days_until_expiry <= 30) bucket30++;
