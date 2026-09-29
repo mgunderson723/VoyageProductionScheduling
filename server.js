@@ -292,9 +292,15 @@ app.get("/api/data/:key", (req, res) => {
 const KEY_ROLE_REQUIREMENTS = {
   "vf_orders": "orderEdit", // admin or operator
   "vf_users":  "admin",     // admin only
+  // DIMs reference data has its own validated endpoint (/api/dims/config);
+  // no role may write it through this generic path, or validation, the
+  // concurrency check and version history would all be skipped.
+  "vf_dims_config":         "locked",
+  "vf_dims_config_history": "locked",
 };
 
 function userHasRole(userId, requirement) {
+  if (requirement === "locked") return false;
   const users = readData("vf_users") || [];
   const u = users.find(x => x && x.id === userId);
   if (!u) return false;
@@ -4469,6 +4475,65 @@ app.post("/api/error-reporting/undismiss", requireOrderEdit, (req, res) => {
     writeData("production_run_errors_dismissed", blob);
   }
   res.json({ ok: true, moRef });
+});
+
+// ── DIMs calculator reference data ──────────────────────────────────────────
+// Pack formats, pallets, packaging components, containers and packing-list
+// columns live in one editable blob so the team can add a pack format (e.g.
+// 25 kg bag-in-box liquor) or correct a tare without a code change. Until the
+// first save it serves the starter data in lib/dims-seed.json. Validation is
+// the same code the browser runs (public/dims-engine.js).
+const DimsEngine = require("./public/dims-engine");
+const DIMS_SEED_PATH = path.join(__dirname, "lib", "dims-seed.json");
+const DIMS_HISTORY_MAX = 25;
+
+function readDimsConfig() {
+  const blob = readData("vf_dims_config");
+  if (blob && blob.config) return { ...blob, seeded: false };
+  const seed = JSON.parse(fs.readFileSync(DIMS_SEED_PATH, "utf8"));
+  return { config: seed, updatedAt: null, updatedBy: null, seeded: true };
+}
+
+// GET /api/dims/config — any signed-in user (the calculator is read-only).
+app.get("/api/dims/config", (req, res) => {
+  try {
+    res.json({ ok: true, ...readDimsConfig() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// PUT /api/dims/config — admin or operator. Body: { config, baseUpdatedAt }.
+// baseUpdatedAt is the updatedAt the editor loaded; if someone else saved in
+// between we return 409 instead of silently overwriting their change. The
+// previous version goes into a capped history blob so a bad edit can be
+// recovered.
+app.put("/api/dims/config", requireOrderEdit, (req, res) => {
+  const body = req.body || {};
+  const config = body.config;
+  const problems = DimsEngine.validateConfig(config);
+  if (problems.length) {
+    return res.status(400).json({ ok: false, error: "Reference data has problems", problems });
+  }
+  const current = readData("vf_dims_config");
+  const currentAt = current && current.updatedAt ? current.updatedAt : null;
+  if ((body.baseUpdatedAt || null) !== currentAt) {
+    return res.status(409).json({
+      ok: false,
+      error: "Someone else saved DIMs reference data since you loaded it. Reload and re-apply your change.",
+      current: current || null,
+    });
+  }
+  if (current && current.config) {
+    const history = readData("vf_dims_config_history") || [];
+    history.push({ at: current.updatedAt || null, by: current.updatedBy || null, config: current.config });
+    writeData("vf_dims_config_history", history.slice(-DIMS_HISTORY_MAX));
+  }
+  const users = readData("vf_users") || [];
+  const u = users.find(x => x && x.id === req.userId);
+  const blob = { config, updatedAt: new Date().toISOString(), updatedBy: u ? u.username : "(unknown)" };
+  writeData("vf_dims_config", blob);
+  res.json({ ok: true, ...blob, seeded: false });
 });
 
 // ── Production Output: trailing-7-day "what did we produce" feed ────────────

@@ -11,6 +11,7 @@
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="/dims-engine.js"></script>
 <style>
 /* ============================================================================
    APP-SPECIFIC OVERRIDES — built on top of voyage-tokens.css
@@ -902,6 +903,44 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
 }
 .vf-topbar__brand .brand-orange { color: var(--vf-brand-orange); }
 .vf-topbar__spacer { flex: 1; }
+
+/* ── DIMs calculator ─────────────────────────────────────────────────────── */
+.dims-layout { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: var(--vf-space-5); align-items: start; }
+@media (max-width: 960px) { .dims-layout { grid-template-columns: 1fr; } }
+.dims-inputs { background: var(--vf-surface-sunken); border: 1px solid var(--vf-border-subtle); border-radius: var(--vf-radius-md); padding: var(--vf-space-4); }
+.dims-inputs .field { margin-bottom: var(--vf-space-3); }
+.dims-row2 { display: grid; grid-template-columns: 1fr 1fr; gap: var(--vf-space-2); }
+.dims-sub { font-size: 11px; color: var(--vf-text-tertiary); margin-top: 3px; line-height: 1.35; }
+.dims-check { display: flex; align-items: center; gap: 6px; font-size: var(--vf-text-sm); color: var(--vf-text-secondary); margin-bottom: var(--vf-space-2); cursor: pointer; }
+.dims-seg { display: inline-flex; border: 1px solid var(--vf-border-default); border-radius: var(--vf-radius-sm); overflow: hidden; }
+.dims-seg button { border: 0; background: var(--vf-surface-raised); padding: 5px 14px; font-size: 12px; cursor: pointer; color: var(--vf-text-secondary); font-family: inherit; }
+.dims-seg button.on { background: var(--vf-brand-navy); color: var(--vf-text-inverse); }
+.dims-box { padding: 10px 14px; border-radius: var(--vf-radius-sm); font-size: 13px; margin-bottom: var(--vf-space-3); line-height: 1.45; }
+.dims-box.warn { background: var(--vf-warning-soft); color: var(--vf-warning-text); }
+.dims-box.err { background: var(--vf-danger-soft); color: var(--vf-danger-text); }
+.dims-box.info { background: var(--vf-info-soft); color: var(--vf-info-text); }
+.dims-box ul { margin: 4px 0 0 18px; padding: 0; }
+.dims-empty { padding: var(--vf-space-6); text-align: center; color: var(--vf-text-tertiary); border: 1px dashed var(--vf-border-default); border-radius: var(--vf-radius-md); font-size: 13px; }
+.dims-metrics .metric-value { font-size: var(--vf-text-2xl); }
+.dims-h3 { font-size: 13px; font-weight: 600; color: var(--vf-text-primary); margin: var(--vf-space-4) 0 var(--vf-space-2); display: flex; align-items: center; gap: var(--vf-space-2); flex-wrap: wrap; }
+.dims-h3 .dims-grow { flex: 1; }
+.dims-est { display: inline-block; font-size: 10px; padding: 0 5px; border-radius: 8px; background: var(--vf-warning-soft); color: var(--vf-warning-text); margin-left: 4px; font-weight: 500; }
+.dims-missing { color: var(--vf-danger-text); font-size: 12px; }
+.dims-num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.dims-form { display: grid; grid-template-columns: 1fr 1fr; gap: 0 var(--vf-space-4); }
+.dims-form .dims-span2 { grid-column: 1 / -1; }
+.dims-mfield { display: grid; grid-template-columns: minmax(0, 1fr) 70px auto; gap: 6px; align-items: center; }
+.dims-mfield select { padding: 0 6px; }
+.dims-mfield label.dims-est-toggle { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--vf-text-tertiary); margin: 0; white-space: nowrap; }
+.dims-mini { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 6px; }
+.dims-mini th { text-align: left; font-weight: 500; color: var(--vf-text-tertiary); font-size: 11px; padding: 2px 4px; }
+.dims-mini td { padding: 2px 4px; vertical-align: middle; }
+.dims-mini input, .dims-mini select { height: 28px; padding: 0 6px; font-size: 12px; border: 1px solid var(--vf-border-default); border-radius: var(--vf-radius-sm); background: var(--vf-surface-raised); color: var(--vf-text-primary); font-family: inherit; width: 100%; }
+.dims-mini input[type="checkbox"] { width: auto; height: auto; }
+.dims-cols { list-style: none; margin: 0; padding: 0; max-width: 520px; }
+.dims-cols li { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border: 1px solid var(--vf-border-subtle); border-radius: var(--vf-radius-sm); margin-bottom: 4px; font-size: 13px; background: var(--vf-surface-raised); }
+.dims-cols li code { font-size: 11px; color: var(--vf-text-tertiary); }
+.dims-cols li .dims-grow { flex: 1; }
 </style>
 </head>
 <body>
@@ -992,6 +1031,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
     <button class="tab" onclick="switchTab('error-reporting')">Error reporting</button>
     <button class="tab" onclick="switchTab('production-output')">Production output</button>
     <button class="tab" onclick="switchTab('yield')">Yield</button>
+    <button class="tab" onclick="switchTab('dims')">DIMs calculator</button>
     <button class="tab" onclick="switchTab('mrp')" id="tab-mrp-btn" style="display:none;">MRP</button>
     <button class="tab" onclick="switchTab('mrp-setup')" id="tab-mrp-setup-btn" style="display:none;">MRP Setup</button>
     <button class="tab" onclick="switchTab('yield-setup')" id="tab-yield-setup-btn" style="display:none;">Yield Setup</button>
@@ -1537,6 +1577,105 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
     </div>
 
     <div id="yield-content"></div>
+  </div>
+
+  <!-- DIMS CALCULATOR — pallet count, dims and gross weight for freight quotes.
+       Reference data is editable in the Reference data sub-tab (admin/operator). -->
+  <div id="tab-dims" style="display:none;">
+    <div class="header">
+      <div style="display:flex;align-items:center;gap:var(--vf-space-3);flex-wrap:wrap;">
+        <h2>DIMs calculator</h2>
+        <span id="dims-meta" style="font-size:var(--vf-text-sm);color:var(--vf-text-tertiary);"></span>
+      </div>
+    </div>
+    <div style="display:flex;margin-bottom:var(--vf-space-4);border-bottom:1px solid var(--vf-border-subtle);">
+      <button class="btn btn-sm" id="dims-tab-calc" onclick="switchDimsSection('calc')" style="border-radius:0;border-bottom:2px solid var(--vf-brand-orange);">Calculator</button>
+      <button class="btn btn-sm" id="dims-tab-ref" onclick="switchDimsSection('ref')" style="border-radius:0;background:transparent;border-bottom:2px solid transparent;">Reference data</button>
+    </div>
+
+    <div id="dims-section-calc">
+      <div class="dims-layout">
+        <div class="dims-inputs">
+          <div class="field">
+            <label for="dims-pack">Pack format</label>
+            <select id="dims-pack" onchange="onDimsPackChange()"></select>
+          </div>
+          <div class="field">
+            <label for="dims-qty" id="dims-qty-label">Quantity</label>
+            <input id="dims-qty" type="number" min="1" step="1" placeholder="e.g. 80" oninput="runDims()">
+          </div>
+          <div class="field">
+            <label for="dims-pallet">Pallet</label>
+            <select id="dims-pallet" onchange="onDimsPalletChange()"></select>
+          </div>
+          <div class="dims-row2">
+            <div class="field" style="margin-bottom:0;">
+              <label for="dims-perlayer" id="dims-perlayer-label">Per layer</label>
+              <input id="dims-perlayer" type="number" min="1" step="1" oninput="onDimsPatternInput()">
+            </div>
+            <div class="field" style="margin-bottom:0;">
+              <label for="dims-layers">Layers</label>
+              <input id="dims-layers" type="number" min="1" step="1" oninput="onDimsPatternInput()">
+            </div>
+          </div>
+          <div class="dims-sub" id="dims-pattern-hint" style="margin-bottom:var(--vf-space-3);"></div>
+          <label class="dims-check"><input type="checkbox" id="dims-slip" onchange="runDims()"> Slip sheets (one per layer + one on top)</label>
+          <label class="dims-check" id="dims-ds-wrap" style="display:none;"><input type="checkbox" id="dims-ds" onchange="runDims()"> Double-stack pallets</label>
+          <div class="field">
+            <label for="dims-bulge">Bulge allowance per layer (in)</label>
+            <input id="dims-bulge" type="number" min="0" step="0.05" oninput="runDims()">
+            <div class="dims-sub">0 for rigid boxes and drums; ~0.2 for squeezable-packet cases.</div>
+          </div>
+          <div class="field">
+            <label for="dims-container">Check against container</label>
+            <select id="dims-container" onchange="runDims()"></select>
+          </div>
+          <div class="field" style="margin-bottom:0;">
+            <label>Show results in</label>
+            <div class="dims-seg">
+              <button type="button" id="dims-units-metric" onclick="setDimsUnits('metric')">Metric</button>
+              <button type="button" id="dims-units-imperial" onclick="setDimsUnits('imperial')">Imperial</button>
+            </div>
+            <div class="dims-sub">Metric for export docs, imperial for domestic LTL. The other system is shown underneath.</div>
+          </div>
+        </div>
+        <div id="dims-results"></div>
+      </div>
+    </div>
+
+    <div id="dims-section-ref" style="display:none;">
+      <div id="dims-ref"></div>
+    </div>
+
+    <!-- Item editor (packs / pallets / components / containers) -->
+    <div id="dims-edit-modal" class="modal-overlay" style="display:none;">
+      <div class="modal" style="width:720px;">
+        <h2 id="dims-edit-title">Edit</h2>
+        <div id="dims-edit-body"></div>
+        <div id="dims-edit-error" class="dims-box err" style="display:none;margin-top:var(--vf-space-3);"></div>
+        <div style="display:flex;justify-content:flex-end;gap:var(--vf-space-2);margin-top:var(--vf-space-3);">
+          <button class="btn" onclick="closeDimsEditor()">Cancel</button>
+          <button class="btn btn-primary" id="dims-edit-save" onclick="saveDimsEditor()">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Raw JSON editor (power edits / bulk changes) -->
+    <div id="dims-json-modal" class="modal-overlay" style="display:none;">
+      <div class="modal" style="width:860px;">
+        <h2>Reference data (JSON)</h2>
+        <div class="dims-sub" style="margin-bottom:var(--vf-space-2);">
+          Every measurement is <code>{"v": number, "u": unit}</code>, plus <code>"est": true</code> when it's an estimate.
+          Lengths: in, mm, cm, ft. Weights: kg, lb, g. Saving checks the whole file before anything is stored.
+        </div>
+        <textarea id="dims-json-text" spellcheck="false" style="width:100%;height:55vh;font-family:ui-monospace,Consolas,monospace;font-size:12px;padding:var(--vf-space-2);border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);"></textarea>
+        <div id="dims-json-error" class="dims-box err" style="display:none;margin-top:var(--vf-space-2);"></div>
+        <div style="display:flex;justify-content:flex-end;gap:var(--vf-space-2);margin-top:var(--vf-space-3);">
+          <button class="btn" onclick="document.getElementById('dims-json-modal').style.display='none'">Cancel</button>
+          <button class="btn btn-primary" onclick="saveDimsJson()">Save</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- MRP — operator+ — production-plan-driven material requirements -->
@@ -3276,10 +3415,10 @@ function switchTab(t){
     const el = document.getElementById(id);
     if (el && el.style.display !== 'none') el.style.display = 'none';
   });
-  ['calendar','orders','pipeline','capacity','traceability','expiring-lots','lot-report','mo-status','live-inv','error-reporting','production-output','yield','mrp','mrp-setup','yield-setup','admin'].forEach(k=>{const el=document.getElementById('tab-'+k);if(el)el.style.display=k===t?'':'none';});
+  ['calendar','orders','pipeline','capacity','traceability','expiring-lots','lot-report','mo-status','live-inv','error-reporting','production-output','yield','dims','mrp','mrp-setup','yield-setup','admin'].forEach(k=>{const el=document.getElementById('tab-'+k);if(el)el.style.display=k===t?'':'none';});
   document.querySelectorAll('.tab').forEach(el=>{
     const tabName=el.textContent.trim().toLowerCase();
-    const map={'calendar':'calendar','work orders':'orders','pipeline':'pipeline','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','expiring lots':'expiring-lots','lot ledger report':'lot-report','mo status':'mo-status','live inventory':'live-inv','error reporting':'error-reporting','production output':'production-output','yield':'yield','mrp':'mrp','mrp setup':'mrp-setup','yield setup':'yield-setup','admin console':'admin'};
+    const map={'calendar':'calendar','work orders':'orders','pipeline':'pipeline','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','expiring lots':'expiring-lots','lot ledger report':'lot-report','mo status':'mo-status','live inventory':'live-inv','error reporting':'error-reporting','production output':'production-output','yield':'yield','dims calculator':'dims','mrp':'mrp','mrp setup':'mrp-setup','yield setup':'yield-setup','admin console':'admin'};
     el.classList.toggle('active',map[tabName]===t);
   });
   if(t==='calendar')renderCal();
@@ -3293,6 +3432,7 @@ function switchTab(t){
   if(t==='error-reporting')loadErrorReporting();
   if(t==='production-output')loadProductionOutput();
   if(t==='yield')loadYield();
+  if(t==='dims')loadDims();
   if(t==='yield-setup')loadYieldSetup();
   if(t==='mrp-setup')loadMrpSetup();
   if(t==='mrp')loadMrp();
@@ -7596,6 +7736,740 @@ async function syncErrorReporting() {
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '↻ Sync now'; }
   }
+}
+
+// ── DIMs calculator ──────────────────────────────────────────────────────────
+//
+// Reference data (pack formats, pallets, packaging components, containers,
+// packing-list columns) comes from /api/dims/config and is editable in the
+// Reference data sub-tab by admins/operators, so adding a pack format or
+// fixing a tare never needs a deploy. The math lives in /dims-engine.js,
+// shared with the server-side validator and the jest regression tests.
+let dimsConfig = null;
+let dimsMeta = { updatedAt: null, updatedBy: null, seeded: false };
+let dimsSection = 'calc';
+let dimsUnits = 'metric';
+let dimsUnitsTouched = false;
+let dimsPackingTsv = '';
+let dimsEdit = null;
+
+const DIMS_LB = 0.45359237;
+const DIMS_LEN_UNITS = ['in', 'mm', 'cm', 'ft'];
+const DIMS_WT_UNITS = ['kg', 'lb', 'g'];
+
+async function loadDims(force) {
+  if (dimsConfig && !force) { renderDimsAll(); return; }
+  const out = document.getElementById('dims-results');
+  out.innerHTML = '<div class="dims-empty">Loading reference data…</div>';
+  try {
+    const r = await fetch('/api/dims/config');
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    setDimsConfig(j);
+  } catch (e) {
+    out.innerHTML = `<div class="dims-box err">Couldn't load DIMs reference data: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function setDimsConfig(j) {
+  const first = !dimsConfig;
+  dimsConfig = j.config;
+  dimsMeta = { updatedAt: j.updatedAt || null, updatedBy: j.updatedBy || null, seeded: !!j.seeded };
+  populateDimsSelects(first);
+  renderDimsAll();
+}
+
+function renderDimsAll() {
+  const meta = document.getElementById('dims-meta');
+  if (meta) {
+    meta.textContent = dimsMeta.updatedAt
+      ? `Reference data last saved ${new Date(dimsMeta.updatedAt).toLocaleString()} by ${dimsMeta.updatedBy || 'unknown'}`
+      : 'Using the starter reference data from the spec (not yet edited)';
+  }
+  updateDimsChrome();
+  runDims();
+  if (dimsSection === 'ref') renderDimsRef();
+}
+
+function switchDimsSection(name) {
+  dimsSection = name;
+  ['calc', 'ref'].forEach(k => {
+    document.getElementById('dims-section-' + k).style.display = k === name ? '' : 'none';
+    const b = document.getElementById('dims-tab-' + k);
+    b.style.borderBottom = k === name ? '2px solid var(--vf-brand-orange)' : '2px solid transparent';
+    b.style.background = k === name ? '' : 'transparent';
+  });
+  if (name === 'ref' && dimsConfig) renderDimsRef();
+}
+
+const dimsById = (list, id) => (dimsConfig && dimsConfig[list] || []).find(x => x.id === id) || null;
+
+function populateDimsSelects(first) {
+  const packSel = document.getElementById('dims-pack');
+  const palSel = document.getElementById('dims-pallet');
+  const conSel = document.getElementById('dims-container');
+  const prevPack = packSel.value, prevPal = palSel.value, prevCon = conSel.value;
+  packSel.innerHTML = dimsConfig.packs.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.label)}</option>`).join('');
+  palSel.innerHTML = dimsConfig.pallets.filter(p => !p.inboundOnly)
+    .map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.label)}</option>`).join('');
+  conSel.innerHTML = '<option value="">None</option>' +
+    dimsConfig.containers.map(c => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)}</option>`).join('');
+  const keep = (sel, v) => v && [...sel.options].some(o => o.value === v);
+  if (keep(conSel, prevCon)) conSel.value = prevCon;
+  if (!first && keep(packSel, prevPack)) {
+    packSel.value = prevPack;
+    if (keep(palSel, prevPal)) palSel.value = prevPal;
+  } else {
+    applyDimsDefaults(null);
+  }
+}
+
+// Pre-fill pallet, pattern, slip sheets, bulge and output units from the
+// pack's saved defaults. palletId = null → pack change (reset everything);
+// otherwise only the pattern + units follow the newly chosen pallet.
+function applyDimsDefaults(palletId) {
+  const packId = document.getElementById('dims-pack').value;
+  const d = DimsEngine.defaultsFor(dimsConfig, packId, palletId);
+  if (!d) return;
+  const palSel = document.getElementById('dims-pallet');
+  if (d.palletId && [...palSel.options].some(o => o.value === d.palletId)) palSel.value = d.palletId;
+  document.getElementById('dims-perlayer').value = d.perLayer ?? '';
+  document.getElementById('dims-layers').value = d.layers ?? '';
+  if (!palletId) {
+    document.getElementById('dims-slip').checked = d.slipSheets;
+    document.getElementById('dims-bulge').value = d.bulgeIn;
+    document.getElementById('dims-ds').checked = false;
+  }
+  if (!dimsUnitsTouched) dimsUnits = d.units;
+  updateDimsChrome();
+  runDims();
+}
+
+function onDimsPackChange() { applyDimsDefaults(null); }
+function onDimsPalletChange() { applyDimsDefaults(document.getElementById('dims-pallet').value); }
+function onDimsPatternInput() { updateDimsChrome(); runDims(); }
+function setDimsUnits(u) { dimsUnits = u; dimsUnitsTouched = true; updateDimsChrome(); runDims(); }
+
+function resetDimsPattern() {
+  const pack = dimsById('packs', document.getElementById('dims-pack').value);
+  const pt = DimsEngine.patternFor(pack, document.getElementById('dims-pallet').value);
+  if (!pt) return;
+  document.getElementById('dims-perlayer').value = pt.perLayer ?? '';
+  document.getElementById('dims-layers').value = pt.layers ?? '';
+  onDimsPatternInput();
+}
+
+// Labels, visibility and the "saved pattern" hint that depend on the pack/pallet.
+function updateDimsChrome() {
+  if (!dimsConfig) return;
+  const pack = dimsById('packs', document.getElementById('dims-pack').value);
+  const word = (pack && pack.unitName) || 'unit';
+  document.getElementById('dims-qty-label').textContent = `Quantity (${DimsEngine.plural(word)})`;
+  document.getElementById('dims-perlayer-label').textContent = `${dimsCap(DimsEngine.plural(word))} per layer`;
+  const dsOk = !!(pack && pack.doubleStack && pack.doubleStack.allowed);
+  document.getElementById('dims-ds-wrap').style.display = dsOk ? '' : 'none';
+  if (!dsOk) document.getElementById('dims-ds').checked = false;
+  document.getElementById('dims-units-metric').classList.toggle('on', dimsUnits === 'metric');
+  document.getElementById('dims-units-imperial').classList.toggle('on', dimsUnits === 'imperial');
+  const hint = document.getElementById('dims-pattern-hint');
+  const pt = pack ? DimsEngine.patternFor(pack, document.getElementById('dims-pallet').value) : null;
+  if (!pt) {
+    hint.innerHTML = 'No saved pattern for this pack on this pallet. Enter per layer and layers.';
+  } else {
+    const per = document.getElementById('dims-perlayer').value, lay = document.getElementById('dims-layers').value;
+    const changed = String(pt.perLayer ?? '') !== per || String(pt.layers ?? '') !== lay;
+    hint.innerHTML = `Saved pattern: ${pt.perLayer ?? '?'} × ${pt.layers ?? '?'} = ${(pt.perLayer || 0) * (pt.layers || 0)} per pallet` +
+      (pt.est ? ' <span class="dims-est">unconfirmed</span>' : '') +
+      (changed ? ` · <a href="#" onclick="event.preventDefault();resetDimsPattern();">reset</a>` : '');
+  }
+}
+
+function readDimsInputs() {
+  const v = id => document.getElementById(id).value;
+  return {
+    packId: v('dims-pack'),
+    quantity: v('dims-qty').trim() === '' ? NaN : Number(v('dims-qty')),
+    palletId: v('dims-pallet'),
+    perLayer: v('dims-perlayer'),
+    layers: v('dims-layers'),
+    slipSheets: document.getElementById('dims-slip').checked,
+    bulgeIn: Number(v('dims-bulge')) || 0,
+    doubleStack: document.getElementById('dims-ds').checked,
+    containerId: v('dims-container') || null,
+  };
+}
+
+const dimsNum = (x, dp) => (x == null || !isFinite(x)) ? '—' : Number(x).toLocaleString(undefined, { maximumFractionDigits: dp });
+const dimsWt = (kg, u) => u === 'imperial' ? `${dimsNum(kg / DIMS_LB, 0)} lb` : `${dimsNum(kg, 1)} kg`;
+const dimsLen = (inches, u) => u === 'imperial' ? `${dimsNum(inches, 1)} in` : `${dimsNum(inches * 2.54, 0)} cm`;
+const dimsLWH = (L, W, H, u) => u === 'imperial'
+  ? `${[L, W, H].map(x => dimsNum(x, 1)).join(' × ')} in`
+  : `${[L, W, H].map(x => dimsNum(x * 2.54, 0)).join(' × ')} cm`;
+const dimsOther = () => dimsUnits === 'metric' ? 'imperial' : 'metric';
+const dimsDual = (fn, ...a) => `${fn(...a, dimsUnits)}<div class="dims-sub">${fn(...a, dimsOther())}</div>`;
+const dimsPlural = (n, w) => `${n} ${n === 1 ? w : DimsEngine.plural(w)}`;
+const dimsCap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
+
+function runDims() {
+  const out = document.getElementById('dims-results');
+  if (!out || !dimsConfig) return;
+  const input = readDimsInputs();
+  if (isNaN(input.quantity)) {
+    out.innerHTML = '<div class="dims-empty">Enter a quantity to see pallets, dims and gross weight.</div>';
+    dimsPackingTsv = '';
+    return;
+  }
+  const r = DimsEngine.calculate(dimsConfig, input);
+  const u = dimsUnits;
+  const list = items => `<ul>${items.map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul>`;
+  if (!r.ok) {
+    const fix = canEditOrders()
+      ? `<div style="margin-top:6px;"><a href="#" onclick="event.preventDefault();switchDimsSection('ref');">Add the missing figures in Reference data →</a></div>`
+      : '<div style="margin-top:6px;">Ask an admin or operator to add the missing figures in Reference data.</div>';
+    out.innerHTML = `<div class="dims-box err"><strong>Can't calculate yet.</strong>${list(r.errors)}${fix}</div>` +
+      (r.warnings.length ? `<div class="dims-box warn">${list(r.warnings)}</div>` : '');
+    dimsPackingTsv = '';
+    return;
+  }
+
+  const word = r.unitWord;
+  const partial = r.partial ? ` + 1 partial (${dimsPlural(r.partial.units, word)}, ${dimsPlural(r.partial.layers, 'layer')})` : '';
+  let posSub = r.doubleStack ? 'double-stacked' : 'single-stacked';
+  if (r.container && r.container.containersNeeded) {
+    posSub += ` · ${r.container.containersNeeded} × ${escapeHtml(r.container.label)} (${r.container.capacity} each)`;
+  }
+  const metric = (label, val, sub) =>
+    `<div class="metric"><div class="metric-label">${label}</div><div class="metric-value">${val}</div><div class="dims-sub">${sub}</div></div>`;
+  const metrics = `<div class="metrics dims-metrics">
+    ${metric('Pallets', r.palletCount, `${r.fullPallets} full${partial}`)}
+    ${metric('Floor positions', r.floorPositions, posSub)}
+    ${metric('Total gross', dimsWt(r.totals.grossKg, u), dimsWt(r.totals.grossKg, dimsOther()))}
+    ${metric('Total net', dimsWt(r.totals.netKg, u), dimsWt(r.totals.netKg, dimsOther()))}
+  </div>`;
+
+  const star = r.heightExcludesPallet ? '*' : '';
+  const rows = r.groups.map(g => `<tr>
+      <td>${g.kind === 'full' ? 'Full' : 'Partial'} × ${g.count}</td>
+      <td class="dims-num">${g.units}</td>
+      <td class="dims-num">${g.layers}${g.sheets ? `<div class="dims-sub">${g.sheets} slip sheets</div>` : ''}</td>
+      <td class="dims-num">${dimsDual(dimsLWH, g.L_in, g.W_in, g.H_in)}${star}</td>
+      <td class="dims-num">${dimsDual(dimsWt, g.netKg)}</td>
+      <td class="dims-num">${dimsDual(dimsWt, g.packagingKg)}</td>
+      <td class="dims-num">${dimsDual(dimsWt, g.palletKg)}</td>
+      <td class="dims-num"><strong>${dimsDual(dimsWt, g.grossKg)}</strong></td>
+    </tr>`).join('');
+  const table = `<div style="overflow-x:auto;"><table class="status-table" style="margin:0;">
+    <thead><tr><th>Per pallet</th><th class="dims-num">${escapeHtml(dimsCap(DimsEngine.plural(word)))}</th><th class="dims-num">Layers</th>
+      <th class="dims-num">L × W × H</th><th class="dims-num">Net</th><th class="dims-num">Packaging</th><th class="dims-num">Pallet</th><th class="dims-num">Gross</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>
+    ${r.heightExcludesPallet ? '<div class="dims-sub">* Excludes the pallet deck — that pallet\'s height isn\'t on file.</div>' : ''}`;
+
+  let stackBox = '';
+  if (r.doubleStack) {
+    const ds = r.doubleStack;
+    stackBox = `<div class="dims-box info">Double-stacked: ${dimsPlural(ds.positions, 'floor position')}.
+      Tallest position ${dimsLen(ds.maxHeightIn, u)} (${dimsLen(ds.maxHeightIn, dimsOther())}),
+      heaviest ${dimsWt(ds.heaviestPositionKg, u)}.
+      ${ds.measuredHeightIn ? `Measured on the dock: ${dimsLen(ds.measuredHeightIn, u)}.` : ''}</div>`;
+  }
+  const estBox = r.estimates.length
+    ? `<div class="dims-box warn"><strong>Uses estimated figures</strong> — replace them with measured values in Reference data:${list(r.estimates)}</div>` : '';
+  const warnBox = r.warnings.length ? `<div class="dims-box warn">${list(r.warnings)}</div>` : '';
+
+  const pl = DimsEngine.packingList(dimsConfig, r);
+  dimsPackingTsv = pl.tsv;
+  const plTable = `<div style="overflow-x:auto;"><table class="status-table" style="margin:0;">
+    <thead><tr>${pl.header.map(h => `<th>${escapeHtml(h)}</th>`).join('')}</tr></thead>
+    <tbody>${pl.rows.map(row => `<tr>${row.map(c => `<td class="${typeof c === 'number' ? 'dims-num' : ''}">${escapeHtml(typeof c === 'number' ? c.toLocaleString(undefined, { maximumFractionDigits: 1 }) : c)}</td>`).join('')}</tr>`).join('')}</tbody>
+  </table></div>`;
+
+  out.innerHTML = metrics + stackBox + table + (estBox || warnBox ? '<div style="height:12px"></div>' : '') + estBox + warnBox +
+    `<div class="dims-h3"><span class="dims-grow">Packing list</span>
+       <span id="dims-copy-ok" class="dims-sub" style="margin:0;"></span>
+       <button class="btn btn-sm" onclick="copyDimsPackingList()">Copy for Excel / Sheets</button></div>` +
+    plTable + '<div class="dims-sub">One row per pallet. Column order is set in Reference data → Packing list columns.</div>';
+}
+
+async function copyDimsPackingList() {
+  if (!dimsPackingTsv) return;
+  const ok = document.getElementById('dims-copy-ok');
+  try {
+    await navigator.clipboard.writeText(dimsPackingTsv);
+  } catch (_) {
+    const ta = document.createElement('textarea');
+    ta.value = dimsPackingTsv;
+    document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
+  }
+  if (ok) { ok.textContent = 'Copied ✓'; setTimeout(() => { ok.textContent = ''; }, 2000); }
+}
+
+// ── Reference data view + editors ──
+const DIMS_LIST_WORD = { packs: 'pack format', pallets: 'pallet', components: 'packaging component', containers: 'container' };
+
+const DIMS_FIELDS = {
+  packs: [
+    { k: 'label', label: 'Name', type: 'text', req: true, span: true, hint: 'Shown in the calculator, e.g. "CBE liquor — 25 kg bag-in-box".' },
+    { k: 'id', label: 'ID', type: 'id', hint: 'Internal key; letters, digits, _ or -. Fixed once saved.' },
+    { k: 'product', label: 'Product', type: 'text' },
+    { k: 'unitName', label: 'Unit word', type: 'text', hint: 'case, drum, box, bag…' },
+    { k: 'shape', label: 'Shape', type: 'select', options: [['box', 'Box (L × W × H)'], ['cylinder', 'Drum / cylinder (diameter × H)']] },
+    { k: 'L', label: 'Outside length', type: 'len', hint: 'Boxes' },
+    { k: 'W', label: 'Outside width', type: 'len', hint: 'Boxes' },
+    { k: 'dia', label: 'Outside diameter', type: 'len', hint: 'Drums' },
+    { k: 'H', label: 'Outside height', type: 'len' },
+    { k: 'net', label: 'Net weight per unit', type: 'wt' },
+    { k: 'tare', label: 'Unit tare (empty packaging)', type: 'wt' },
+    { k: 'liner', label: 'Liner / insert', type: 'ref', ref: 'components', none: 'None' },
+    { k: 'defaultPallet', label: 'Default pallet', type: 'ref', ref: 'pallets', none: '—' },
+    { k: 'bulgePerLayer', label: 'Bulge allowance per layer', type: 'len', hint: '0 for rigid boxes and drums' },
+    { k: 'slipSheets', label: 'Slip sheets on by default', type: 'bool' },
+    { k: 'patterns', label: 'Pallet patterns', type: 'patterns', span: true },
+    { k: 'doubleStack.allowed', label: 'Can be double-stacked', type: 'bool' },
+    { k: 'doubleStack.separator', label: 'Separator between tiers', type: 'ref', ref: 'components', none: 'None' },
+    { k: 'doubleStack.measuredHeight', label: 'Measured double-stack height', type: 'len' },
+    { k: 'source', label: 'Source', type: 'text', span: true, hint: 'Where the figures came from (spec sheet, measured on the dock…).' },
+    { k: 'notes', label: 'Notes', type: 'textarea', span: true },
+  ],
+  pallets: [
+    { k: 'label', label: 'Name', type: 'text', req: true, span: true },
+    { k: 'id', label: 'ID', type: 'id', hint: 'Fixed once saved.' },
+    { k: 'defaultUnits', label: 'Default output units', type: 'select', options: [['metric', 'Metric (export)'], ['imperial', 'Imperial (domestic)']] },
+    { k: 'L', label: 'Footprint length', type: 'len' },
+    { k: 'W', label: 'Footprint width', type: 'len' },
+    { k: 'H', label: 'Deck height', type: 'len' },
+    { k: 'tare', label: 'Tare', type: 'wt' },
+    { k: 'inboundOnly', label: 'Inbound only (hide from calculator)', type: 'bool' },
+    { k: 'notes', label: 'Notes', type: 'textarea', span: true },
+  ],
+  components: [
+    { k: 'label', label: 'Name', type: 'text', req: true, span: true },
+    { k: 'id', label: 'ID', type: 'id', hint: 'Fixed once saved. The calculator\'s slip-sheet option uses "slip_sheet".' },
+    { k: 'wt', label: 'Weight each', type: 'wt' },
+    { k: 'thk', label: 'Thickness', type: 'len' },
+    { k: 'notes', label: 'Notes', type: 'textarea', span: true },
+  ],
+  containers: [
+    { k: 'label', label: 'Name', type: 'text', req: true, span: true },
+    { k: 'id', label: 'ID', type: 'id', hint: 'Fixed once saved.' },
+    { k: 'L', label: 'Interior length', type: 'len' },
+    { k: 'W', label: 'Interior width', type: 'len' },
+    { k: 'H', label: 'Interior height', type: 'len' },
+    { k: 'tare', label: 'Tare', type: 'wt' },
+    { k: 'floorPositions', label: 'Floor positions by pallet footprint', type: 'fp', span: true, hint: 'One per line, e.g. 48x40: 18' },
+    { k: 'notes', label: 'Notes', type: 'textarea', span: true },
+  ],
+};
+
+const DIMS_BLANK = {
+  packs: () => ({ id: '', label: '', product: '', unitName: 'case', shape: 'box',
+    L: { v: null, u: 'in' }, W: { v: null, u: 'in' }, H: { v: null, u: 'in' }, dia: { v: null, u: 'in' },
+    net: { v: null, u: 'kg' }, tare: { v: null, u: 'kg' }, liner: null, defaultPallet: null, patterns: [],
+    slipSheets: false, bulgePerLayer: { v: 0, u: 'in' },
+    doubleStack: { allowed: false, separator: null, measuredHeight: { v: null, u: 'in' } }, source: '', notes: '' }),
+  pallets: () => ({ id: '', label: '', L: { v: 48, u: 'in' }, W: { v: 40, u: 'in' }, H: { v: null, u: 'in' },
+    tare: { v: null, u: 'kg' }, defaultUnits: 'metric', inboundOnly: false, notes: '' }),
+  components: () => ({ id: '', label: '', wt: { v: null, u: 'kg' }, thk: { v: null, u: 'in' }, notes: '' }),
+  containers: () => ({ id: '', label: '', L: { v: null, u: 'mm' }, W: { v: null, u: 'mm' }, H: { v: null, u: 'mm' },
+    tare: { v: null, u: 'kg' }, floorPositions: {}, notes: '' }),
+};
+
+const dimsGet = (o, path) => path.split('.').reduce((x, k) => (x == null ? undefined : x[k]), o);
+function dimsSet(o, path, val) {
+  const ks = path.split('.');
+  let x = o;
+  ks.slice(0, -1).forEach(k => { if (x[k] == null || typeof x[k] !== 'object') x[k] = {}; x = x[k]; });
+  x[ks[ks.length - 1]] = val;
+}
+const dimsSlug = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 48) || 'item';
+function dimsUniqueId(list, base) {
+  const taken = new Set((dimsConfig[list] || []).map(x => x.id));
+  let id = base, n = 2;
+  while (taken.has(id)) id = `${base}_${n++}`;
+  return id;
+}
+const dimsM = m => (m && m.v != null)
+  ? `${dimsNum(m.v, 4)} ${escapeHtml(m.u)}${m.est ? '<span class="dims-est">est.</span>' : ''}`
+  : '<span class="dims-missing">not on file</span>';
+
+// What still points at an item — deleting it would break these.
+function dimsRefsTo(list, id) {
+  const refs = [];
+  if (list === 'pallets') {
+    dimsConfig.packs.forEach(p => {
+      if (p.defaultPallet === id || (p.patterns || []).some(pt => pt.pallet === id)) refs.push(p.label);
+    });
+  }
+  if (list === 'components') {
+    dimsConfig.packs.forEach(p => {
+      if (p.liner === id || (p.doubleStack && p.doubleStack.separator === id)) refs.push(p.label);
+    });
+    if (id === 'slip_sheet') refs.push('the calculator\'s slip-sheet option');
+  }
+  return refs;
+}
+
+function renderDimsRef() {
+  const el = document.getElementById('dims-ref');
+  if (!el || !dimsConfig) return;
+  const c = dimsConfig;
+  const canEdit = canEditOrders();
+  const actions = (list, i) => canEdit ? `<td style="white-space:nowrap;text-align:right;">
+      <button class="btn btn-sm" onclick="openDimsEditor('${list}', ${i})">Edit</button>
+      ${list === 'packs' ? `<button class="btn btn-sm" onclick="openDimsEditor('${list}', ${i}, true)" title="Start a new pack format from this one">Duplicate</button>` : ''}
+      <button class="btn btn-sm btn-danger" onclick="deleteDimsItem('${list}', ${i})">Delete</button></td>` : '';
+  const head = (title, list, addLabel) => `<div class="dims-h3"><span class="dims-grow">${title}</span>
+      ${canEdit ? `<button class="btn btn-sm btn-primary" onclick="openDimsEditor('${list}', -1)">+ ${addLabel}</button>` : ''}</div>`;
+  const note = s => s ? `<div class="dims-sub">${escapeHtml(s)}</div>` : '';
+  const estCount = obj => JSON.stringify(obj).split('"est":true').length - 1;
+
+  const packRows = c.packs.map((p, i) => {
+    const cyl = p.shape === 'cylinder';
+    const od = cyl ? `⌀ ${dimsM(p.dia)} × ${dimsM(p.H)}` : `${dimsM(p.L)} × ${dimsM(p.W)} × ${dimsM(p.H)}`;
+    const liner = p.liner ? `<div class="dims-sub">+ ${escapeHtml((dimsById('components', p.liner) || {}).label || p.liner)}</div>` : '';
+    const pats = (p.patterns || []).map(pt => {
+      const pal = dimsById('pallets', pt.pallet);
+      const def = pt.pallet === p.defaultPallet ? ' <span class="dims-sub" style="display:inline;">(default)</span>' : '';
+      return `<div>${escapeHtml(pal ? pal.label : pt.pallet)}: ${pt.perLayer ?? '?'} × ${pt.layers ?? '?'}${pt.est ? '<span class="dims-est">unconfirmed</span>' : ''}${def}</div>`;
+    }).join('') || '<span class="dims-missing">no pallet pattern</span>';
+    const flags = [];
+    const n = estCount(p);
+    if (n) flags.push(`<span class="dims-est">${n} estimate${n === 1 ? '' : 's'}</span>`);
+    if (p.doubleStack && p.doubleStack.allowed) flags.push('<div class="dims-sub">double-stack OK</div>');
+    if (p.slipSheets) flags.push('<div class="dims-sub">slip sheets</div>');
+    return `<tr><td><strong>${escapeHtml(p.label)}</strong>${note(p.source)}</td><td>${od}</td>
+      <td>${dimsM(p.net)} net<div>${dimsM(p.tare)} tare</div>${liner}</td><td>${pats}</td><td>${flags.join('')}</td>${actions('packs', i)}</tr>`;
+  }).join('');
+
+  const palletRows = c.pallets.map((p, i) => `<tr><td><strong>${escapeHtml(p.label)}</strong>${p.inboundOnly ? '<div class="dims-sub">inbound only</div>' : ''}</td>
+      <td>${dimsM(p.L)} × ${dimsM(p.W)}</td><td>${dimsM(p.H)}</td><td>${dimsM(p.tare)}</td>
+      <td>${p.defaultUnits === 'imperial' ? 'Imperial' : 'Metric'}</td><td style="max-width:320px;">${note(p.notes)}</td>${actions('pallets', i)}</tr>`).join('');
+
+  const compRows = c.components.map((x, i) => `<tr><td><strong>${escapeHtml(x.label)}</strong><div class="dims-sub"><code>${escapeHtml(x.id)}</code></div></td>
+      <td>${dimsM(x.wt)}</td><td>${dimsM(x.thk)}</td><td style="max-width:360px;">${note(x.notes)}</td>${actions('components', i)}</tr>`).join('');
+
+  const conRows = c.containers.map((x, i) => {
+    const fp = Object.entries(x.floorPositions || {}).map(([k, v]) => `${escapeHtml(k)}: ${escapeHtml(String(v))}`).join(', ') || '<span class="dims-missing">none</span>';
+    return `<tr><td><strong>${escapeHtml(x.label)}</strong></td><td>${dimsM(x.L)} × ${dimsM(x.W)} × ${dimsM(x.H)}</td>
+      <td>${dimsM(x.tare)}</td><td>${fp}</td>${actions('containers', i)}</tr>`;
+  }).join('');
+
+  const tbl = (cols, rows, empty) => `<div style="overflow-x:auto;"><table class="status-table" style="margin:0;">
+      <thead><tr>${cols.map(h => `<th>${h}</th>`).join('')}${canEdit ? '<th></th>' : ''}</tr></thead>
+      <tbody>${rows || `<tr><td colspan="${cols.length + 1}" class="dims-sub">${empty}</td></tr>`}</tbody></table></div>`;
+
+  const cols = (c.packingList && c.packingList.columns) || [];
+  const colLabel = k => DimsEngine.PACKING_COLUMNS[k] ? DimsEngine.PACKING_COLUMNS[k].label({ unitWord: 'unit' }) : k;
+  const colItems = cols.map((k, i) => `<li><span class="dims-grow">${escapeHtml(colLabel(k))} <code>${escapeHtml(k)}</code></span>
+      ${canEdit ? `<button class="btn btn-sm" onclick="dimsColMove(${i}, -1)" ${i === 0 ? 'disabled' : ''}>↑</button>
+      <button class="btn btn-sm" onclick="dimsColMove(${i}, 1)" ${i === cols.length - 1 ? 'disabled' : ''}>↓</button>
+      <button class="btn btn-sm btn-danger" onclick="dimsColRemove(${i})">✕</button>` : ''}</li>`).join('');
+  const remaining = Object.keys(DimsEngine.PACKING_COLUMNS).filter(k => !cols.includes(k));
+  const colAdd = canEdit && remaining.length ? `<div style="display:flex;gap:6px;margin-top:6px;max-width:520px;">
+      <select id="dims-col-add" style="flex:1;height:28px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;">
+        ${remaining.map(k => `<option value="${k}">${escapeHtml(colLabel(k))} (${k})</option>`).join('')}</select>
+      <button class="btn btn-sm" onclick="dimsColAdd()">+ Add column</button></div>` : '';
+
+  el.innerHTML = `
+    <div style="display:flex;gap:var(--vf-space-2);align-items:center;flex-wrap:wrap;">
+      <div class="dims-sub" style="flex:1;margin:0;max-width:760px;">
+        Every figure keeps the unit it was stated in. Anything marked <span class="dims-est">est.</span> is flagged in the calculator until it's replaced with a measured value.
+        ${canEdit ? '' : ' Admins and operators can edit this data.'}
+      </div>
+      <button class="btn btn-sm" onclick="downloadDimsJson()">Download JSON</button>
+      ${canEdit ? '<button class="btn btn-sm" onclick="openDimsJson()">Edit raw JSON</button>' : ''}
+    </div>
+    ${head('Pack formats', 'packs', 'Add pack format')}
+    ${tbl(['Pack format', 'Unit outside dims', 'Weight', 'Pallet patterns', 'Flags'], packRows, 'No pack formats yet.')}
+    ${head('Pallets', 'pallets', 'Add pallet')}
+    ${tbl(['Pallet', 'Footprint', 'Deck height', 'Tare', 'Default units', 'Notes'], palletRows, 'No pallets yet.')}
+    ${head('Packaging components', 'components', 'Add component')}
+    ${tbl(['Component', 'Weight each', 'Thickness', 'Notes'], compRows, 'No components yet.')}
+    ${head('Containers', 'containers', 'Add container')}
+    ${tbl(['Container', 'Interior L × W × H', 'Tare', 'Floor positions'], conRows, 'No containers yet.')}
+    <div class="dims-h3"><span class="dims-grow">Packing list columns</span></div>
+    <div class="dims-sub" style="margin-bottom:6px;">Order of the copy-paste block in the calculator. Match it to the SO packing list layout.</div>
+    <ul class="dims-cols">${colItems || '<li class="dims-sub">Default order.</li>'}</ul>${colAdd}`;
+}
+
+// ── Item editor modal ──
+function openDimsEditor(list, index, duplicate) {
+  if (!canEditOrders()) return;
+  const isNew = index < 0 || !!duplicate;
+  const src = index >= 0 ? dimsConfig[list][index] : DIMS_BLANK[list]();
+  const item = JSON.parse(JSON.stringify(src));
+  if (duplicate) {
+    item.label = item.label + ' (copy)';
+    item.id = dimsUniqueId(list, item.id + '_copy');
+  }
+  dimsEdit = { list, index: duplicate ? -1 : index, isNew, item, idTouched: !!duplicate, fieldIds: [] };
+  document.getElementById('dims-edit-title').textContent =
+    (duplicate ? 'New ' : isNew ? 'Add ' : 'Edit ') + DIMS_LIST_WORD[list] + (duplicate ? ` (copied from ${src.label})` : '');
+  document.getElementById('dims-edit-error').style.display = 'none';
+  renderDimsEditorBody();
+  document.getElementById('dims-edit-modal').style.display = 'flex';
+}
+
+function closeDimsEditor() {
+  document.getElementById('dims-edit-modal').style.display = 'none';
+  dimsEdit = null;
+}
+
+function dimsMeasureInput(id, m, units) {
+  const u = (m && m.u) || units[0];
+  return `<div class="dims-mfield">
+    <input id="${id}-v" type="number" min="0" step="any" value="${m && m.v != null ? m.v : ''}" placeholder="not on file">
+    <select id="${id}-u">${units.map(x => `<option${x === u ? ' selected' : ''}>${x}</option>`).join('')}</select>
+    <label class="dims-est-toggle" title="Tick if this figure is an estimate rather than measured or from a spec"><input type="checkbox" id="${id}-e" ${m && m.est ? 'checked' : ''} style="width:auto;height:auto;"> est.</label>
+  </div>`;
+}
+
+function renderDimsEditorBody() {
+  const { list, item, isNew } = dimsEdit;
+  dimsEdit.fieldIds = [];
+  const html = DIMS_FIELDS[list].map((f, i) => {
+    const id = 'dfe-' + i;
+    dimsEdit.fieldIds.push({ f, id });
+    const val = dimsGet(item, f.k);
+    const hint = f.hint ? `<div class="dims-sub">${escapeHtml(f.hint)}</div>` : '';
+    const lab = `<label for="${id}">${escapeHtml(f.label)}${f.req ? ' <span style="color:var(--vf-danger-text);">*</span>' : ''}</label>`;
+    let ctl = '';
+    switch (f.type) {
+      case 'text':
+        ctl = `<input id="${id}" value="${escapeHtml(val || '')}"${f.k === 'label' && isNew ? ' oninput="dimsLabelToId()"' : ''}>`;
+        break;
+      case 'id':
+        ctl = `<input id="${id}" value="${escapeHtml(val || '')}" ${isNew ? 'oninput="dimsEdit.idTouched=true"' : 'disabled'} placeholder="auto from name">`;
+        break;
+      case 'textarea':
+        ctl = `<textarea id="${id}" rows="2">${escapeHtml(val || '')}</textarea>`;
+        break;
+      case 'select':
+        ctl = `<select id="${id}">${f.options.map(([v, l]) => `<option value="${v}"${v === val ? ' selected' : ''}>${escapeHtml(l)}</option>`).join('')}</select>`;
+        break;
+      case 'bool':
+        return `<div class="field"><label class="dims-check" style="margin-top:22px;"><input type="checkbox" id="${id}" ${val ? 'checked' : ''} style="width:auto;height:auto;"> ${escapeHtml(f.label)}</label>${hint}</div>`;
+      case 'ref':
+        ctl = `<select id="${id}"><option value="">${escapeHtml(f.none || '—')}</option>${(dimsConfig[f.ref] || [])
+          .filter(x => !(f.ref === 'pallets' && x.inboundOnly))
+          .map(x => `<option value="${escapeHtml(x.id)}"${x.id === val ? ' selected' : ''}>${escapeHtml(x.label)}</option>`).join('')}</select>`;
+        break;
+      case 'len': ctl = dimsMeasureInput(id, val, DIMS_LEN_UNITS); break;
+      case 'wt': ctl = dimsMeasureInput(id, val, DIMS_WT_UNITS); break;
+      case 'fp':
+        ctl = `<textarea id="${id}" rows="2" placeholder="48x40: 18">${escapeHtml(Object.entries(val || {}).map(([k, v]) => `${k}: ${v}`).join('\n'))}</textarea>`;
+        break;
+      case 'patterns':
+        return `<div class="field dims-span2"><label>${escapeHtml(f.label)}</label>
+          <div class="dims-sub" style="margin:0 0 4px;">Units per layer and layers for each pallet this pack ships on. Overhang is how far the load sticks past the deck, if known.</div>
+          <div id="${id}"></div></div>`;
+    }
+    return `<div class="field${f.span ? ' dims-span2' : ''}">${lab}${ctl}${hint}</div>`;
+  }).join('');
+  document.getElementById('dims-edit-body').innerHTML = `<div class="dims-form">${html}</div>`;
+  const pf = dimsEdit.fieldIds.find(x => x.f.type === 'patterns');
+  if (pf) renderDimsPatterns(pf.id, dimsGet(item, pf.f.k) || []);
+}
+
+function dimsLabelToId() {
+  if (!dimsEdit || !dimsEdit.isNew || dimsEdit.idTouched) return;
+  const lab = dimsEdit.fieldIds.find(x => x.f.k === 'label');
+  const idf = dimsEdit.fieldIds.find(x => x.f.type === 'id');
+  if (lab && idf) document.getElementById(idf.id).value = dimsUniqueId(dimsEdit.list, dimsSlug(document.getElementById(lab.id).value));
+}
+
+function renderDimsPatterns(id, patterns) {
+  const pallets = dimsConfig.pallets.filter(p => !p.inboundOnly);
+  const rows = patterns.map((pt, r) => `<tr data-row="${r}">
+      <td><select class="dp-pallet">${pallets.map(p => `<option value="${escapeHtml(p.id)}"${p.id === pt.pallet ? ' selected' : ''}>${escapeHtml(p.label)}</option>`).join('')}</select></td>
+      <td style="width:70px;"><input class="dp-per" type="number" min="1" step="1" value="${pt.perLayer ?? ''}"></td>
+      <td style="width:62px;"><input class="dp-layers" type="number" min="1" step="1" value="${pt.layers ?? ''}"></td>
+      <td style="width:130px;"><div style="display:flex;gap:4px;"><input class="dp-oh" type="number" min="0" step="any" value="${pt.overhang && pt.overhang.v != null ? pt.overhang.v : ''}" placeholder="—">
+        <select class="dp-ohu" style="width:56px;">${['in', 'mm', 'cm'].map(u => `<option${u === ((pt.overhang && pt.overhang.u) || 'in') ? ' selected' : ''}>${u}</option>`).join('')}</select></div></td>
+      <td style="width:40px;text-align:center;"><input class="dp-est" type="checkbox" ${pt.est ? 'checked' : ''}></td>
+      <td><input class="dp-notes" value="${escapeHtml(pt.notes || '')}"></td>
+      <td style="width:36px;"><button class="btn btn-sm" onclick="dimsPatternRemove('${id}', ${r})" title="Remove">✕</button></td>
+    </tr>`).join('');
+  document.getElementById(id).innerHTML = `<table class="dims-mini">
+      <thead><tr><th>Pallet</th><th>Per layer</th><th>Layers</th><th>Overhang</th><th title="Not yet confirmed as the standard">Unconf.</th><th>Notes</th><th></th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="7" class="dims-sub">No pallet patterns yet.</td></tr>'}</tbody></table>
+    <button class="btn btn-sm" onclick="dimsPatternAdd('${id}')">+ Add pallet pattern</button>`;
+}
+
+function readDimsPatterns(id) {
+  return [...document.querySelectorAll(`#${id} tbody tr[data-row]`)].map(tr => {
+    const q = s => tr.querySelector(s);
+    const intOrNull = v => (v === '' ? null : Math.round(Number(v)));
+    const oh = q('.dp-oh').value;
+    return {
+      pallet: q('.dp-pallet').value,
+      perLayer: intOrNull(q('.dp-per').value),
+      layers: intOrNull(q('.dp-layers').value),
+      overhang: { v: oh === '' ? null : Number(oh), u: q('.dp-ohu').value },
+      est: q('.dp-est').checked,
+      notes: q('.dp-notes').value.trim(),
+    };
+  });
+}
+
+function dimsPatternAdd(id) {
+  const cur = readDimsPatterns(id);
+  const pallets = dimsConfig.pallets.filter(p => !p.inboundOnly);
+  const used = new Set(cur.map(p => p.pallet));
+  const free = pallets.find(p => !used.has(p.id)) || pallets[0];
+  cur.push({ pallet: free ? free.id : '', perLayer: null, layers: null, overhang: { v: null, u: 'in' }, est: false, notes: '' });
+  renderDimsPatterns(id, cur);
+}
+
+function dimsPatternRemove(id, r) {
+  const cur = readDimsPatterns(id);
+  cur.splice(r, 1);
+  renderDimsPatterns(id, cur);
+}
+
+function readDimsMeasure(id) {
+  const raw = document.getElementById(id + '-v').value.trim();
+  const v = raw === '' ? null : Number(raw);
+  const m = { v: v == null || !isFinite(v) ? null : v, u: document.getElementById(id + '-u').value };
+  if (document.getElementById(id + '-e').checked) m.est = true;
+  return m;
+}
+
+function collectDimsEditor() {
+  const item = JSON.parse(JSON.stringify(dimsEdit.item));
+  dimsEdit.fieldIds.forEach(({ f, id }) => {
+    const el = document.getElementById(id);
+    switch (f.type) {
+      case 'text': case 'id': case 'textarea': dimsSet(item, f.k, el.value.trim()); break;
+      case 'select': dimsSet(item, f.k, el.value); break;
+      case 'bool': dimsSet(item, f.k, el.checked); break;
+      case 'ref': dimsSet(item, f.k, el.value || null); break;
+      case 'len': case 'wt': dimsSet(item, f.k, readDimsMeasure(id)); break;
+      case 'patterns': dimsSet(item, f.k, readDimsPatterns(id)); break;
+      case 'fp': {
+        const fp = {};
+        el.value.split('\n').forEach(line => {
+          const m = line.match(/^\s*([0-9]+\s*x\s*[0-9]+)\s*[:=]\s*([0-9]+)\s*$/i);
+          if (m) fp[m[1].replace(/\s/g, '').toLowerCase()] = Number(m[2]);
+        });
+        dimsSet(item, f.k, fp);
+        break;
+      }
+    }
+  });
+  return item;
+}
+
+function showDimsError(boxId, problems) {
+  const box = document.getElementById(boxId);
+  if (!box) { alert(problems.join('\n')); return; }
+  box.innerHTML = problems.length === 1 ? escapeHtml(problems[0])
+    : `<strong>Fix these before saving:</strong><ul>${problems.map(p => `<li>${escapeHtml(p)}</li>`).join('')}</ul>`;
+  box.style.display = '';
+}
+
+async function saveDimsEditor() {
+  const { list, index } = dimsEdit;
+  const item = collectDimsEditor();
+  if (!item.label) return showDimsError('dims-edit-error', ['Name is required.']);
+  if (!item.id) item.id = dimsUniqueId(list, dimsSlug(item.label));
+  const next = JSON.parse(JSON.stringify(dimsConfig));
+  if (index >= 0) next[list][index] = item; else next[list].push(item);
+  const problems = DimsEngine.validateConfig(next);
+  if (problems.length) return showDimsError('dims-edit-error', problems);
+  const btn = document.getElementById('dims-edit-save');
+  btn.disabled = true; btn.textContent = 'Saving…';
+  const ok = await putDimsConfig(next, 'dims-edit-error');
+  btn.disabled = false; btn.textContent = 'Save';
+  if (ok) closeDimsEditor();
+}
+
+// Saves the whole reference-data blob. The server refuses (409) if someone
+// else saved since we loaded, so two people editing can't clobber each other.
+async function putDimsConfig(next, errBoxId) {
+  try {
+    const r = await fetch('/api/dims/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ config: next, baseUpdatedAt: dimsMeta.updatedAt }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 409) {
+      showDimsError(errBoxId, [j.error || 'Someone else saved changes first. Reload and try again.']);
+      if (j.current && j.current.config) setDimsConfig(Object.assign({ seeded: false }, j.current));
+      return false;
+    }
+    if (!r.ok || !j.ok) {
+      showDimsError(errBoxId, j.problems && j.problems.length ? j.problems : [j.error || ('Save failed (HTTP ' + r.status + ')')]);
+      return false;
+    }
+    setDimsConfig(j);
+    return true;
+  } catch (e) {
+    showDimsError(errBoxId, ['Save failed: ' + e.message]);
+    return false;
+  }
+}
+
+async function deleteDimsItem(list, index) {
+  const item = dimsConfig[list][index];
+  const refs = dimsRefsTo(list, item.id);
+  if (refs.length) {
+    alert(`Can't delete "${item.label}" — it's used by: ${refs.join('; ')}. Change those first.`);
+    return;
+  }
+  if (!confirm(`Delete "${item.label}"? The previous version of the reference data is kept on the server if you need it back.`)) return;
+  const next = JSON.parse(JSON.stringify(dimsConfig));
+  next[list].splice(index, 1);
+  const problems = DimsEngine.validateConfig(next);
+  if (problems.length) { alert(problems.join('\n')); return; }
+  await putDimsConfig(next, null);
+}
+
+async function dimsSaveColumns(cols) {
+  const next = JSON.parse(JSON.stringify(dimsConfig));
+  next.packingList = Object.assign({}, next.packingList, { columns: cols });
+  await putDimsConfig(next, null);
+}
+function dimsColMove(i, d) {
+  const cols = [...(dimsConfig.packingList.columns || [])];
+  const j = i + d;
+  if (j < 0 || j >= cols.length) return;
+  [cols[i], cols[j]] = [cols[j], cols[i]];
+  dimsSaveColumns(cols);
+}
+function dimsColRemove(i) {
+  const cols = [...(dimsConfig.packingList.columns || [])];
+  cols.splice(i, 1);
+  dimsSaveColumns(cols);
+}
+function dimsColAdd() {
+  const k = document.getElementById('dims-col-add').value;
+  dimsSaveColumns([...((dimsConfig.packingList && dimsConfig.packingList.columns) || []), k]);
+}
+
+function openDimsJson() {
+  if (!canEditOrders()) return;
+  document.getElementById('dims-json-text').value = JSON.stringify(dimsConfig, null, 2);
+  document.getElementById('dims-json-error').style.display = 'none';
+  document.getElementById('dims-json-modal').style.display = 'flex';
+}
+
+async function saveDimsJson() {
+  let next;
+  try { next = JSON.parse(document.getElementById('dims-json-text').value); }
+  catch (e) { return showDimsError('dims-json-error', ['Not valid JSON: ' + e.message]); }
+  const problems = DimsEngine.validateConfig(next);
+  if (problems.length) return showDimsError('dims-json-error', problems);
+  if (await putDimsConfig(next, 'dims-json-error')) document.getElementById('dims-json-modal').style.display = 'none';
+}
+
+function downloadDimsJson() {
+  const blob = new Blob([JSON.stringify(dimsConfig, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'dims-reference-data.json';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
 // ── Production Output Tab ────────────────────────────────────────────────────
