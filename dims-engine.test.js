@@ -28,31 +28,30 @@ describe("DIMs seed config", () => {
 });
 
 describe("Validation loads", () => {
-  it("CFC 10 kg BIB, 80 cases, EU 40×48, 9 slip sheets → 853.05 kg, ~58 in", () => {
+  it("CFC 10 kg BIB, 80 cases, EU 40×48, 9 slip sheets → 853.05 kg, 58.06 in (measured 853 kg / 58 in)", () => {
     const r = run("cfc_bib_10kg", 80);
     expect(r.ok).toBe(true);
     expect(r.palletCount).toBe(1);
     expect(r.groups[0].sheets).toBe(9);
     expect(r.totals.grossKg).toBeCloseTo(853.05, 2);
-    // 8 × 6.625 + 4.625 + 9 × 0.0625; spec range 58.1–58.4 in, measured 58 in
-    expect(r.groups[0].H_in).toBeCloseTo(58.1875, 4);
-    expect(r.groups[0].H_in).toBeGreaterThanOrEqual(58.1);
-    expect(r.groups[0].H_in).toBeLessThanOrEqual(58.4);
+    // 8 × 6.625 + 4.5 measured EU deck + 9 × 0.0625 slip sheets
+    expect(r.groups[0].H_in).toBeCloseTo(58.0625, 4);
+    expect(Math.abs(r.groups[0].H_in - 58)).toBeLessThan(0.1);
   });
 
   it("PFS 54 cases, GMA pallet → ~40 in and ~1,105 lb (measured 40 in / 501 kg)", () => {
     const r = run("pfs_case", 54);
     expect(r.ok).toBe(true);
     expect(r.palletCount).toBe(1);
-    expect(r.groups[0].H_in).toBeCloseTo(39.95, 2); // 6 × 5.625 + 5.0 + 6 × 0.2 bulge
+    expect(r.groups[0].H_in).toBeCloseTo(39.7, 2); // 6 × 5.625 + 4.75 measured US deck + 6 × 0.2 bulge
     expect(Math.abs(r.groups[0].H_in - 40)).toBeLessThan(0.5);
     expect(r.totals.grossKg / Dims.LB_TO_KG).toBeCloseTo(1106.5, 1);
     expect(Math.abs(r.totals.grossKg - 501)).toBeLessThan(2);
   });
 
-  it("PFS without the bulge allowance matches the 38.75 in OD-spec figure", () => {
+  it("PFS without the bulge allowance is rigid case height plus the deck: 38.5 in", () => {
     const r = run("pfs_case", 54, { bulgeIn: 0 });
-    expect(r.groups[0].H_in).toBeCloseTo(38.75, 2);
+    expect(r.groups[0].H_in).toBeCloseTo(38.5, 2); // 6 × 5.625 + 4.75
   });
 
   it("Drum double-stack on EU 40×48 lands within 1 in of the measured 79 in", () => {

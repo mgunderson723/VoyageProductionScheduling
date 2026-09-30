@@ -103,44 +103,44 @@
       "label": "EU-compliant thin-deck export, 48 × 40",
       "L": { "v": 48, "u": "in" },
       "W": { "v": 40, "u": "in" },
-      "H": { "v": 4.625, "u": "in", "est": true },
+      "H": { "v": 4.5, "u": "in" },
       "tare": { "v": 15, "u": "kg" },
       "defaultUnits": "metric",
       "inboundOnly": false,
-      "notes": "Height back-solved (4.5–4.75 in) from the 79 in drum double-stack; measure an empty pallet."
+      "notes": "Deck height 4.5 in measured by the team (Sep 2026)."
     },
     {
       "id": "eu_48x48",
       "label": "EU-compliant 48 × 48",
       "L": { "v": 48, "u": "in" },
       "W": { "v": 48, "u": "in" },
-      "H": { "v": null, "u": "in" },
+      "H": { "v": 4.5, "u": "in" },
       "tare": { "v": 27, "u": "kg", "est": true },
       "defaultUnits": "metric",
       "inboundOnly": false,
-      "notes": "Tare from the Jul 2026 study, unconfirmed. Re-weigh and measure."
+      "notes": "Deck height 4.5 in from the team's EU pallet measurement (Sep 2026); confirm on a 48 × 48. Tare from the Jul 2026 study, unconfirmed; re-weigh."
     },
     {
       "id": "us_recycled_40x48",
       "label": "US recycled 48 × 40",
       "L": { "v": 48, "u": "in" },
       "W": { "v": 40, "u": "in" },
-      "H": { "v": null, "u": "in" },
+      "H": { "v": 4.75, "u": "in" },
       "tare": { "v": 13, "u": "kg" },
       "defaultUnits": "imperial",
       "inboundOnly": false,
-      "notes": "Height to measure."
+      "notes": "Deck height 4.75 in from the team's US pallet measurement (Sep 2026)."
     },
     {
       "id": "us_gma_40x48",
       "label": "US GMA 48 × 40 (PFS spec sheet)",
       "L": { "v": 48, "u": "in" },
       "W": { "v": 40, "u": "in" },
-      "H": { "v": 5.0, "u": "in", "est": true },
+      "H": { "v": 4.75, "u": "in" },
       "tare": { "v": 40, "u": "lb", "est": true },
       "defaultUnits": "imperial",
       "inboundOnly": false,
-      "notes": "IP models 5.0 in; an older sheet says 6 in. Tare implied (~40 lb). Measure one."
+      "notes": "Deck height 4.75 in measured by the team (Sep 2026); IP modelled 5.0 in and an older sheet said 6 in. Tare implied (~40 lb); weigh one."
     },
     {
       "id": "tarac",
