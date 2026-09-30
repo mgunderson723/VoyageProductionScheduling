@@ -66,10 +66,10 @@
         { "pallet": "us_gma_40x48", "perLayer": 9, "layers": 6, "overhang": { "v": null, "u": "in" }, "est": true, "notes": "9 × 6 = 54 replaced 72 (8 high) in Jul 2026 after crushing; not yet confirmed as the spec-sheet standard. IP's own design is 10 × 8 = 80 interlocked, safety factor 5.0." }
       ],
       "slipSheets": false,
-      "bulgePerLayer": { "v": 0.2, "u": "in" },
+      "bulgePerLayer": { "v": 0.25, "u": "in" },
       "doubleStack": { "allowed": false, "separator": null, "measuredHeight": { "v": null, "u": "in" } },
       "source": "IP CAD 73831113189_1 (7/10/2026). ID 15 × 11 × 5 in; older spec sheets show ID.",
-      "notes": "Case tare ~1 lb is an estimate (6.16 sq ft 55 ECT C-flute). IP's TOPS pallet report carries a wrong 9.00 lb filled-case weight; do not reuse its 785 lb gross."
+      "notes": "Case tare ~1 lb is an estimate (6.16 sq ft 55 ECT C-flute). IP's TOPS pallet report carries a wrong 9.00 lb filled-case weight; do not reuse its 785 lb gross. Bulge 0.25 in per layer back-solved from the measured 40 in load on a 4.75 in deck."
     },
     {
       "id": "drum_55gal",

@@ -43,7 +43,7 @@ describe("Validation loads", () => {
     const r = run("pfs_case", 54);
     expect(r.ok).toBe(true);
     expect(r.palletCount).toBe(1);
-    expect(r.groups[0].H_in).toBeCloseTo(39.7, 2); // 6 × 5.625 + 4.75 measured US deck + 6 × 0.2 bulge
+    expect(r.groups[0].H_in).toBeCloseTo(40.0, 2); // 6 × 5.625 + 4.75 measured US deck + 6 × 0.25 bulge
     expect(Math.abs(r.groups[0].H_in - 40)).toBeLessThan(0.5);
     expect(r.totals.grossKg / Dims.LB_TO_KG).toBeCloseTo(1106.5, 1);
     expect(Math.abs(r.totals.grossKg - 501)).toBeLessThan(2);
