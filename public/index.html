@@ -2154,6 +2154,20 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       <tbody id="admin-user-body"></tbody>
     </table>
 
+    <h2 style="margin-top:32px;">Slack notifications</h2>
+    <div style="font-size:var(--vf-text-sm);color:var(--vf-text-secondary);margin:var(--vf-space-2) 0;max-width:820px;">
+      After the 07:00 UTC Cin7 production sync, the planner posts new Error reporting flags (only when there are new ones)
+      and a production report of runs entered in Cin7 since the last report.
+    </div>
+    <div id="slack-status" style="font-size:var(--vf-text-sm);color:var(--vf-text-secondary);line-height:1.7;"></div>
+    <div style="display:flex;gap:var(--vf-space-2);align-items:center;margin:var(--vf-space-3) 0;flex-wrap:wrap;">
+      <button class="btn btn-sm" onclick="slackTest()">Send test message</button>
+      <button class="btn btn-sm" onclick="slackPreview()">Preview tonight's posts</button>
+      <button class="btn btn-sm btn-primary" onclick="slackPostNow()">Post now</button>
+      <span id="slack-msg" style="font-size:var(--vf-text-sm);"></span>
+    </div>
+    <pre id="slack-preview" style="display:none;white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace;font-size:12px;background:var(--vf-surface-sunken);border:1px solid var(--vf-border-subtle);border-radius:var(--vf-radius-sm);padding:var(--vf-space-3);max-height:420px;overflow-y:auto;"></pre>
+
     <h2 style="margin-top:32px;">Bug Reports</h2>
     <div style="display:flex;gap:var(--vf-space-2);align-items:center;margin:var(--vf-space-3) 0;flex-wrap:wrap;">
       <select id="bug-status-filter" onchange="renderBugReports()" style="padding:5px 10px;font-size:12px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;height:32px;">
@@ -2667,6 +2681,80 @@ async function loadAuditLog(){
 let bugReports = [];
 let bugReportCounts = { new: 0, acknowledged: 0, resolved: 0 };
 let bugReportExpanded = new Set();
+// ── Slack notifications (admin console) ──
+function slackMsg(text, isError) {
+  const el = document.getElementById('slack-msg');
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = isError ? 'var(--vf-danger-text)' : 'var(--vf-success-text)';
+}
+
+async function loadSlackStatus() {
+  const el = document.getElementById('slack-status');
+  if (!el) return;
+  try {
+    const r = await fetch('/api/slack/status');
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    const c = j.configured;
+    const when = x => x && x.lastPostAt
+      ? `last posted ${new Date(x.lastPostAt).toLocaleString()} (${x.lastCount} new)` : 'not posted yet';
+    const flag = ok => ok ? '<span style="color:var(--vf-success-text);">✓ webhook set</span>' : '<span style="color:var(--vf-danger-text);">✗ no webhook</span>';
+    const setup = (!c.errors && !c.production) ? `<div style="margin-top:6px;padding:8px 12px;background:var(--vf-warning-soft);color:var(--vf-warning-text);border-radius:var(--vf-radius-sm);max-width:820px;">
+        To turn this on, create a Slack incoming webhook for the channel (Slack → Apps → Incoming Webhooks), then add it in Railway
+        on the scheduling service as <code>SLACK_WEBHOOK_URL</code> and redeploy. To send the two posts to different channels, also set
+        <code>SLACK_ERRORS_WEBHOOK_URL</code> or <code>SLACK_PRODUCTION_WEBHOOK_URL</code>.</div>` : '';
+    el.innerHTML = `
+      <div>Error flags: ${flag(c.errors)} · ${when(j.errors)}</div>
+      <div>Production report: ${flag(c.production)} · ${when(j.production)}</div>
+      <div>Links in posts open: ${j.appBaseUrl ? escapeHtml(j.appBaseUrl) : 'not set (add APP_BASE_URL)'} · last Cin7 production sync: ${j.lastSync ? new Date(j.lastSync).toLocaleString() : 'never'}</div>
+      ${setup}`;
+  } catch (e) {
+    el.textContent = "Couldn't load Slack status: " + e.message;
+  }
+}
+
+async function slackTest() {
+  slackMsg('Sending…');
+  try {
+    const r = await fetch('/api/slack/test', { method: 'POST' });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    slackMsg(`Test message sent to ${j.channels} channel${j.channels === 1 ? '' : 's'}. Check Slack.`);
+  } catch (e) { slackMsg(e.message, true); }
+}
+
+async function slackPreview() {
+  slackMsg('Building preview…');
+  const pre = document.getElementById('slack-preview');
+  try {
+    const r = await fetch('/api/slack/preview', { method: 'POST' });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    const errs = j.errors || {}, prod = j.production || {};
+    pre.textContent =
+      '── Error flags ──\n' + (errs.preview || 'No new flags, so nothing would be posted.') +
+      '\n\n── Production report ──\n' + (prod.preview || prod.skipped || 'Nothing to post.');
+    pre.style.display = '';
+    slackMsg('Preview only. Nothing was posted.');
+  } catch (e) { slackMsg(e.message, true); }
+}
+
+async function slackPostNow() {
+  if (!confirm('Post new error flags and the production report to Slack now? Anything posted now won\'t be posted again tonight.')) return;
+  slackMsg('Posting…');
+  try {
+    const r = await fetch('/api/slack/post-now', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ which: 'both' }) });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    const say = (label, x) => !x ? '' : x.error ? `${label} failed: ${x.error}` : x.skipped ? `${label} skipped: ${x.skipped}`
+      : x.posted ? `${label} posted (${x.newCount} new)` : `${label}: nothing new`;
+    const parts = [say('Error flags', j.errors), say('Production report', j.production)].filter(Boolean);
+    slackMsg(parts.join(' · '), !!((j.errors && j.errors.error) || (j.production && j.production.error)));
+    loadSlackStatus();
+  } catch (e) { slackMsg(e.message, true); }
+}
+
 async function loadBugReports(){
   try {
     const r = await fetch('/api/bug-reports');
@@ -3430,7 +3518,7 @@ function switchTab(t){
   });
   if(t==='calendar')renderCal();
   if(t==='orders')render();
-  if(t==='admin'){renderUsers();loadAuditLog();loadBugReports();}
+  if(t==='admin'){renderUsers();loadAuditLog();loadBugReports();loadSlackStatus();}
   if(t==='traceability'){ renderTraceability(); }
   if(t==='expiring-lots'){ loadExpiringLots(); }
   if(t==='lot-report'){ loadLotReport(); }

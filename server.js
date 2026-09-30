@@ -297,6 +297,8 @@ const KEY_ROLE_REQUIREMENTS = {
   // concurrency check and version history would all be skipped.
   "vf_dims_config":         "locked",
   "vf_dims_config_history": "locked",
+  // What's already been posted to Slack; only the digest job writes it.
+  "slack_digest_state":     "locked",
 };
 
 function userHasRole(userId, requirement) {
@@ -4478,6 +4480,82 @@ app.post("/api/error-reporting/undismiss", requireOrderEdit, (req, res) => {
   res.json({ ok: true, moRef });
 });
 
+// ── Slack daily posts (error flags + Cin7 production report) ────────────────
+// Built by lib/slack-digests.js from the nightly production-run sync and
+// posted to Slack incoming webhooks set in Railway env vars:
+//   SLACK_WEBHOOK_URL             — default channel for both posts
+//   SLACK_ERRORS_WEBHOOK_URL      — optional: send error flags elsewhere
+//   SLACK_PRODUCTION_WEBHOOK_URL  — optional: send the production report elsewhere
+//   APP_BASE_URL                  — optional: link target (defaults to the Railway domain)
+const SlackDigests = require("./lib/slack-digests");
+const slackStore = { read: readData, write: writeData };
+
+function slackSummary(x) {
+  if (!x) return "not run";
+  if (x.error) return "failed (" + x.error + ")";
+  if (x.skipped) return "skipped (" + x.skipped + ")";
+  if (x.posted) return "posted " + x.newCount + " new";
+  return x.payload ? "not posted" : "nothing new";
+}
+const slackStripPayload = r => {
+  const out = {};
+  Object.entries(r || {}).forEach(([k, v]) => { const { payload, ...rest } = v; out[k] = rest; });
+  return out;
+};
+
+// GET /api/slack/status — admin. Which posts are configured (never the URLs)
+// and when each last went out.
+app.get("/api/slack/status", requireAdmin, (req, res) => {
+  const state = readData(SlackDigests.STATE_KEY) || {};
+  res.json({
+    ok: true,
+    configured: {
+      errors: !!SlackDigests.webhookFor("errors", process.env),
+      production: !!SlackDigests.webhookFor("production", process.env),
+      separateChannels: !!(process.env.SLACK_ERRORS_WEBHOOK_URL || process.env.SLACK_PRODUCTION_WEBHOOK_URL),
+    },
+    appBaseUrl: SlackDigests.appBaseUrl(process.env),
+    errors: state.errors ? { lastPostAt: state.errors.lastPostAt, lastCount: state.errors.lastCount } : null,
+    production: state.production ? { lastPostAt: state.production.lastPostAt, lastCount: state.production.lastCount } : null,
+    lastSync: (readData("production_run_errors_t7d") || {}).lastSync || null,
+  });
+});
+
+// POST /api/slack/test — admin. One-line message to each configured channel.
+app.post("/api/slack/test", requireAdmin, async (req, res) => {
+  const urls = [...new Set(["errors", "production"].map(k => SlackDigests.webhookFor(k, process.env)).filter(Boolean))];
+  if (!urls.length) return res.status(400).json({ ok: false, error: "No Slack webhook is set. Add SLACK_WEBHOOK_URL in Railway." });
+  try {
+    for (const url of urls) await SlackDigests.postToSlack(url, SlackDigests.buildTestMessage(SlackDigests.appBaseUrl(process.env)));
+    res.json({ ok: true, channels: urls.length });
+  } catch (e) {
+    res.status(502).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/slack/preview — admin. What tonight's posts would say right now,
+// without posting or marking anything as sent.
+app.post("/api/slack/preview", requireAdmin, async (req, res) => {
+  try {
+    const r = await SlackDigests.runDigests({ store: slackStore, env: process.env, doPost: false });
+    res.json({ ok: true, ...slackStripPayload(r) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/slack/post-now — admin. Body { which: "errors" | "production" | "both" }.
+// Same as the nightly run (only unposted items), for setup or a missed night.
+app.post("/api/slack/post-now", requireAdmin, async (req, res) => {
+  const which = ["errors", "production", "both"].includes(req.body && req.body.which) ? req.body.which : "both";
+  try {
+    const r = await SlackDigests.runDigests({ store: slackStore, env: process.env, which });
+    res.json({ ok: true, ...slackStripPayload(r) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── DIMs calculator reference data ──────────────────────────────────────────
 // Pack formats, pallets, packaging components, containers and packing-list
 // columns live in one editable blob so the team can add a pack format (e.g.
@@ -5849,11 +5927,30 @@ if (process.env.CIN7_ACCOUNT_ID && process.env.CIN7_APPLICATION_KEY) {
   // don't compete with them for the 60/min Cin7 rate budget.
   cron.schedule("0 7 * * *", async () => {
     console.log("[ProdRunSync] Nightly sync starting…");
+    let synced = false;
     try {
       const s = await performProductionRunErrorSync();
+      synced = true;
       console.log(`[ProdRunSync] Sync done — ${s.completedRunsScanned} completed runs in window, ${s.parentOrdersScanned} parent orders fetched (${s.detailFailures} failures), ${s.flaggedRunCount} runs flagged with ${s.flaggedLineCount} zero-actual lines`);
     } catch (e) {
       console.error("[ProdRunSync] Nightly sync failed:", e.message);
+      // Without this, a failed sync would look the same in Slack as a quiet
+      // day with no new errors.
+      const url = SlackDigests.webhookFor("errors", process.env);
+      if (url) {
+        SlackDigests.postToSlack(url, SlackDigests.buildSyncFailure(e.message, SlackDigests.appBaseUrl(process.env)))
+          .catch(err => console.error("[Slack] Sync-failure post failed:", err.message));
+      }
+    }
+    // Daily Slack posts: new error flags (silent if none) + production report.
+    // Only after the nightly sync — manual "Sync now" never posts.
+    if (synced) {
+      try {
+        const r = await SlackDigests.runDigests({ store: { read: readData, write: writeData }, env: process.env });
+        console.log(`[Slack] Digests — errors: ${slackSummary(r.errors)}; production: ${slackSummary(r.production)}`);
+      } catch (e) {
+        console.error("[Slack] Digest run failed:", e.message);
+      }
     }
   });
   console.log("[ProdRunSync] Nightly sync scheduled at 07:00 UTC");
