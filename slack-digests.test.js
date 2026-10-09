@@ -76,6 +76,31 @@ describe("Production report", () => {
     payloadOk(d.payload);
   });
 
+  it("shows run yield and pooled (kg out / kg in) yield for categories and the total", () => {
+    const yblob = { allCompletedRuns: [
+      run("MO-20/1", "2026-09-29", [kg(960, "BFCWIP")], { inputMassKg: 1000, outputMassKg: 960, yieldPct: 96 }),
+      run("MO-20/2", "2026-09-29", [kg(270, "BFCWIP")], { inputMassKg: 300, outputMassKg: 270, yieldPct: 90 }),
+      run("MO-21/1", "2026-09-29", [kg(500, "CFCWIP")], { inputMassKg: 0, outputMassKg: 500, yieldPct: null }),
+    ] };
+    const txt = Slack.payloadToText(Slack.buildProductionDigest({ blob: yblob, seen: {}, today: "2026-09-30" }).payload);
+    expect(txt).toMatch(/MO-20\/1\* · FG-1 Thing · 960 kg · 96% yield/);
+    expect(txt).toMatch(/BFCWIP — 1,230 kg · 2 runs · 94.6% yield/); // 1230/1300, not avg(96,90)
+    expect(txt).toMatch(/3 runs entered in Cin7 since the last report\* · 1,730 kg · 94.6% yield/); // no-input run skipped
+    expect(txt).toMatch(/CFCWIP — 500 kg · 1 run\*/);
+    expect(txt).not.toMatch(/MO-21\/1[^\n]*yield/);
+  });
+
+  it("leaves runs split across categories out of category yield", () => {
+    const yblob = { allCompletedRuns: [
+      run("MO-30/1", "2026-09-29", [kg(400, "A"), kg(400, "B")], { inputMassKg: 1000, outputMassKg: 800, yieldPct: 80 }),
+      run("MO-31/1", "2026-09-29", [kg(450, "A")], { inputMassKg: 500, outputMassKg: 450, yieldPct: 90 }),
+    ] };
+    const txt = Slack.payloadToText(Slack.buildProductionDigest({ blob: yblob, seen: {}, today: "2026-09-30" }).payload);
+    expect(txt).toMatch(/\*A — 850 kg · 2 runs · 90% yield/);
+    expect(txt).toMatch(/\*B — 400 kg · 1 run\*/);
+    expect(txt).toMatch(/1,250 kg · 83.3% yield/);
+  });
+
   it("later reports list only runs not seen before, whatever their completion date", () => {
     const d = Slack.buildProductionDigest({ blob, seen: { "MO-10/1": "x", "MO-11/1": "x" }, today: "2026-10-01", lastPostAt: "2026-09-30T07:05:00Z" });
     expect(d.runKeys).toEqual(["MO-12/1"]);
