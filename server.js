@@ -299,6 +299,8 @@ const KEY_ROLE_REQUIREMENTS = {
   "vf_dims_config_history": "locked",
   // What's already been posted to Slack; only the digest job writes it.
   "slack_digest_state":     "locked",
+  // RSPO settings have their own validated endpoint (/api/rspo/config).
+  "vf_rspo_config":         "locked",
 };
 
 function userHasRole(userId, requirement) {
@@ -4554,6 +4556,185 @@ app.post("/api/slack/post-now", requireAdmin, async (req, res) => {
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
+});
+
+// ── RSPO mass-balance report ────────────────────────────────────────────────
+// Annual RSPO audit pack: RSPO oil in/out, what each oil was used to make,
+// claimed-product production with formulation % (Cin7 BOM) and oil traced
+// through production lots, and purchases with suppliers. Built from the
+// all-time movement ledger by lib/rspo-report.js. Which oils and which
+// claimed products to report on is editable (vf_rspo_config); until the
+// first save it uses lib/rspo-seed.json.
+const RspoReport = require("./lib/rspo-report");
+const RSPO_SEED_PATH = path.join(__dirname, "lib", "rspo-seed.json");
+
+function readRspoConfig() {
+  const blob = readData("vf_rspo_config");
+  if (blob && blob.config) return { ...blob, seeded: false };
+  return { config: JSON.parse(fs.readFileSync(RSPO_SEED_PATH, "utf8")), updatedAt: null, updatedBy: null, seeded: true };
+}
+
+// Formulation % per RSPO oil from the SKU's default Cin7 BOM, expanded all
+// the way to raw materials (no wastage — this is the recipe, not demand).
+function rspoBomFor(oilSkus) {
+  const parents = (readData("vf_boms") || {}).parents || {};
+  const perSku = (readData("vf_supply_settings") || {}).perSku || {};
+  const memo = new Map();
+  return sku => {
+    if (memo.has(sku)) return memo.get(sku);
+    let out = null;
+    const versions = parents[sku];
+    if (versions && versions.length) {
+      const Q = 1000; // kg of finished product
+      const kgPerUnit = perSku[sku] && perSku[sku].kgPerUnit;
+      try {
+        const exp = expandBom(parents, sku, kgPerUnit ? Q / kgPerUnit : Q, { applyWastage: false });
+        const byOil = {};
+        for (const o of oilSkus) byOil[o] = exp.leaves[o] ? exp.leaves[o].qty / Q : 0;
+        out = { found: true, version: versions[0].versionName || versions[0].version || null, byOil };
+      } catch (e) {
+        out = { found: false, error: e.message };
+      }
+    }
+    memo.set(sku, out);
+    return out;
+  };
+}
+
+function rspoRange(req) {
+  const today = new Date().toISOString().slice(0, 10);
+  const ok = s => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
+  const from = ok(req.query.from) ? req.query.from : today.slice(0, 4) + "-01-01";
+  const to = ok(req.query.to) ? req.query.to : today;
+  return from <= to ? { from, to } : { from: to, to: from };
+}
+
+function runRspoReport(req) {
+  const { config, updatedAt, updatedBy, seeded } = readRspoConfig();
+  const { from, to } = rspoRange(req);
+  const posByRef = (readData("purchase_orders") || { byRef: {} }).byRef || {};
+  const report = RspoReport.buildRspoReport({
+    lines: getMovementIndex().all,
+    config, from, to,
+    bomFor: rspoBomFor(config.oils.map(o => o.sku)),
+    supplierFor: ref => (posByRef[ref] && posByRef[ref].supplier) || null,
+  });
+  report.claimNote = config.claimNote || "";
+  report.config = { updatedAt, updatedBy, seeded };
+  report.generatedAt = new Date().toISOString();
+  return report;
+}
+
+// GET /api/traceability/rspo?from=YYYY-MM-DD&to=YYYY-MM-DD — any signed-in user.
+app.get("/api/traceability/rspo", (req, res) => {
+  try {
+    res.json({ ok: true, ...runRspoReport(req) });
+  } catch (e) {
+    console.error("[rspo] report failed:", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/traceability/rspo.xlsx — the same report as an Excel workbook for the auditor.
+app.get("/api/traceability/rspo.xlsx", (req, res) => {
+  try {
+    const r = runRspoReport(req);
+    const n2 = x => (x == null ? "" : Math.round(x * 100) / 100);
+    const pct = x => (x == null ? "" : Math.round(x * 1000) / 10);
+    const oilName = Object.fromEntries(r.oils.map(o => [o.sku, o.label]));
+    const sheets = [];
+
+    sheets.push(["Summary", [
+      ["RSPO mass-balance report"],
+      ["Period", `${r.from} to ${r.to}`],
+      ["Generated", r.generatedAt.slice(0, 16).replace("T", " ") + " UTC"],
+      ["Source", `Cin7 Inventory Movement Details ledger (${r.ledgerStart} to ${r.ledgerEnd}) and Cin7 production BOMs`],
+      ...(r.claimNote ? [["Claim", r.claimNote]] : []),
+      [],
+      ["Claimed product", "SKUs", "Produced (kg)", "Production lots", "RSPO oil", "BOM RSPO oil %", "RSPO oil in product, BOM (kg)", "Traced RSPO oil %", "RSPO oil in product, traced (kg)", "Notes"],
+      ...r.products.map(p => {
+        const oilsUsed = Object.keys(p.tracedOilKg).length ? Object.keys(p.tracedOilKg) : (p.oilsFilter || []);
+        return [p.label, p.skus.join(", "), n2(p.producedKg), p.lotCount,
+          oilsUsed.map(o => `${o} ${oilName[o] || ""}`.trim()).join("; "),
+          pct(p.bomPct), n2(p.bomOilKgTotal), pct(p.tracedPct), n2(p.tracedOilKgTotal),
+          [p.note, ...p.warnings].filter(Boolean).join(" ")];
+      }),
+      ["Total", "", n2(r.totals.producedKg), "", "", "", n2(r.totals.claimedBomKg), "", n2(r.totals.claimedTracedKg), ""],
+    ]]);
+
+    sheets.push(["RSPO oil balance", [
+      ["RSPO oil", "SKU", "Supply model", "Opening stock (kg)", "Purchased (kg)", "Used in production (kg)", "Stock adjustments (kg)", "Transfers (kg)", "Other (kg)", "Closing stock (kg)", "In claimed products, traced (kg)", "In claimed products, BOM (kg)", "Claimed ÷ purchased, traced (%)"],
+      ...r.oils.map(o => [o.label, o.sku, o.model || "", n2(o.opening), n2(o.purchased), n2(o.used), n2(o.adjustments), n2(o.transfers), n2(o.other), n2(o.closing),
+        n2(o.claimedTracedKg), n2(o.claimedBomKg), pct(o.utilizationTraced)]),
+    ]]);
+
+    sheets.push(["Oil usage", [
+      ["RSPO oil SKU", "RSPO oil", "Used to make (SKU)", "Product", "Oil used (kg)", "Runs", "Feeds claimed product", "Run references"],
+      ...r.oils.flatMap(o => o.usedBy.map(u => [o.sku, o.label, u.sku, u.product || "", n2(u.kg), u.runCount, u.feeds.join(", "), u.runs.join(", ")])),
+    ]]);
+
+    sheets.push(["Purchases", [
+      ["Received", "PO", "RSPO oil SKU", "RSPO oil", "Lot", "kg", "Supplier", "Location"],
+      ...r.oils.flatMap(o => o.purchases.map(p => [p.date, p.ref, o.sku, o.label, p.lot || "", n2(p.kg), p.supplier || "", p.location || ""])),
+    ]]);
+
+    sheets.push(["Claimed production lots", [
+      ["Produced", "MO run", "Claimed product", "SKU", "Lot", "Produced (kg)", "Traced RSPO oil (kg)", "Traced RSPO oil by SKU"],
+      ...r.products.flatMap(p => p.runs.map(x => [x.date, x.ref, p.label, x.sku, x.lot || "", n2(x.kg), n2(x.tracedOilKg),
+        Object.entries(x.tracedByOil).map(([o, v]) => `${o}: ${n2(v)}`).join("; ")])),
+    ]]);
+
+    sheets.push(["Method and notes", [
+      ["How the figures are calculated"],
+      ["Opening / closing stock: sum of every Cin7 movement of the oil before / up to the period end, across all locations."],
+      ["Purchased: purchase-order receipts in the period. Used in production: oil consumed on manufacturing orders in the period."],
+      ["BOM RSPO oil %: the SKU's default Cin7 production BOM expanded to raw materials, RSPO oil kg per kg of product, without wastage."],
+      ["Traced RSPO oil %: for each production lot, the RSPO oil actually consumed by the runs that made it, followed through intermediate (WIP) lots, divided by the kg those runs produced."],
+      ["Oil used on runs whose output isn't received in Cin7 yet is shown as \"(not received yet)\" in Oil usage: it's in work in progress."],
+      [],
+      ["Warnings"],
+      ...(r.warnings.length ? r.warnings.map(w => [w]) : [["None."]]),
+    ]]);
+
+    const wb = XLSX.utils.book_new();
+    for (const [name, rows] of sheets) {
+      const ws = XLSX.utils.aoa_to_sheet(rows);
+      const widths = [];
+      rows.forEach(row => row.forEach((c, i) => { widths[i] = Math.min(60, Math.max(widths[i] || 8, String(c == null ? "" : c).length + 2)); }));
+      ws["!cols"] = widths.map(w => ({ wch: w }));
+      XLSX.utils.book_append_sheet(wb, ws, name);
+    }
+    const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+    res.set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.set("Content-Disposition", `attachment; filename="RSPO report ${r.from} to ${r.to}.xlsx"`);
+    res.send(buf);
+  } catch (e) {
+    console.error("[rspo] xlsx failed:", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/rspo/config — any signed-in user (the report is read-only).
+app.get("/api/rspo/config", (req, res) => {
+  try { res.json({ ok: true, ...readRspoConfig() }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// PUT /api/rspo/config — admin or operator. Body { config, baseUpdatedAt };
+// 409 if someone else saved since the editor loaded.
+app.put("/api/rspo/config", requireOrderEdit, (req, res) => {
+  const body = req.body || {};
+  const problems = RspoReport.validateRspoConfig(body.config);
+  if (problems.length) return res.status(400).json({ ok: false, error: "RSPO settings have problems", problems });
+  const current = readData("vf_rspo_config");
+  if ((body.baseUpdatedAt || null) !== ((current && current.updatedAt) || null)) {
+    return res.status(409).json({ ok: false, error: "Someone else saved RSPO settings since you opened them. Reload and re-apply your change." });
+  }
+  const users = readData("vf_users") || [];
+  const u = users.find(x => x && x.id === req.userId);
+  const blob = { config: body.config, updatedAt: new Date().toISOString(), updatedBy: u ? u.username : "(unknown)" };
+  writeData("vf_rspo_config", blob);
+  res.json({ ok: true, ...blob, seeded: false });
 });
 
 // ── DIMs calculator reference data ──────────────────────────────────────────

@@ -1026,6 +1026,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
     <button class="tab" onclick="switchTab('traceability')">Traceability</button>
     <button class="tab" onclick="switchTab('expiring-lots')">Expiring lots</button>
     <button class="tab" onclick="switchTab('lot-report')">Lot ledger report</button>
+    <button class="tab" onclick="switchTab('rspo')">RSPO report</button>
     <button class="tab" onclick="switchTab('mo-status')">MO Status</button>
     <button class="tab" onclick="switchTab('live-inv')">Live Inventory</button>
     <button class="tab" onclick="switchTab('error-reporting')">Error reporting</button>
@@ -1421,6 +1422,43 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
       </table>
     </div>
     <div id="lot-report-empty" class="no-inv-note" style="display:none;">No lots match the current filters.</div>
+  </div>
+
+  <!-- RSPO REPORT — annual RSPO mass-balance audit pack -->
+  <div id="tab-rspo" style="display:none;">
+    <div class="header">
+      <div>
+        <h2>RSPO report</h2>
+        <span style="font-size:var(--vf-text-sm);color:var(--vf-text-tertiary);">RSPO oil in and out, what it was used to make, and the RSPO oil in each claimed product, from the Cin7 movement ledger and BOMs.</span>
+      </div>
+      <div style="display:flex;gap:var(--vf-space-2);align-items:center;flex-wrap:wrap;">
+        <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">From
+          <input type="date" id="rspo-from" style="height:32px;padding:0 8px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;"></label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:var(--vf-text-sm);color:var(--vf-text-secondary);">To
+          <input type="date" id="rspo-to" style="height:32px;padding:0 8px;border:1px solid var(--vf-border-default);border-radius:var(--vf-radius-sm);background:var(--vf-surface-raised);color:var(--vf-text-primary);font-family:inherit;"></label>
+        <button class="btn btn-sm btn-primary" onclick="loadRspo()">Run</button>
+        <button class="btn btn-sm" onclick="downloadRspoXlsx()">⬇ Excel for auditor</button>
+        <button class="btn btn-sm" id="rspo-settings-btn" onclick="openRspoSettings()">Settings</button>
+      </div>
+    </div>
+    <div id="rspo-body"><div class="dims-empty">Pick a period and press Run.</div></div>
+
+    <div id="rspo-settings-modal" class="modal-overlay" style="display:none;">
+      <div class="modal" style="width:900px;">
+        <h2>RSPO report settings</h2>
+        <div class="dims-sub" style="margin-bottom:var(--vf-space-3);">Which RSPO oils to track and which products carry the RSPO claim. A product line with "Only lots made with" set counts only lots where that oil was traced, for products where SG and MB versions share one SKU.</div>
+        <div class="field"><label for="rspo-claim-note">Claim note (shown on the report)</label><input id="rspo-claim-note" placeholder="e.g. RSPO is claimed only on products shipped to Cargill EU."></div>
+        <div class="dims-h3"><span class="dims-grow">RSPO oils</span><button class="btn btn-sm" onclick="rspoAddRow('oil')">+ Add oil</button></div>
+        <table class="dims-mini"><thead><tr><th style="width:170px;">SKU</th><th>Name</th><th style="width:110px;">Supply model</th><th style="width:36px;"></th></tr></thead><tbody id="rspo-oils-edit"></tbody></table>
+        <div class="dims-h3"><span class="dims-grow">Claimed products</span><button class="btn btn-sm" onclick="rspoAddRow('product')">+ Add product</button></div>
+        <table class="dims-mini"><thead><tr><th style="width:140px;">Name</th><th>SKUs (comma-separated)</th><th style="width:170px;">Only lots made with (oil SKU)</th><th style="width:200px;">Note</th><th style="width:36px;"></th></tr></thead><tbody id="rspo-products-edit"></tbody></table>
+        <div id="rspo-settings-error" class="dims-box err" style="display:none;margin-top:var(--vf-space-3);"></div>
+        <div style="display:flex;justify-content:flex-end;gap:var(--vf-space-2);margin-top:var(--vf-space-3);">
+          <button class="btn" onclick="document.getElementById('rspo-settings-modal').style.display='none'">Cancel</button>
+          <button class="btn btn-primary" id="rspo-settings-save" onclick="saveRspoSettings()">Save</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- MO STATUS -->
@@ -3510,10 +3548,10 @@ function switchTab(t){
     const el = document.getElementById(id);
     if (el && el.style.display !== 'none') el.style.display = 'none';
   });
-  ['calendar','orders','pipeline','capacity','traceability','expiring-lots','lot-report','mo-status','live-inv','error-reporting','production-output','yield','dims','mrp','mrp-setup','yield-setup','admin'].forEach(k=>{const el=document.getElementById('tab-'+k);if(el)el.style.display=k===t?'':'none';});
+  ['calendar','orders','pipeline','capacity','traceability','expiring-lots','lot-report','rspo','mo-status','live-inv','error-reporting','production-output','yield','dims','mrp','mrp-setup','yield-setup','admin'].forEach(k=>{const el=document.getElementById('tab-'+k);if(el)el.style.display=k===t?'':'none';});
   document.querySelectorAll('.tab').forEach(el=>{
     const tabName=el.textContent.trim().toLowerCase();
-    const map={'calendar':'calendar','work orders':'orders','pipeline':'pipeline','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','expiring lots':'expiring-lots','lot ledger report':'lot-report','mo status':'mo-status','live inventory':'live-inv','error reporting':'error-reporting','production output':'production-output','yield':'yield','dims calculator':'dims','mrp':'mrp','mrp setup':'mrp-setup','yield setup':'yield-setup','admin console':'admin'};
+    const map={'calendar':'calendar','work orders':'orders','pipeline':'pipeline','capacity & ops':'capacity','capacity &amp; ops':'capacity','traceability':'traceability','expiring lots':'expiring-lots','lot ledger report':'lot-report','rspo report':'rspo','mo status':'mo-status','live inventory':'live-inv','error reporting':'error-reporting','production output':'production-output','yield':'yield','dims calculator':'dims','mrp':'mrp','mrp setup':'mrp-setup','yield setup':'yield-setup','admin console':'admin'};
     el.classList.toggle('active',map[tabName]===t);
   });
   if(t==='calendar')renderCal();
@@ -3522,6 +3560,7 @@ function switchTab(t){
   if(t==='traceability'){ renderTraceability(); }
   if(t==='expiring-lots'){ loadExpiringLots(); }
   if(t==='lot-report'){ loadLotReport(); }
+  if(t==='rspo'){ initRspo(); }
   if(t==='mo-status'){populateMOStatusMachineFilter();renderMOStatus();loadSyncStatus();}
   if(t==='live-inv')loadLiveInventory();
   if(t==='error-reporting')loadErrorReporting();
@@ -7830,6 +7869,199 @@ async function syncErrorReporting() {
     if (content) content.innerHTML = `<div style="padding:20px;color:var(--vf-danger-text);background:var(--vf-danger-soft);border-radius:var(--vf-radius-sm);font-size:13px;">Sync failed: ${escapeHtml(e.message)}</div>`;
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '↻ Sync now'; }
+  }
+}
+
+// ── RSPO report ──────────────────────────────────────────────────────────────
+// Server builds the report from the movement ledger + BOMs
+// (/api/traceability/rspo); the same report downloads as an Excel workbook.
+let rspoReport = null;
+let rspoSettings = null;   // { config, updatedAt, ... } while the editor is open
+
+function initRspo() {
+  const f = document.getElementById('rspo-from'), t = document.getElementById('rspo-to');
+  if (!f.value) {
+    const today = new Date().toISOString().slice(0, 10);
+    f.value = today.slice(0, 4) + '-01-01';
+    t.value = today;
+  }
+  document.getElementById('rspo-settings-btn').style.display = canEditOrders() ? '' : 'none';
+  if (!rspoReport) loadRspo();
+}
+
+const rspoRangeQs = () => `from=${encodeURIComponent(document.getElementById('rspo-from').value)}&to=${encodeURIComponent(document.getElementById('rspo-to').value)}`;
+
+async function loadRspo() {
+  const body = document.getElementById('rspo-body');
+  body.innerHTML = '<div class="dims-empty">Building the report from the movement ledger…</div>';
+  try {
+    const r = await fetch('/api/traceability/rspo?' + rspoRangeQs());
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    rspoReport = j;
+    renderRspo();
+  } catch (e) {
+    body.innerHTML = `<div class="dims-box err">Couldn't build the RSPO report: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function downloadRspoXlsx() {
+  try {
+    const r = await fetch('/api/traceability/rspo.xlsx?' + rspoRangeQs());
+    if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || ('HTTP ' + r.status)); }
+    const blob = await r.blob();
+    const name = (/filename="([^"]+)"/.exec(r.headers.get('Content-Disposition') || '') || [])[1] || 'RSPO report.xlsx';
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  } catch (e) { alert('Excel download failed: ' + e.message); }
+}
+
+function renderRspo() {
+  const r = rspoReport, body = document.getElementById('rspo-body');
+  const kg = x => x == null ? '—' : Number(x).toLocaleString(undefined, { maximumFractionDigits: 0 });
+  const pc = x => x == null ? '—' : (x * 100).toFixed(1) + '%';
+  const oilLabel = Object.fromEntries(r.oils.map(o => [o.sku, o.label]));
+  const oilChip = sku => `<span title="${escapeHtml(oilLabel[sku] || '')}">${escapeHtml(sku)}</span>`;
+  const warnIcon = ws => ws && ws.length ? ` <span class="dims-est" title="${escapeHtml(ws.join('\n'))}">${ws.length} note${ws.length === 1 ? '' : 's'}</span>` : '';
+  const metric = (label, val, sub) => `<div class="metric"><div class="metric-label">${label}</div><div class="metric-value">${val}</div><div class="dims-sub">${sub}</div></div>`;
+
+  const lead = `<div class="metrics dims-metrics">
+    ${metric('Claimed production', kg(r.totals.producedKg) + ' kg', r.products.length + ' claimed product lines')}
+    ${metric('RSPO oil in claimed product', kg(r.totals.claimedTracedKg) + ' kg', 'traced through lots · BOM: ' + (r.totals.claimedBomKg ? kg(r.totals.claimedBomKg) + ' kg' : 'no BOMs'))}
+    ${metric('RSPO oil purchased', kg(r.totals.purchasedKg) + ' kg', 'PO receipts in the period')}
+    ${metric('Period', escapeHtml(r.from.slice(5)) + ' → ' + escapeHtml(r.to.slice(5)), escapeHtml(r.from.slice(0, 4)) + ' · ledger to ' + escapeHtml(r.ledgerEnd || '—'))}
+  </div>`;
+  const claim = r.claimNote ? `<div class="dims-sub" style="margin:-8px 0 12px;">${escapeHtml(r.claimNote)}</div>` : '';
+
+  const prodRows = r.products.map(p => {
+    const oils = Object.keys(p.tracedOilKg).length ? Object.keys(p.tracedOilKg) : (p.oilsFilter || []);
+    const skuLines = p.skuDetail.map(s => `<div class="dims-sub" style="margin:0;">${escapeHtml(s.sku)}${s.producedKg ? ' · ' + kg(s.producedKg) + ' kg' : ''}${s.bomPct != null ? ' · BOM ' + pc(s.bomPct) : ''}</div>`).join('');
+    return `<tr>
+      <td><strong>${escapeHtml(p.label)}</strong>${warnIcon([p.note, ...p.warnings].filter(Boolean))}${skuLines || '<div class="dims-missing">no SKU mapped</div>'}</td>
+      <td class="dims-num">${kg(p.producedKg)}</td>
+      <td class="dims-num">${p.lotCount || '—'}</td>
+      <td>${oils.map(oilChip).join('<br>') || '—'}</td>
+      <td class="dims-num">${pc(p.bomPct)}</td>
+      <td class="dims-num">${pc(p.tracedPct)}</td>
+      <td class="dims-num">${p.bomOilKgTotal != null ? kg(p.bomOilKgTotal) : '—'}</td>
+      <td class="dims-num"><strong>${p.producedKg ? kg(p.tracedOilKgTotal) : '—'}</strong></td>
+    </tr>`;
+  }).join('');
+  const products = `<div class="dims-h3"><span class="dims-grow">Claimed products</span></div>
+    <div style="overflow-x:auto;"><table class="status-table" style="margin:0;">
+      <thead><tr><th>Product / SKUs</th><th class="dims-num">Produced (kg)</th><th class="dims-num">Lots</th><th>RSPO oil</th>
+        <th class="dims-num" title="RSPO oil kg per kg of product in the SKU's default Cin7 BOM">BOM oil %</th>
+        <th class="dims-num" title="RSPO oil actually consumed into these lots, followed through WIP steps">Traced oil %</th>
+        <th class="dims-num">Oil in product, BOM (kg)</th><th class="dims-num">Oil in product, traced (kg)</th></tr></thead>
+      <tbody>${prodRows}</tbody></table></div>`;
+
+  const oilRows = r.oils.map((o, i) => `<tr>
+      <td><strong>${escapeHtml(o.label)}</strong><div class="dims-sub" style="margin:0;">${escapeHtml(o.sku)}${o.model ? ' · ' + escapeHtml(o.model) : ''}</div></td>
+      <td class="dims-num">${kg(o.opening)}</td><td class="dims-num">${kg(o.purchased)}</td><td class="dims-num">${kg(o.used)}</td>
+      <td class="dims-num">${kg(o.adjustments)}</td><td class="dims-num">${kg(o.closing)}</td>
+      <td class="dims-num"><strong>${kg(o.claimedTracedKg)}</strong></td><td class="dims-num">${pc(o.utilizationTraced)}</td>
+    </tr>`).join('');
+  const oils = `<div class="dims-h3"><span class="dims-grow">RSPO oils in and out</span></div>
+    <div style="overflow-x:auto;"><table class="status-table" style="margin:0;">
+      <thead><tr><th>RSPO oil</th><th class="dims-num">Opening (kg)</th><th class="dims-num">Purchased (kg)</th><th class="dims-num">Used in production (kg)</th>
+        <th class="dims-num">Adjustments (kg)</th><th class="dims-num">Closing (kg)</th><th class="dims-num">In claimed product (kg)</th>
+        <th class="dims-num" title="RSPO oil in claimed product (traced) ÷ RSPO oil purchased in the period">Claimed ÷ purchased</th></tr></thead>
+      <tbody>${oilRows}</tbody></table></div>
+    <div class="dims-sub">Opening + purchased − used + adjustments = closing. Transfers between locations net to zero.</div>`;
+
+  const detail = r.oils.map(o => {
+    const used = o.usedBy.map(u => `<tr><td>${escapeHtml(u.sku)}<div class="dims-sub" style="margin:0;">${escapeHtml(u.product || '')}</div></td>
+        <td class="dims-num">${kg(u.kg)}</td><td class="dims-num">${u.runCount}</td>
+        <td>${u.feeds.length ? escapeHtml(u.feeds.join(', ')) : '<span class="dims-sub">not a claimed product</span>'}</td></tr>`).join('');
+    const buys = o.purchases.map(p => `<tr><td>${escapeHtml(p.date)}</td><td>${escapeHtml(p.ref)}</td><td>${escapeHtml(p.lot || '—')}</td>
+        <td class="dims-num">${kg(p.kg)}</td><td>${escapeHtml(p.supplier || '—')}</td></tr>`).join('');
+    return `<details style="margin-bottom:var(--vf-space-2);border:1px solid var(--vf-border-subtle);border-radius:var(--vf-radius-sm);padding:var(--vf-space-2) var(--vf-space-3);">
+      <summary style="cursor:pointer;font-weight:500;">${escapeHtml(o.label)} (${escapeHtml(o.sku)}) — used to make ${o.usedBy.length} product${o.usedBy.length === 1 ? '' : 's'} · ${o.purchases.length} purchase${o.purchases.length === 1 ? '' : 's'}</summary>
+      <div style="display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:var(--vf-space-4);margin-top:var(--vf-space-2);">
+        <div><div class="dims-sub" style="font-weight:600;">Used to make</div>
+          <table class="status-table" style="margin:0;"><thead><tr><th>Product</th><th class="dims-num">Oil (kg)</th><th class="dims-num">Runs</th><th>Feeds claimed product</th></tr></thead>
+          <tbody>${used || '<tr><td colspan="4" class="dims-sub">Not used in production this period.</td></tr>'}</tbody></table></div>
+        <div><div class="dims-sub" style="font-weight:600;">Purchases</div>
+          <table class="status-table" style="margin:0;"><thead><tr><th>Received</th><th>PO</th><th>Lot</th><th class="dims-num">kg</th><th>Supplier</th></tr></thead>
+          <tbody>${buys || '<tr><td colspan="5" class="dims-sub">No purchases this period.</td></tr>'}</tbody></table></div>
+      </div></details>`;
+  }).join('');
+
+  const allWarn = r.warnings.concat(...r.products.map(p => p.warnings.map(w => p.label + ': ' + w)));
+  const warn = allWarn.length ? `<div class="dims-box warn" style="margin-top:var(--vf-space-4);"><strong>Check before sending</strong><ul>${allWarn.map(w => `<li>${escapeHtml(w)}</li>`).join('')}</ul></div>` : '';
+  const cfg = r.config && r.config.seeded ? 'Using the starter RSPO settings.' : `Settings last saved ${r.config && r.config.updatedAt ? new Date(r.config.updatedAt).toLocaleString() : '—'} by ${escapeHtml((r.config && r.config.updatedBy) || '—')}.`;
+
+  body.innerHTML = lead + claim + products + oils +
+    `<div class="dims-h3"><span class="dims-grow">Where each oil went, and purchases</span></div>${detail}` + warn +
+    `<div class="dims-sub" style="margin-top:var(--vf-space-3);">${cfg} Traced oil % follows the oil actually consumed through each production lot; BOM oil % is the default Cin7 recipe.</div>`;
+}
+
+// ── RSPO settings editor ──
+async function openRspoSettings() {
+  if (!canEditOrders()) return;
+  try {
+    const r = await fetch('/api/rspo/config');
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    rspoSettings = j;
+  } catch (e) { alert("Couldn't load RSPO settings: " + e.message); return; }
+  const c = rspoSettings.config;
+  document.getElementById('rspo-claim-note').value = c.claimNote || '';
+  document.getElementById('rspo-oils-edit').innerHTML = '';
+  document.getElementById('rspo-products-edit').innerHTML = '';
+  c.oils.forEach(o => rspoAddRow('oil', o));
+  c.products.forEach(p => rspoAddRow('product', p));
+  document.getElementById('rspo-settings-error').style.display = 'none';
+  document.getElementById('rspo-settings-modal').style.display = 'flex';
+}
+
+function rspoAddRow(kind, v) {
+  v = v || {};
+  const tr = document.createElement('tr');
+  const del = '<td><button class="btn btn-sm" title="Remove" onclick="this.closest(\'tr\').remove()">✕</button></td>';
+  if (kind === 'oil') {
+    tr.innerHTML = `<td><input class="ro-sku" value="${escapeHtml(v.sku || '')}" placeholder="RM-xxxxxx-xx"></td>
+      <td><input class="ro-label" value="${escapeHtml(v.label || '')}"></td>
+      <td><select class="ro-model">${['', 'SG', 'MB', 'IP', 'B&C'].map(m => `<option value="${m}"${(v.model || '') === m ? ' selected' : ''}>${m || '—'}</option>`).join('')}</select></td>${del}`;
+    document.getElementById('rspo-oils-edit').appendChild(tr);
+  } else {
+    tr.innerHTML = `<td><input class="rp-label" value="${escapeHtml(v.label || '')}"></td>
+      <td><input class="rp-skus" value="${escapeHtml((v.skus || []).join(', '))}" placeholder="FG-..., FG-..."></td>
+      <td><input class="rp-oils" value="${escapeHtml((v.oils || []).join(', '))}" placeholder="any RSPO oil"></td>
+      <td><input class="rp-note" value="${escapeHtml(v.note || '')}"></td>${del}`;
+    document.getElementById('rspo-products-edit').appendChild(tr);
+  }
+}
+
+async function saveRspoSettings() {
+  const list = s => s.split(',').map(x => x.trim()).filter(Boolean);
+  const config = Object.assign({}, rspoSettings.config, {
+    claimNote: document.getElementById('rspo-claim-note').value.trim(),
+    oils: [...document.querySelectorAll('#rspo-oils-edit tr')].map(tr => ({
+      sku: tr.querySelector('.ro-sku').value.trim(), label: tr.querySelector('.ro-label').value.trim(),
+      model: tr.querySelector('.ro-model').value || undefined,
+    })),
+    products: [...document.querySelectorAll('#rspo-products-edit tr')].map(tr => ({
+      label: tr.querySelector('.rp-label').value.trim(), skus: list(tr.querySelector('.rp-skus').value),
+      oils: list(tr.querySelector('.rp-oils').value), note: tr.querySelector('.rp-note').value.trim(),
+    })),
+  });
+  const btn = document.getElementById('rspo-settings-save');
+  btn.disabled = true; btn.textContent = 'Saving…';
+  try {
+    const r = await fetch('/api/rspo/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ config, baseUpdatedAt: rspoSettings.updatedAt || null }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) { showDimsError('rspo-settings-error', j.problems && j.problems.length ? j.problems : [j.error || ('Save failed (HTTP ' + r.status + ')')]); return; }
+    document.getElementById('rspo-settings-modal').style.display = 'none';
+    loadRspo();
+  } catch (e) {
+    showDimsError('rspo-settings-error', ['Save failed: ' + e.message]);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Save';
   }
 }
 
