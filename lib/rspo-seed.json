@@ -1,5 +1,6 @@
 {
   "claimNote": "RSPO is claimed only on products shipped to Cargill EU.",
+  "claimCustomers": ["Cargill"],
   "oils": [
     { "sku": "RM-120002-00", "label": "CBE - Coberine 608 SG", "model": "SG" },
     { "sku": "RM-120000-00", "label": "Palm Flakes - Cisao 8252-00-03 MB", "model": "MB" },
@@ -8,8 +9,8 @@
   ],
   "products": [
     { "label": "505.EU", "skus": ["FG-860-005-01-EU", "FG-505-DRM-225-EU"], "oils": [], "note": "Two 505.EU SKUs are produced in Cin7; both included." },
-    { "label": "812v", "skus": ["WIP2-5100062-EU"], "oils": [], "note": "No 812v finished-good SKU found in Cin7; using the 812v conching WIP." },
-    { "label": "506.EU (SG)", "skus": ["FG-860-006-01-EU"], "oils": ["RM-120004-01"], "note": "Same SKU as 506.EU (MB); counts lots made with the SG stearin." },
+    { "label": "812v", "skus": ["WIP2-5100062-EU"], "oils": [], "note": "Not made for EU yet; no finished-good SKU, so this tracks the 812v conching WIP." },
+    { "label": "506.EU (SG)", "skus": ["FG-860-006-01-EU"], "oils": ["RM-120004-01"], "note": "No SG 506 liquor run yet. Shares the 506.EU SKU, so any lot made with the SG stearin lands here automatically." },
     { "label": "506.EU (MB)", "skus": ["FG-860-006-01-EU"], "oils": ["RM-120004-00"], "note": "Counts lots made with PK-100 MB." },
     { "label": "859v SGM (RUF)", "skus": ["FG-859v-SGM-75-10"], "oils": [], "note": "" },
     { "label": "859v SGA (Ikea)", "skus": ["FG-859v-SGA-75-10"], "oils": [], "note": "" },

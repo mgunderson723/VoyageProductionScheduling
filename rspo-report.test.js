@@ -105,6 +105,51 @@ describe("RSPO report", () => {
   });
 });
 
+describe("RSPO shipments", () => {
+  const shipLines = lines.concat([
+    mv("2026-06-01", "SO-00001", "FG-X", "Out", 200, "F1"),
+    mv("2026-07-10", "SO-00001", "FG-X", "In", 20, "F1"),               // return
+    // Assembly re-books 100 kg of F1 as a selling SKU in its own unit
+    mv("2026-07-01", "FG-00001", "FG-X", "Out", 100, "F1"),
+    mv("2026-07-01", "FG-00001", "FG-X-CFC", "In", 100, "F1", { unit: "CFC Lot" }),
+    mv("2026-07-05", "SO-00002", "FG-X-CFC", "Out", 50, "F1", { unit: "CFC Lot" }),
+    // Packout entered in boxes (16) from 400 kg, then re-booked as 400 kg
+    mv("2026-08-01", "MO-00006/1", "WIP-A", "Out", 400, "W1"),
+    mv("2026-08-01", "MO-00006/1", "FG-X", "In", 16, "F3"),
+    mv("2026-08-02", "FG-00002", "FG-X", "Out", 16, "F3"),
+    mv("2026-08-02", "FG-00002", "FG-X-kg", "In", 400, "F3"),
+    mv("2026-08-03", "SO-00004", "FG-X-kg", "Out", 400, "F3"),
+  ]);
+  const customers = { "SO-00001": "Cargill BV", "SO-00002": "Other Co", "SO-00004": "Cargill BV" };
+  const rep = () => buildRspoReport({
+    lines: shipLines, from: "2026-01-01", to: "2026-12-31", bomFor,
+    config: Object.assign({}, config, { claimCustomers: ["cargill"] }),
+    customerFor: ref => customers[ref] || null,
+  });
+
+  it("lists shipments with the oil they carried, following assembly re-bookings", () => {
+    const s = rep().shipments;
+    expect(s.map(x => [x.ref, x.sku, x.kg, x.oilKg])).toEqual([
+      ["SO-00001", "FG-X", 200, 60],
+      ["SO-00002", "FG-X-CFC", 50, 15],     // CFC Lot → kg via the assembly (100 kg in, 100 out)
+      ["SO-00001", "FG-X", -20, -6],        // return
+      ["SO-00004", "FG-X-kg", 400, 120],     // oil % from input weight, not the 16 boxes
+    ]);
+    expect(s[1].viaAssembly).toBe(true);
+    expect(s[1].toClaimCustomer).toBe(false);
+  });
+
+  it("totals shipped kg, shipped to claim customers, and oil shipped", () => {
+    const r = rep();
+    const p = r.products[0];
+    expect(p.shippedKg).toBe(630);
+    expect(p.shippedClaimKg).toBe(580);
+    expect(p.shippedOilKgTotal).toBeCloseTo(189, 6);
+    expect(r.oils[0].shippedTracedKg).toBeCloseTo(189, 6);
+    expect(r.warnings.join(" ")).toMatch(/Lot F3 \(FG-X\) on MO-00006\/1: output entered as 16 from 400 kg/);
+  });
+});
+
 describe("RSPO settings", () => {
   it("starter settings are valid", () => {
     expect(validateRspoConfig(seed)).toEqual([]);

@@ -1448,6 +1448,7 @@ table.import-tbl tr:hover td { background: var(--vf-surface-hover); }
         <h2>RSPO report settings</h2>
         <div class="dims-sub" style="margin-bottom:var(--vf-space-3);">Which RSPO oils to track and which products carry the RSPO claim. A product line with "Only lots made with" set counts only lots where that oil was traced, for products where SG and MB versions share one SKU.</div>
         <div class="field"><label for="rspo-claim-note">Claim note (shown on the report)</label><input id="rspo-claim-note" placeholder="e.g. RSPO is claimed only on products shipped to Cargill EU."></div>
+        <div class="field"><label for="rspo-claim-customers">Claim customers (comma-separated; a shipment counts when the customer name contains one)</label><input id="rspo-claim-customers" placeholder="e.g. Cargill"></div>
         <div class="dims-h3"><span class="dims-grow">RSPO oils</span><button class="btn btn-sm" onclick="rspoAddRow('oil')">+ Add oil</button></div>
         <table class="dims-mini"><thead><tr><th style="width:170px;">SKU</th><th>Name</th><th style="width:110px;">Supply model</th><th style="width:36px;"></th></tr></thead><tbody id="rspo-oils-edit"></tbody></table>
         <div class="dims-h3"><span class="dims-grow">Claimed products</span><button class="btn btn-sm" onclick="rspoAddRow('product')">+ Add product</button></div>
@@ -7931,13 +7932,15 @@ function renderRspo() {
   const lead = `<div class="metrics dims-metrics">
     ${metric('Claimed production', kg(r.totals.producedKg) + ' kg', r.products.length + ' claimed product lines')}
     ${metric('RSPO oil in claimed product', kg(r.totals.claimedTracedKg) + ' kg', 'traced through lots · BOM: ' + (r.totals.claimedBomKg ? kg(r.totals.claimedBomKg) + ' kg' : 'no BOMs'))}
+    ${metric('Claimed product shipped', kg(r.totals.shippedKg) + ' kg', 'carrying ' + kg(r.totals.shippedOilKg) + ' kg RSPO oil' +
+      (r.totals.shippedClaimKg != null ? ' · ' + kg(r.totals.shippedClaimKg) + ' kg to claim customers' : ''))}
     ${metric('RSPO oil purchased', kg(r.totals.purchasedKg) + ' kg', 'PO receipts in the period')}
-    ${metric('Period', escapeHtml(r.from.slice(5)) + ' → ' + escapeHtml(r.to.slice(5)), escapeHtml(r.from.slice(0, 4)) + ' · ledger to ' + escapeHtml(r.ledgerEnd || '—'))}
   </div>`;
   const claim = r.claimNote ? `<div class="dims-sub" style="margin:-8px 0 12px;">${escapeHtml(r.claimNote)}</div>` : '';
 
   const prodRows = r.products.map(p => {
-    const oils = Object.keys(p.tracedOilKg).length ? Object.keys(p.tracedOilKg) : (p.oilsFilter || []);
+    const oils = Object.keys(p.tracedOilKg).length ? Object.keys(p.tracedOilKg)
+      : Object.keys(p.shippedOilKg || {}).length ? Object.keys(p.shippedOilKg) : (p.oilsFilter || []);
     const skuLines = p.skuDetail.map(s => `<div class="dims-sub" style="margin:0;">${escapeHtml(s.sku)}${s.producedKg ? ' · ' + kg(s.producedKg) + ' kg' : ''}${s.bomPct != null ? ' · BOM ' + pc(s.bomPct) : ''}</div>`).join('');
     return `<tr>
       <td><strong>${escapeHtml(p.label)}</strong>${warnIcon([p.note, ...p.warnings].filter(Boolean))}${skuLines || '<div class="dims-missing">no SKU mapped</div>'}</td>
@@ -7948,6 +7951,8 @@ function renderRspo() {
       <td class="dims-num">${pc(p.tracedPct)}</td>
       <td class="dims-num">${p.bomOilKgTotal != null ? kg(p.bomOilKgTotal) : '—'}</td>
       <td class="dims-num"><strong>${p.producedKg ? kg(p.tracedOilKgTotal) : '—'}</strong></td>
+      <td class="dims-num">${p.shipmentCount ? kg(p.shippedKg) : '—'}${p.shippedClaimKg != null && p.shipmentCount && p.shippedClaimKg !== p.shippedKg ? `<div class="dims-sub" style="margin:0;">${kg(p.shippedClaimKg)} to claim customers</div>` : ''}</td>
+      <td class="dims-num"><strong>${p.shipmentCount ? kg(p.shippedOilKgTotal) : '—'}</strong></td>
     </tr>`;
   }).join('');
   const products = `<div class="dims-h3"><span class="dims-grow">Claimed products</span></div>
@@ -7955,20 +7960,41 @@ function renderRspo() {
       <thead><tr><th>Product / SKUs</th><th class="dims-num">Produced (kg)</th><th class="dims-num">Lots</th><th>RSPO oil</th>
         <th class="dims-num" title="RSPO oil kg per kg of product in the SKU's default Cin7 BOM">BOM oil %</th>
         <th class="dims-num" title="RSPO oil actually consumed into these lots, followed through WIP steps">Traced oil %</th>
-        <th class="dims-num">Oil in product, BOM (kg)</th><th class="dims-num">Oil in product, traced (kg)</th></tr></thead>
+        <th class="dims-num">Oil in product made, BOM (kg)</th><th class="dims-num">Oil in product made, traced (kg)</th>
+        <th class="dims-num" title="Sales-order shipments in the period, including lots re-booked under a selling SKU">Shipped (kg)</th>
+        <th class="dims-num" title="Shipped kg × each shipped lot's traced RSPO oil %">Oil shipped (kg)</th></tr></thead>
       <tbody>${prodRows}</tbody></table></div>`;
+
+  const shipRows = r.shipments.map(s => `<tr>
+      <td style="white-space:nowrap;">${escapeHtml(s.date)}</td><td>${escapeHtml(s.ref)}</td>
+      <td>${s.customer ? escapeHtml(s.customer) : '<span class="dims-sub">not synced</span>'}${s.toClaimCustomer ? ' <span class="dims-est" style="background:var(--vf-success-soft);color:var(--vf-success-text);">claim</span>' : ''}</td>
+      <td>${escapeHtml(s.product)}</td>
+      <td>${escapeHtml(s.sku)}${s.viaAssembly ? '<div class="dims-sub" style="margin:0;">re-booked by a Cin7 assembly</div>' : ''}</td>
+      <td>${escapeHtml(s.lot || '—')}</td>
+      <td class="dims-num">${s.kg != null ? kg(s.kg) : '—'}${s.isReturn ? '<div class="dims-sub" style="margin:0;">return</div>' : ''}${s.unit && !/^kg$/i.test(s.unit) ? `<div class="dims-sub" style="margin:0;">${escapeHtml(String(s.qty) + ' ' + s.unit)}</div>` : ''}</td>
+      <td class="dims-num"><strong>${kg(s.oilKg)}</strong></td>
+      <td class="dims-num">${s.kg ? pc(s.oilKg / s.kg) : '—'}</td>
+      <td>${Object.keys(s.byOil).map(oilChip).join(', ') || '—'}</td></tr>`).join('');
+  const shipments = `<div class="dims-h3"><span class="dims-grow">Shipments of claimed product</span></div>
+    ${r.shipments.length ? `<div style="overflow-x:auto;"><table class="status-table" style="margin:0;">
+      <thead><tr><th>Shipped</th><th>Sales order</th><th>Customer</th><th>Claimed product</th><th>Shipped as</th><th>Lot</th>
+        <th class="dims-num">kg</th><th class="dims-num">RSPO oil (kg)</th><th class="dims-num">Oil %</th><th>RSPO oil</th></tr></thead>
+      <tbody>${shipRows}</tbody></table></div>` : '<div class="dims-empty">No claimed product shipped in this period.</div>'}
+    <div class="dims-sub">RSPO oil shipped = shipped kg × the lot's traced oil %.${r.claimCustomers && r.claimCustomers.length ? ' "Claim" marks customers whose name contains ' + escapeHtml(r.claimCustomers.join(' or ')) + '.' : ''}</div>`;
 
   const oilRows = r.oils.map((o, i) => `<tr>
       <td><strong>${escapeHtml(o.label)}</strong><div class="dims-sub" style="margin:0;">${escapeHtml(o.sku)}${o.model ? ' · ' + escapeHtml(o.model) : ''}</div></td>
       <td class="dims-num">${kg(o.opening)}</td><td class="dims-num">${kg(o.purchased)}</td><td class="dims-num">${kg(o.used)}</td>
       <td class="dims-num">${kg(o.adjustments)}</td><td class="dims-num">${kg(o.closing)}</td>
-      <td class="dims-num"><strong>${kg(o.claimedTracedKg)}</strong></td><td class="dims-num">${pc(o.utilizationTraced)}</td>
+      <td class="dims-num">${kg(o.claimedTracedKg)}<div class="dims-sub" style="margin:0;">${pc(o.utilizationTraced)} of purchased</div></td>
+      <td class="dims-num"><strong>${kg(o.shippedTracedKg)}</strong><div class="dims-sub" style="margin:0;">${pc(o.shippedOverPurchased)} of purchased</div></td>
     </tr>`).join('');
   const oils = `<div class="dims-h3"><span class="dims-grow">RSPO oils in and out</span></div>
     <div style="overflow-x:auto;"><table class="status-table" style="margin:0;">
       <thead><tr><th>RSPO oil</th><th class="dims-num">Opening (kg)</th><th class="dims-num">Purchased (kg)</th><th class="dims-num">Used in production (kg)</th>
-        <th class="dims-num">Adjustments (kg)</th><th class="dims-num">Closing (kg)</th><th class="dims-num">In claimed product (kg)</th>
-        <th class="dims-num" title="RSPO oil in claimed product (traced) ÷ RSPO oil purchased in the period">Claimed ÷ purchased</th></tr></thead>
+        <th class="dims-num">Adjustments (kg)</th><th class="dims-num">Closing (kg)</th>
+        <th class="dims-num" title="RSPO oil traced into claimed product made in the period">In claimed product made (kg)</th>
+        <th class="dims-num" title="RSPO oil traced into claimed product shipped in the period">In claimed product shipped (kg)</th></tr></thead>
       <tbody>${oilRows}</tbody></table></div>
     <div class="dims-sub">Opening + purchased − used + adjustments = closing. Transfers between locations net to zero.</div>`;
 
@@ -7994,7 +8020,7 @@ function renderRspo() {
   const warn = allWarn.length ? `<div class="dims-box warn" style="margin-top:var(--vf-space-4);"><strong>Check before sending</strong><ul>${allWarn.map(w => `<li>${escapeHtml(w)}</li>`).join('')}</ul></div>` : '';
   const cfg = r.config && r.config.seeded ? 'Using the starter RSPO settings.' : `Settings last saved ${r.config && r.config.updatedAt ? new Date(r.config.updatedAt).toLocaleString() : '—'} by ${escapeHtml((r.config && r.config.updatedBy) || '—')}.`;
 
-  body.innerHTML = lead + claim + products + oils +
+  body.innerHTML = lead + claim + products + shipments + oils +
     `<div class="dims-h3"><span class="dims-grow">Where each oil went, and purchases</span></div>${detail}` + warn +
     `<div class="dims-sub" style="margin-top:var(--vf-space-3);">${cfg} Traced oil % follows the oil actually consumed through each production lot; BOM oil % is the default Cin7 recipe.</div>`;
 }
@@ -8010,6 +8036,7 @@ async function openRspoSettings() {
   } catch (e) { alert("Couldn't load RSPO settings: " + e.message); return; }
   const c = rspoSettings.config;
   document.getElementById('rspo-claim-note').value = c.claimNote || '';
+  document.getElementById('rspo-claim-customers').value = (c.claimCustomers || []).join(', ');
   document.getElementById('rspo-oils-edit').innerHTML = '';
   document.getElementById('rspo-products-edit').innerHTML = '';
   c.oils.forEach(o => rspoAddRow('oil', o));
@@ -8040,6 +8067,7 @@ async function saveRspoSettings() {
   const list = s => s.split(',').map(x => x.trim()).filter(Boolean);
   const config = Object.assign({}, rspoSettings.config, {
     claimNote: document.getElementById('rspo-claim-note').value.trim(),
+    claimCustomers: list(document.getElementById('rspo-claim-customers').value),
     oils: [...document.querySelectorAll('#rspo-oils-edit tr')].map(tr => ({
       sku: tr.querySelector('.ro-sku').value.trim(), label: tr.querySelector('.ro-label').value.trim(),
       model: tr.querySelector('.ro-model').value || undefined,

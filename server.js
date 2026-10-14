@@ -4613,11 +4613,13 @@ function runRspoReport(req) {
   const { config, updatedAt, updatedBy, seeded } = readRspoConfig();
   const { from, to } = rspoRange(req);
   const posByRef = (readData("purchase_orders") || { byRef: {} }).byRef || {};
+  const sosByRef = (readData("sales_orders") || { byRef: {} }).byRef || {};
   const report = RspoReport.buildRspoReport({
     lines: getMovementIndex().all,
     config, from, to,
     bomFor: rspoBomFor(config.oils.map(o => o.sku)),
     supplierFor: ref => (posByRef[ref] && posByRef[ref].supplier) || null,
+    customerFor: ref => (sosByRef[ref] && sosByRef[ref].customer) || null,
   });
   report.claimNote = config.claimNote || "";
   report.config = { updatedAt, updatedBy, seeded };
@@ -4642,6 +4644,7 @@ app.get("/api/traceability/rspo.xlsx", (req, res) => {
     const n2 = x => (x == null ? "" : Math.round(x * 100) / 100);
     const pct = x => (x == null ? "" : Math.round(x * 1000) / 10);
     const oilName = Object.fromEntries(r.oils.map(o => [o.sku, o.label]));
+    const claimHdr = r.claimCustomers.length ? ` (name contains ${r.claimCustomers.join(" / ")})` : "";
     const sheets = [];
 
     sheets.push(["Summary", [
@@ -4651,21 +4654,37 @@ app.get("/api/traceability/rspo.xlsx", (req, res) => {
       ["Source", `Cin7 Inventory Movement Details ledger (${r.ledgerStart} to ${r.ledgerEnd}) and Cin7 production BOMs`],
       ...(r.claimNote ? [["Claim", r.claimNote]] : []),
       [],
-      ["Claimed product", "SKUs", "Produced (kg)", "Production lots", "RSPO oil", "BOM RSPO oil %", "RSPO oil in product, BOM (kg)", "Traced RSPO oil %", "RSPO oil in product, traced (kg)", "Notes"],
+      ["Claimed product", "SKUs", "Produced (kg)", "Production lots", "RSPO oil", "BOM RSPO oil %", "RSPO oil in product, BOM (kg)", "Traced RSPO oil %", "RSPO oil in product, traced (kg)",
+        "Shipped (kg)", `Shipped to claim customers (kg)${claimHdr}`, "RSPO oil shipped, traced (kg)", "Notes"],
       ...r.products.map(p => {
-        const oilsUsed = Object.keys(p.tracedOilKg).length ? Object.keys(p.tracedOilKg) : (p.oilsFilter || []);
+        const oilsUsed = Object.keys(p.tracedOilKg).length ? Object.keys(p.tracedOilKg)
+          : Object.keys(p.shippedOilKg).length ? Object.keys(p.shippedOilKg) : (p.oilsFilter || []);
         return [p.label, p.skus.join(", "), n2(p.producedKg), p.lotCount,
           oilsUsed.map(o => `${o} ${oilName[o] || ""}`.trim()).join("; "),
           pct(p.bomPct), n2(p.bomOilKgTotal), pct(p.tracedPct), n2(p.tracedOilKgTotal),
+          n2(p.shippedKg), n2(p.shippedClaimKg), n2(p.shippedOilKgTotal),
           [p.note, ...p.warnings].filter(Boolean).join(" ")];
       }),
-      ["Total", "", n2(r.totals.producedKg), "", "", "", n2(r.totals.claimedBomKg), "", n2(r.totals.claimedTracedKg), ""],
+      ["Total", "", n2(r.totals.producedKg), "", "", "", n2(r.totals.claimedBomKg), "", n2(r.totals.claimedTracedKg),
+        n2(r.totals.shippedKg), n2(r.totals.shippedClaimKg), n2(r.totals.shippedOilKg), ""],
     ]]);
 
     sheets.push(["RSPO oil balance", [
-      ["RSPO oil", "SKU", "Supply model", "Opening stock (kg)", "Purchased (kg)", "Used in production (kg)", "Stock adjustments (kg)", "Transfers (kg)", "Other (kg)", "Closing stock (kg)", "In claimed products, traced (kg)", "In claimed products, BOM (kg)", "Claimed ÷ purchased, traced (%)"],
+      ["RSPO oil", "SKU", "Supply model", "Opening stock (kg)", "Purchased (kg)", "Used in production (kg)", "Stock adjustments (kg)", "Transfers (kg)", "Other (kg)", "Closing stock (kg)",
+        "In claimed products produced, traced (kg)", "In claimed products produced, BOM (kg)", "Produced claim ÷ purchased (%)",
+        "In claimed products shipped, traced (kg)", "Shipped claim ÷ purchased (%)"],
       ...r.oils.map(o => [o.label, o.sku, o.model || "", n2(o.opening), n2(o.purchased), n2(o.used), n2(o.adjustments), n2(o.transfers), n2(o.other), n2(o.closing),
-        n2(o.claimedTracedKg), n2(o.claimedBomKg), pct(o.utilizationTraced)]),
+        n2(o.claimedTracedKg), n2(o.claimedBomKg), pct(o.utilizationTraced), n2(o.shippedTracedKg), pct(o.shippedOverPurchased)]),
+    ]]);
+
+    sheets.push(["Shipments", [
+      ["Shipped", "Sales order", "Customer", "Claim customer", "Claimed product", "Shipped as SKU", "Lot", "Qty", "Unit", "Shipped (kg)", "RSPO oil shipped, traced (kg)", "Traced RSPO oil %", "RSPO oil by SKU", "Note"],
+      ...r.shipments.map(s => [s.date, s.ref, s.customer || "(not synced)",
+        s.toClaimCustomer == null ? "" : (s.toClaimCustomer ? "Yes" : "No"),
+        s.product, s.sku, s.lot || "", n2(s.qty), s.unit || "", n2(s.kg), n2(s.oilKg),
+        s.kg ? pct(s.oilKg / s.kg) : "",
+        Object.entries(s.byOil).map(([o, v]) => `${o}: ${n2(v)}`).join("; "),
+        [s.isReturn ? "Return" : "", s.viaAssembly ? "Re-booked from the claimed SKU by a Cin7 assembly" : ""].filter(Boolean).join(". ")]),
     ]]);
 
     sheets.push(["Oil usage", [
@@ -4691,6 +4710,8 @@ app.get("/api/traceability/rspo.xlsx", (req, res) => {
       ["BOM RSPO oil %: the SKU's default Cin7 production BOM expanded to raw materials, RSPO oil kg per kg of product, without wastage."],
       ["Traced RSPO oil %: for each production lot, the RSPO oil actually consumed by the runs that made it, followed through intermediate (WIP) lots, divided by the kg those runs produced."],
       ["Oil used on runs whose output isn't received in Cin7 yet is shown as \"(not received yet)\" in Oil usage: it's in work in progress."],
+      ["Shipments: sales-order lines in the period whose lot is a claimed product, including lots a Cin7 assembly document re-booked under a selling SKU. RSPO oil shipped = shipped kg × the lot's traced RSPO oil %. Returns count as negative."],
+      ["Where a packout recorded far less output than its input weight (boxes or drums entered as kg), that lot's oil % is worked out from input weight instead; each such lot is listed under Warnings."],
       [],
       ["Warnings"],
       ...(r.warnings.length ? r.warnings.map(w => [w]) : [["None."]]),
